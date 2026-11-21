@@ -2,6 +2,8 @@ package com.example.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
+import org.json.JSONObject
 
 class PilotPreferences(context: Context) {
 
@@ -32,6 +34,13 @@ class PilotPreferences(context: Context) {
             )
         }.getOrDefault(AutoReplyDelivery.SILENT_DIRECT_REPLY)
 
+        val themeMode = runCatching {
+            AppThemeMode.valueOf(
+                prefs.getString(KEY_THEME_MODE, AppThemeMode.SYSTEM.name)
+                    ?: AppThemeMode.SYSTEM.name
+            )
+        }.getOrDefault(AppThemeMode.SYSTEM)
+
         return PilotSettings(
             apiKey = prefs.getString(KEY_API_KEY, "").orEmpty(),
             liveModel = prefs.getString(KEY_LIVE_MODEL, PilotSettings.DEFAULT_LIVE_MODEL)
@@ -44,6 +53,12 @@ class PilotPreferences(context: Context) {
                 .orEmpty()
                 .ifBlank { PilotSettings.DEFAULT_VOICE },
             speakerphoneOn = prefs.getBoolean(KEY_SPEAKERPHONE, true),
+            autoVisionDefaultOn = prefs.getBoolean(KEY_AUTO_VISION_DEFAULT, false),
+            autoVisionIntervalSec = prefs.getInt(KEY_AUTO_VISION_INTERVAL, 4).coerceIn(2, 10),
+            showTouchVisualizer = prefs.getBoolean(KEY_SHOW_TOUCH_VISUALIZER, true),
+            showFloatingCaptions = prefs.getBoolean(KEY_SHOW_FLOATING_CAPTIONS, true),
+            themeMode = themeMode,
+            customVoiceInstructions = prefs.getString(KEY_CUSTOM_VOICE_INSTRUCTIONS, "").orEmpty(),
             autoChatMode = autoChatMode,
             autoReplyDelivery = autoReplyDelivery,
             autoReplyPersona = prefs.getString(
@@ -61,11 +76,116 @@ class PilotPreferences(context: Context) {
             .putString(KEY_TEXT_MODEL, settings.textModel.trim().removePrefix("models/"))
             .putString(KEY_VOICE_NAME, settings.voiceName.trim())
             .putBoolean(KEY_SPEAKERPHONE, settings.speakerphoneOn)
+            .putBoolean(KEY_AUTO_VISION_DEFAULT, settings.autoVisionDefaultOn)
+            .putInt(KEY_AUTO_VISION_INTERVAL, settings.autoVisionIntervalSec.coerceIn(2, 10))
+            .putBoolean(KEY_SHOW_TOUCH_VISUALIZER, settings.showTouchVisualizer)
+            .putBoolean(KEY_SHOW_FLOATING_CAPTIONS, settings.showFloatingCaptions)
+            .putString(KEY_THEME_MODE, settings.themeMode.name)
+            .putString(KEY_CUSTOM_VOICE_INSTRUCTIONS, settings.customVoiceInstructions.trim())
             .putString(KEY_AUTO_CHAT_MODE, settings.autoChatMode.name)
             .putString(KEY_AUTO_REPLY_DELIVERY, settings.autoReplyDelivery.name)
             .putString(KEY_AUTO_REPLY_PERSONA, settings.autoReplyPersona.trim())
             .putStringSet(KEY_ENABLED_APPS, settings.enabledMessagingApps.map { it.name }.toSet())
             .apply()
+    }
+
+    fun loadRoutines(): List<PilotRoutine> {
+        val raw = prefs.getString(KEY_CUSTOM_ROUTINES, null)
+        val custom = if (raw.isNullOrBlank()) {
+            emptyList()
+        } else {
+            runCatching {
+                val arr = JSONArray(raw)
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val accent = runCatching {
+                            RoutineAccent.valueOf(obj.optString("accent", RoutineAccent.COBALT.name))
+                        }.getOrDefault(RoutineAccent.COBALT)
+                        add(
+                            PilotRoutine(
+                                id = obj.optString("id"),
+                                title = obj.optString("title"),
+                                subtitle = obj.optString("subtitle"),
+                                prompt = obj.optString("prompt"),
+                                accent = accent,
+                                isBuiltIn = false
+                            )
+                        )
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
+        return custom + PilotSettings.DEFAULT_ROUTINES
+    }
+
+    fun saveCustomRoutines(allRoutines: List<PilotRoutine>) {
+        val arr = JSONArray()
+        allRoutines.filter { !it.isBuiltIn }.forEach { r ->
+            arr.put(
+                JSONObject()
+                    .put("id", r.id)
+                    .put("title", r.title)
+                    .put("subtitle", r.subtitle)
+                    .put("prompt", r.prompt)
+                    .put("accent", r.accent.name)
+            )
+        }
+        prefs.edit().putString(KEY_CUSTOM_ROUTINES, arr.toString()).apply()
+    }
+
+    fun loadAskAiHistory(): List<AskAiMessage> {
+        val raw = prefs.getString(KEY_ASK_AI_HISTORY, null) ?: return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val citationsArr = obj.optJSONArray("citations") ?: JSONArray()
+                    val citations = buildList {
+                        for (c in 0 until citationsArr.length()) {
+                            val cObj = citationsArr.optJSONObject(c) ?: continue
+                            add(
+                                WebCitation(
+                                    title = cObj.optString("title"),
+                                    url = cObj.optString("url")
+                                )
+                            )
+                        }
+                    }
+                    add(
+                        AskAiMessage(
+                            id = obj.optLong("id"),
+                            isUser = obj.optBoolean("isUser"),
+                            text = obj.optString("text"),
+                            citations = citations,
+                            modelUsed = obj.optString("modelUsed").ifBlank { null },
+                            timestamp = obj.optString("timestamp")
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    fun saveAskAiHistory(messages: List<AskAiMessage>) {
+        val arr = JSONArray()
+        messages.takeLast(30).forEach { msg ->
+            val citationsArr = JSONArray()
+            msg.citations.forEach { cit ->
+                citationsArr.put(JSONObject().put("title", cit.title).put("url", cit.url))
+            }
+            arr.put(
+                JSONObject()
+                    .put("id", msg.id)
+                    .put("isUser", msg.isUser)
+                    .put("text", msg.text)
+                    .put("citations", citationsArr)
+                    .put("modelUsed", msg.modelUsed ?: "")
+                    .put("timestamp", msg.timestamp)
+            )
+        }
+        prefs.edit().putString(KEY_ASK_AI_HISTORY, arr.toString()).apply()
     }
 
     companion object {
@@ -75,9 +195,17 @@ class PilotPreferences(context: Context) {
         private const val KEY_TEXT_MODEL = "text_model_id"
         private const val KEY_VOICE_NAME = "live_voice_name"
         private const val KEY_SPEAKERPHONE = "speakerphone_on"
+        private const val KEY_AUTO_VISION_DEFAULT = "auto_vision_default"
+        private const val KEY_AUTO_VISION_INTERVAL = "auto_vision_interval"
+        private const val KEY_SHOW_TOUCH_VISUALIZER = "show_touch_visualizer"
+        private const val KEY_SHOW_FLOATING_CAPTIONS = "show_floating_captions"
+        private const val KEY_THEME_MODE = "app_theme_mode"
+        private const val KEY_CUSTOM_VOICE_INSTRUCTIONS = "custom_voice_instructions"
         private const val KEY_AUTO_CHAT_MODE = "auto_chat_mode"
         private const val KEY_AUTO_REPLY_DELIVERY = "auto_reply_delivery"
         private const val KEY_AUTO_REPLY_PERSONA = "auto_reply_persona"
         private const val KEY_ENABLED_APPS = "enabled_messaging_apps"
+        private const val KEY_ASK_AI_HISTORY = "ask_ai_history_json"
+        private const val KEY_CUSTOM_ROUTINES = "custom_routines_json"
     }
 }

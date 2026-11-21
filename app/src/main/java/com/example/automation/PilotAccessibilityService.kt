@@ -6,12 +6,22 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.Rect
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
+import android.media.AudioManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
+import android.os.BatteryManager
 import android.os.Bundle
+import android.provider.AlarmClock
 import android.view.Display
+import android.view.KeyEvent
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.example.data.AgentActivity
@@ -30,6 +40,10 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.net.URLEncoder
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class PilotAccessibilityService : AccessibilityService() {
 
@@ -61,6 +75,9 @@ class PilotAccessibilityService : AccessibilityService() {
         super.onDestroy()
     }
 
+    fun isCurrentScreenBlocked(): Boolean =
+        SafetyGuardrails.isPackageBlocked(currentForegroundPackage())
+
     private fun currentForegroundPackage(): String? =
         rootInActiveWindow?.packageName?.toString()
 
@@ -79,6 +96,134 @@ class PilotAccessibilityService : AccessibilityService() {
         return null
     }
 
+    private fun emitTouchRipple(x: Int, y: Int, label: String = "") {
+        if (PilotStateHub.settings.value.showTouchVisualizer && x > 0 && y > 0) {
+            PilotStateHub.activeController?.showTouchIndicator(x, y, label)
+        }
+    }
+
+    fun getDeviceStatusJson(): JSONObject {
+        val batteryIntent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+        val batteryPct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+        val status = batteryIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+            status == BatteryManager.BATTERY_STATUS_FULL
+
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+        val volPct = (curVol * 100) / maxVol
+        val ringer = when (audioManager.ringerMode) {
+            AudioManager.RINGER_MODE_SILENT -> "SILENT"
+            AudioManager.RINGER_MODE_VIBRATE -> "VIBRATE"
+            else -> "NORMAL"
+        }
+
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+        val networkType = when {
+            caps == null -> "OFFLINE"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "MOBILE_DATA"
+            else -> "CONNECTED"
+        }
+
+        val now = Date()
+        val timeFmt = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(now)
+        val dateFmt = SimpleDateFormat("EEEE, dd MMM yyyy", Locale.getDefault()).format(now)
+        val dm = resources.displayMetrics
+
+        return JSONObject()
+            .put("status", "ok")
+            .put("battery_percent", batteryPct)
+            .put("is_charging", isCharging)
+            .put("local_time", timeFmt)
+            .put("local_date", dateFmt)
+            .put("network", networkType)
+            .put("media_volume_percent", volPct)
+            .put("ringer_mode", ringer)
+            .put("foreground_package", currentForegroundPackage().orEmpty())
+            .put("screen_width", dm.widthPixels)
+            .put("screen_height", dm.heightPixels)
+    }
+
+    fun toggleFlashlight(enabled: Boolean): JSONObject {
+        return runCatching {
+            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val rearWithFlash = cameraManager.cameraIdList.firstOrNull { id ->
+                val chars = cameraManager.getCameraCharacteristics(id)
+                val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                val facingBack = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                hasFlash && facingBack
+            } ?: cameraManager.cameraIdList.firstOrNull { id ->
+                cameraManager.getCameraCharacteristics(id)
+                    .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            }
+            if (rearWithFlash == null) {
+                return JSONObject().put("status", "error").put("message", "No flashlight hardware found.")
+            }
+            cameraManager.setTorchMode(rearWithFlash, enabled)
+            PilotStateHub.log(LogLevel.TOOL, "Flashlight", "Torch set to $enabled")
+            JSONObject().put("status", "ok").put("flashlight_on", enabled)
+        }.getOrElse { err ->
+            PilotStateHub.log(LogLevel.ERROR, "Flashlight", "Torch error: ${err.message}")
+            JSONObject().put("status", "error").put("message", err.message ?: "Failed to toggle flashlight")
+        }
+    }
+
+    fun setAlarmOrTimer(mode: String, hours: Int, minutes: Int, label: String): JSONObject {
+        val m = mode.trim().uppercase()
+        val cleanLabel = label.trim().ifBlank { "LivePilot AI" }
+        return runCatching {
+            val intent = if (m == "ALARM") {
+                Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                    putExtra(AlarmClock.EXTRA_HOUR, hours.coerceIn(0, 23))
+                    putExtra(AlarmClock.EXTRA_MINUTES, minutes.coerceIn(0, 59))
+                    putExtra(AlarmClock.EXTRA_MESSAGE, cleanLabel)
+                    putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            } else {
+                val totalSeconds = ((hours.coerceAtLeast(0) * 3600) + (minutes.coerceAtLeast(0) * 60))
+                    .coerceAtLeast(10)
+                Intent(AlarmClock.ACTION_SET_TIMER).apply {
+                    putExtra(AlarmClock.EXTRA_LENGTH, totalSeconds)
+                    putExtra(AlarmClock.EXTRA_MESSAGE, cleanLabel)
+                    putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            startActivity(intent)
+            PilotStateHub.log(LogLevel.TOOL, "Clock", "Set $m ${hours}h ${minutes}m ($cleanLabel)")
+            JSONObject()
+                .put("status", "ok")
+                .put("mode", m)
+                .put("hours", hours)
+                .put("minutes", minutes)
+                .put("label", cleanLabel)
+        }.getOrElse { err ->
+            JSONObject().put("status", "error").put("message", err.message ?: "Could not set $m")
+        }
+    }
+
+    fun clipboardAction(action: String, text: String): JSONObject {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        return when (action.trim().uppercase()) {
+            "WRITE" -> {
+                clipboard.setPrimaryClip(ClipData.newPlainText("LivePilot", text))
+                PilotStateHub.log(LogLevel.TOOL, "Clipboard", "Copied ${text.length} chars to clipboard")
+                JSONObject().put("status", "ok").put("action", "WRITE").put("copied_length", text.length)
+            }
+            "READ" -> {
+                val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString().orEmpty()
+                JSONObject().put("status", "ok").put("action", "READ").put("text", clipText.take(600))
+            }
+            else -> JSONObject().put("status", "error").put("message", "Unknown clipboard action: $action")
+        }
+    }
+
     fun openAppByName(rawQuery: String): JSONObject {
         val query = rawQuery.trim()
         if (query.isBlank()) {
@@ -88,7 +233,6 @@ class PilotAccessibilityService : AccessibilityService() {
         val normalizedQuery = resolveAlias(query)
         val pm = packageManager
 
-        // Direct package override check first
         DIRECT_PACKAGE_HINTS[normalizedQuery.lowercase()]?.forEach { candidatePkg ->
             if (SafetyGuardrails.isPackageBlocked(candidatePkg)) {
                 return JSONObject()
@@ -107,7 +251,6 @@ class PilotAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Fuzzy match all launchable apps
         val mainIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(mainIntent, PackageManager.MATCH_ALL)
         val targetLower = normalizedQuery.lowercase()
@@ -159,6 +302,176 @@ class PilotAccessibilityService : AccessibilityService() {
             .put("package", bestPkg)
     }
 
+    fun searchYouTube(rawQuery: String): JSONObject {
+        val query = rawQuery.trim()
+        if (query.isBlank()) {
+            return JSONObject().put("status", "error").put("message", "Search query was empty.")
+        }
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val ytUri = Uri.parse("https://www.youtube.com/results?search_query=$encoded")
+        val ytIntent = Intent(Intent.ACTION_VIEW, ytUri).apply {
+            setPackage("com.google.android.youtube")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        val launchedYt = runCatching {
+            startActivity(ytIntent)
+            true
+        }.getOrDefault(false)
+
+        if (!launchedYt) {
+            val fallbackIntent = Intent(Intent.ACTION_VIEW, ytUri).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching { startActivity(fallbackIntent) }
+                .onFailure { err ->
+                    return JSONObject().put("status", "error").put("message", err.message ?: "Could not open YouTube")
+                }
+        }
+
+        PilotStateHub.log(LogLevel.TOOL, "search_youtube", "Opened YouTube search for '$query'")
+        return JSONObject()
+            .put("status", "ok")
+            .put("query", query)
+            .put("in_youtube_app", launchedYt)
+    }
+
+    suspend fun clickByText(rawQuery: String, exact: Boolean): JSONObject {
+        checkSafetyGuardrail()?.let { return it }
+        val query = rawQuery.trim()
+        if (query.isBlank()) {
+            return JSONObject().put("status", "error").put("message", "Query text cannot be empty.")
+        }
+
+        val candidateTerms = expandUiSynonyms(query)
+        var hit = findBestMatchingNode(rootInActiveWindow, candidateTerms, exact)
+        if (hit == null) {
+            performSwipeGesture("DOWN", distancePercent = 45, durationMs = 300L)
+            delay(450)
+            hit = findBestMatchingNode(rootInActiveWindow, candidateTerms, exact)
+        }
+
+        if (hit == null) {
+            return JSONObject()
+                .put("status", "not_found")
+                .put("message", "No visible element matching '$query' found on screen.")
+        }
+
+        val rect = Rect()
+        hit.getBoundsInScreen(rect)
+        val label = (hit.text ?: hit.contentDescription ?: query).toString().take(80)
+        emitTouchRipple(rect.centerX(), rect.centerY(), label)
+
+        val clicked = tryClickNodeOrParent(hit)
+        if (clicked) {
+            PilotStateHub.log(LogLevel.TOOL, "click_by_text", "Clicked '$label' via ACTION_CLICK")
+            return JSONObject()
+                .put("status", "ok")
+                .put("matched", label)
+                .put("method", "accessibility_click")
+        }
+
+        val tapOk = dispatchTapGesture(rect.centerX().toFloat(), rect.centerY().toFloat(), 60L)
+        PilotStateHub.log(LogLevel.TOOL, "click_by_text", "Tapped '$label' at (${rect.centerX()},${rect.centerY()}) ok=$tapOk")
+        return JSONObject()
+            .put("status", if (tapOk) "ok" else "error")
+            .put("matched", label)
+            .put("method", "gesture_tap")
+            .put("x", rect.centerX())
+            .put("y", rect.centerY())
+    }
+
+    fun deviceControl(action: String, value: String): JSONObject {
+        val act = action.trim().uppercase()
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        return when (act) {
+            "VOLUME_UP" -> {
+                audioManager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_RAISE,
+                    AudioManager.FLAG_SHOW_UI
+                )
+                JSONObject().put("status", "ok").put("action", act)
+            }
+            "VOLUME_DOWN" -> {
+                audioManager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_LOWER,
+                    AudioManager.FLAG_SHOW_UI
+                )
+                JSONObject().put("status", "ok").put("action", act)
+            }
+            "VOLUME_MUTE" -> {
+                audioManager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_TOGGLE_MUTE,
+                    AudioManager.FLAG_SHOW_UI
+                )
+                JSONObject().put("status", "ok").put("action", act)
+            }
+            "MEDIA_PLAY_PAUSE" -> {
+                dispatchMediaKey(audioManager, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                JSONObject().put("status", "ok").put("action", act)
+            }
+            "MEDIA_NEXT" -> {
+                dispatchMediaKey(audioManager, KeyEvent.KEYCODE_MEDIA_NEXT)
+                JSONObject().put("status", "ok").put("action", act)
+            }
+            "MEDIA_PREVIOUS" -> {
+                dispatchMediaKey(audioManager, KeyEvent.KEYCODE_MEDIA_PREVIOUS)
+                JSONObject().put("status", "ok").put("action", act)
+            }
+            "OPEN_URL" -> {
+                val url = value.trim().let {
+                    if (it.startsWith("http://") || it.startsWith("https://")) it else "https://$it"
+                }
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val ok = runCatching {
+                    startActivity(intent)
+                    true
+                }.getOrDefault(false)
+                JSONObject().put("status", if (ok) "ok" else "error").put("url", url)
+            }
+            "DIAL_NUMBER" -> {
+                val cleanNum = value.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+                if (cleanNum.isBlank()) {
+                    return JSONObject().put("status", "error").put("message", "No valid phone number provided.")
+                }
+                val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$cleanNum")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val ok = runCatching {
+                    startActivity(intent)
+                    true
+                }.getOrDefault(false)
+                JSONObject().put("status", if (ok) "ok" else "error").put("number", cleanNum)
+            }
+            "WHATSAPP_CHAT" -> {
+                val digits = value.filter { it.isDigit() }
+                if (digits.isBlank()) {
+                    return JSONObject().put("status", "error").put("message", "Provide phone digits with country code.")
+                }
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$digits")).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                val ok = runCatching {
+                    startActivity(intent)
+                    true
+                }.getOrDefault(false)
+                JSONObject().put("status", if (ok) "ok" else "error").put("number", digits)
+            }
+            else -> JSONObject().put("status", "error").put("message", "Unknown device_control action: $action")
+        }
+    }
+
+    private fun dispatchMediaKey(audioManager: AudioManager, keyCode: Int) {
+        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+    }
+
+    @Suppress("DEPRECATION")
     fun getScreenUiJson(): JSONObject {
         checkSafetyGuardrail()?.let { return it }
 
@@ -173,7 +486,7 @@ class PilotAccessibilityService : AccessibilityService() {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
 
-        val maxNodes = 85
+        val maxNodes = 95
         while (queue.isNotEmpty() && lastIndexedNodes.size < maxNodes) {
             val node = queue.removeFirst()
             for (i in 0 until node.childCount) {
@@ -185,6 +498,7 @@ class PilotAccessibilityService : AccessibilityService() {
             val desc = node.contentDescription?.toString()?.trim().orEmpty()
             val clickable = node.isClickable
             val editable = node.isEditable
+            val scrollable = node.isScrollable
             val meaningful = clickable || editable || text.isNotEmpty() || desc.isNotEmpty()
             if (!meaningful) continue
 
@@ -202,6 +516,9 @@ class PilotAccessibilityService : AccessibilityService() {
                 .put("bounds", "${rect.left},${rect.top},${rect.right},${rect.bottom}")
                 .put("clickable", clickable)
                 .put("editable", editable)
+            if (scrollable) item.put("scrollable", true)
+            if (node.isCheckable) item.put("checked", node.isChecked)
+            if (node.isFocused) item.put("focused", true)
             if (text.isNotEmpty()) item.put("text", text.take(100))
             if (desc.isNotEmpty()) item.put("desc", desc.take(100))
             elements.put(item)
@@ -222,9 +539,8 @@ class PilotAccessibilityService : AccessibilityService() {
         val dm = resources.displayMetrics
         val controller = PilotStateHub.activeController
 
-        // Temporarily make overlay invisible/non-touchable so it never blocks UI beneath
         controller?.setOverlayTemporarilyHidden(true)
-        delay(120)
+        delay(110)
 
         val jpegResult = CompletableDeferred<ByteArray?>()
         try {
@@ -361,6 +677,9 @@ class PilotAccessibilityService : AccessibilityService() {
 
         if (index in lastIndexedNodes.indices) {
             val node = lastIndexedNodes[index]
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
+            emitTouchRipple(rect.centerX(), rect.centerY(), "Tap #$index")
             val clicked = tryClickNodeOrParent(node)
             if (clicked) {
                 PilotStateHub.log(LogLevel.TOOL, "Click", "Clicked node #$index via ACTION_CLICK")
@@ -369,6 +688,7 @@ class PilotAccessibilityService : AccessibilityService() {
         }
 
         if (x > 0 && y > 0) {
+            emitTouchRipple(x, y, "Tap")
             val ok = dispatchTapGesture(x.toFloat(), y.toFloat(), durationMs = 60L)
             PilotStateHub.log(LogLevel.TOOL, "Click", "Dispatched 60ms tap at ($x, $y) ok=$ok")
             return JSONObject()
@@ -384,6 +704,7 @@ class PilotAccessibilityService : AccessibilityService() {
     suspend fun longPress(x: Int, y: Int, durationMs: Int): JSONObject {
         checkSafetyGuardrail()?.let { return it }
         val dur = durationMs.coerceIn(450, 2500).toLong()
+        emitTouchRipple(x, y, "Hold")
         val ok = dispatchTapGesture(x.toFloat(), y.toFloat(), durationMs = dur)
         return JSONObject()
             .put("status", if (ok) "ok" else "error")
@@ -401,11 +722,13 @@ class PilotAccessibilityService : AccessibilityService() {
     ): JSONObject {
         checkSafetyGuardrail()?.let { return it }
         val dur = durationMs.coerceIn(150, 3000).toLong()
+        emitTouchRipple(startX, startY, "Drag")
         val path = Path().apply {
             moveTo(startX.toFloat(), startY.toFloat())
             lineTo(endX.toFloat(), endY.toFloat())
         }
         val ok = dispatchPathGesture(path, dur)
+        emitTouchRipple(endX, endY, "")
         PilotStateHub.log(LogLevel.TOOL, "Drag", "($startX,$startY)->($endX,$endY) ${dur}ms ok=$ok")
         return JSONObject()
             .put("status", if (ok) "ok" else "error")
@@ -423,19 +746,22 @@ class PilotAccessibilityService : AccessibilityService() {
     ): JSONObject {
         checkSafetyGuardrail()?.let { return it }
 
-        var targetNode: AccessibilityNodeInfo? =
+        val targetNode: AccessibilityNodeInfo? =
             if (index in lastIndexedNodes.indices) lastIndexedNodes[index] else null
 
         if (targetNode != null) {
+            val r = Rect()
+            targetNode.getBoundsInScreen(r)
+            emitTouchRipple(r.centerX(), r.centerY(), "Type")
             targetNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
             targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         } else if (x > 0 && y > 0) {
+            emitTouchRipple(x, y, "Type")
             dispatchTapGesture(x.toFloat(), y.toFloat(), 60L)
         }
 
         delay(220)
 
-        // Re-locate focused editable node in active window
         val root = rootInActiveWindow
         val focusedEdit = root?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
             ?: targetNode
@@ -450,7 +776,6 @@ class PilotAccessibilityService : AccessibilityService() {
         }
         var setOk = focusedEdit.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
 
-        // Clipboard + ACTION_PASTE fallback for custom chat inputs (imo, etc.)
         if (!setOk) {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.setPrimaryClip(ClipData.newPlainText("LivePilotText", text))
@@ -484,6 +809,7 @@ class PilotAccessibilityService : AccessibilityService() {
             "HOME" -> GLOBAL_ACTION_HOME
             "RECENTS" -> GLOBAL_ACTION_RECENTS
             "NOTIFICATIONS" -> GLOBAL_ACTION_NOTIFICATIONS
+            "QUICK_SETTINGS" -> GLOBAL_ACTION_QUICK_SETTINGS
             else -> return JSONObject().put("status", "error").put("message", "Unknown navigation action: $action")
         }
         val ok = performGlobalAction(globalAction)
@@ -511,8 +837,64 @@ class PilotAccessibilityService : AccessibilityService() {
             }
         }
 
-        // Fallback: open the messaging app directly
         return openAppByName(senderOrApp)
+    }
+
+    private fun expandUiSynonyms(query: String): List<String> {
+        val q = query.lowercase()
+        val results = mutableListOf(q)
+        UI_SYNONYMS.forEach { group ->
+            if (group.any { it == q || q.contains(it) }) {
+                results.addAll(group)
+            }
+        }
+        return results.distinct()
+    }
+
+    private fun findBestMatchingNode(
+        root: AccessibilityNodeInfo?,
+        queries: List<String>,
+        exact: Boolean
+    ): AccessibilityNodeInfo? {
+        if (root == null) return null
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var bestNode: AccessibilityNodeInfo? = null
+        var bestScore = 0
+
+        while (queue.isNotEmpty()) {
+            val node = queue.removeFirst()
+            for (i in 0 until node.childCount) {
+                node.getChild(i)?.let { queue.add(it) }
+            }
+            if (!node.isVisibleToUser) continue
+            val text = node.text?.toString()?.trim().orEmpty()
+            val desc = node.contentDescription?.toString()?.trim().orEmpty()
+            val tLow = text.lowercase()
+            val dLow = desc.lowercase()
+
+            var nodeScore = 0
+            for (q in queries) {
+                val matched = if (exact) {
+                    tLow == q || dLow == q
+                } else {
+                    tLow.contains(q) || dLow.contains(q)
+                }
+                if (!matched) continue
+                val s = when {
+                    (tLow == q || dLow == q) && node.isClickable -> 100
+                    (tLow == q || dLow == q) -> 90
+                    node.isClickable -> 75
+                    else -> 50
+                }
+                if (s > nodeScore) nodeScore = s
+            }
+            if (nodeScore > bestScore) {
+                bestScore = nodeScore
+                bestNode = node
+            }
+        }
+        return bestNode
     }
 
     private suspend fun performSwipeGesture(
@@ -531,12 +913,10 @@ class PilotAccessibilityService : AccessibilityService() {
         val path = Path()
         when (direction) {
             "DOWN" -> {
-                // Scroll down content => swipe finger UP
                 path.moveTo(cx, (cy + deltaY).coerceAtMost(h * 0.85f))
                 path.lineTo(cx, (cy - deltaY).coerceAtLeast(h * 0.18f))
             }
             "UP" -> {
-                // Scroll up content => swipe finger DOWN
                 path.moveTo(cx, (cy - deltaY).coerceAtLeast(h * 0.18f))
                 path.lineTo(cx, (cy + deltaY).coerceAtMost(h * 0.85f))
             }
@@ -653,8 +1033,23 @@ class PilotAccessibilityService : AccessibilityService() {
         @Volatile
         var instance: PilotAccessibilityService? = null
 
+        private val UI_SYNONYMS: List<List<String>> = listOf(
+            listOf("send", "পাঠান", "reply", "post"),
+            listOf("search", "খুঁজুন", "সার্চ"),
+            listOf("like", "লাইক", "love"),
+            listOf("share", "শেয়ার", "শেয়ার"),
+            listOf("subscribe", "সাবস্ক্রাইব"),
+            listOf("comment", "কমেন্ট", "comments"),
+            listOf("skip", "স্কিপ", "skip ad", "skip ads"),
+            listOf("play", "চালু", "resume"),
+            listOf("pause", "থামান", "পজ"),
+            listOf("next", "পরবর্তী", "নেক্সট"),
+            listOf("allow", "অনুমতি", "accept")
+        )
+
         private val BENGALI_APP_ALIASES: Map<String, String> = mapOf(
             "ইউটিউব" to "YouTube",
+            "ইউটিউব স্টুডিও" to "YouTube Studio",
             "ইমো" to "imo",
             "হোয়াটসঅ্যাপ" to "WhatsApp",
             "হোয়াটসঅ্যাপ" to "WhatsApp",
@@ -669,11 +1064,20 @@ class PilotAccessibilityService : AccessibilityService() {
             "সেটিংস" to "Settings",
             "ক্যামেরা" to "Camera",
             "টিকটক" to "TikTok",
-            "ইনস্টাগ্রাম" to "Instagram"
+            "ইনস্টাগ্রাম" to "Instagram",
+            "স্পটিফাই" to "Spotify",
+            "ম্যাপস" to "Maps",
+            "গুগল ম্যাপ" to "Maps",
+            "জিমেইল" to "Gmail",
+            "প্লে স্টোর" to "Play Store",
+            "ক্যালকুলেটর" to "Calculator",
+            "ঘড়ি" to "Clock",
+            "ফাইল" to "Files"
         )
 
         private val DIRECT_PACKAGE_HINTS: Map<String, List<String>> = mapOf(
             "youtube" to listOf("com.google.android.youtube"),
+            "youtube studio" to listOf("com.google.android.apps.youtube.creator"),
             "imo" to listOf("com.imo.android.imoim", "com.imo.android.imoimhd", "com.imo.android.imoimbeta"),
             "whatsapp" to listOf("com.whatsapp", "com.whatsapp.w4b"),
             "facebook" to listOf("com.facebook.katana", "com.facebook.lite"),
@@ -681,8 +1085,17 @@ class PilotAccessibilityService : AccessibilityService() {
             "capcut" to listOf("com.lemon.lvoverseas"),
             "inshot" to listOf("com.camerasideas.instashot"),
             "canva" to listOf("com.canva.editor"),
-            "telegram" to listOf("org.telegram.messenger"),
-            "chrome" to listOf("com.android.chrome")
+            "vn" to listOf("com.frontrow.vlog"),
+            "picsart" to listOf("com.picsart.studio"),
+            "lightroom" to listOf("com.adobe.lrmobile"),
+            "telegram" to listOf("org.telegram.messenger", "org.telegram.messenger.web"),
+            "chrome" to listOf("com.android.chrome"),
+            "spotify" to listOf("com.spotify.music"),
+            "instagram" to listOf("com.instagram.android"),
+            "tiktok" to listOf("com.zhiliaoapp.musically", "com.ss.android.ugc.trill"),
+            "maps" to listOf("com.google.android.apps.maps"),
+            "gmail" to listOf("com.google.android.gm"),
+            "play store" to listOf("com.android.vending")
         )
     }
 }

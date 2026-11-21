@@ -24,11 +24,14 @@ data class CachedNotificationHandle(
 
 interface OverlaySessionController {
     fun toggleMute()
+    fun toggleAutoVision()
     fun triggerManualVisionCapture()
     fun emergencyStopActions()
     fun endCallSession()
     fun setOverlayTemporarilyHidden(hidden: Boolean)
+    fun showTouchIndicator(x: Int, y: Int, label: String = "")
     fun pushIncomingMessageAlert(alertText: String)
+    fun sendUserTextCommand(commandText: String): Boolean
     fun sendVisionFrame(jpegBytes: ByteArray): Boolean
 }
 
@@ -36,6 +39,7 @@ object PilotStateHub {
 
     private val logIdCounter = AtomicLong(1L)
     private val captionIdCounter = AtomicLong(1L)
+    private val toolEventIdCounter = AtomicLong(1L)
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
     private var preferences: PilotPreferences? = null
@@ -52,6 +56,9 @@ object PilotStateHub {
     private val _captions = MutableStateFlow<List<LiveCaptionLine>>(emptyList())
     val captions: StateFlow<List<LiveCaptionLine>> = _captions.asStateFlow()
 
+    private val _recentToolEvents = MutableStateFlow<List<RecentToolEvent>>(emptyList())
+    val recentToolEvents: StateFlow<List<RecentToolEvent>> = _recentToolEvents.asStateFlow()
+
     private val _incomingMessages = MutableStateFlow<List<IncomingMessageRecord>>(emptyList())
     val incomingMessages: StateFlow<List<IncomingMessageRecord>> = _incomingMessages.asStateFlow()
 
@@ -66,12 +73,20 @@ object PilotStateHub {
     @Volatile
     var activeController: OverlaySessionController? = null
 
+    @Volatile
+    var pendingStartupCommand: String? = null
+
     fun ensureInitialized(context: Context) {
         if (preferences == null) {
             val prefs = PilotPreferences(context.applicationContext)
             preferences = prefs
             _settings.value = prefs.loadSettings()
         }
+    }
+
+    fun getPreferences(context: Context): PilotPreferences {
+        ensureInitialized(context)
+        return preferences!!
     }
 
     fun updateSettings(transform: (PilotSettings) -> PilotSettings) {
@@ -82,6 +97,36 @@ object PilotStateHub {
 
     fun updateSession(transform: (LiveSessionState) -> LiveSessionState) {
         _sessionState.update(transform)
+    }
+
+    fun recordToolExecuted(toolName: String, summary: String, succeeded: Boolean) {
+        val event = RecentToolEvent(
+            id = toolEventIdCounter.getAndIncrement(),
+            toolName = toolName,
+            summary = summary,
+            succeeded = succeeded,
+            timestamp = formatNow()
+        )
+        _recentToolEvents.update { (listOf(event) + it).take(12) }
+        _sessionState.update {
+            it.copy(
+                toolsExecutedCount = it.toolsExecutedCount + 1,
+                lastToolSummary = "${if (succeeded) "✓" else "!"} $summary"
+            )
+        }
+    }
+
+    fun clearRecentToolEvents() {
+        _recentToolEvents.value = emptyList()
+    }
+
+    fun updateAudioLevels(mic: Float? = null, ai: Float? = null) {
+        _sessionState.update { state ->
+            state.copy(
+                micLevel = mic ?: state.micLevel,
+                aiAudioLevel = ai ?: state.aiAudioLevel
+            )
+        }
     }
 
     fun updatePermissions(snapshot: PermissionSnapshot) {
@@ -101,7 +146,7 @@ object PilotStateHub {
             message = message
         )
         _logs.update { current ->
-            (current + entry).takeLast(250)
+            (current + entry).takeLast(300)
         }
     }
 
@@ -112,9 +157,10 @@ object PilotStateHub {
     fun appendCaption(speaker: String, chunkText: String) {
         val trimmed = chunkText.trim()
         if (trimmed.isEmpty()) return
+        _sessionState.update { it.copy(lastCaptionPreview = "$speaker: ${trimmed.take(72)}") }
         _captions.update { current ->
             val last = current.lastOrNull()
-            if (last != null && last.speaker == speaker && last.text.length < 220) {
+            if (last != null && last.speaker == speaker && last.text.length < 240) {
                 val merged = if (last.text.endsWith(" ") || trimmed.startsWith(" ")) {
                     last.text + trimmed
                 } else {
@@ -127,7 +173,7 @@ object PilotStateHub {
                     speaker = speaker,
                     text = trimmed,
                     timestamp = formatNow()
-                )).takeLast(40)
+                )).takeLast(60)
             }
         }
     }
@@ -174,12 +220,10 @@ object PilotStateHub {
             val latestId = orderedIds.firstOrNull() ?: return null
             return notificationHandles[latestId]
         }
-        // First match by sender name
         for (id in orderedIds) {
             val handle = notificationHandles[id] ?: continue
             if (handle.senderName.lowercase().contains(normalized)) return handle
         }
-        // Fallback match by app name or package
         for (id in orderedIds) {
             val handle = notificationHandles[id] ?: continue
             if (handle.app.displayName.lowercase().contains(normalized) ||

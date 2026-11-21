@@ -25,11 +25,14 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
@@ -58,39 +61,31 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.data.AskAiMessage
 import com.example.data.PilotSettings
 import com.example.ui.AskAiUiState
 import com.example.ui.components.StatusPillBadge
+import com.example.ui.components.formatAiRichText
 import com.example.ui.theme.CobaltBlue
-import com.example.ui.theme.CobaltDark
-import com.example.ui.theme.CobaltSoft
-import com.example.ui.theme.EmeraldDark
 import com.example.ui.theme.EmeraldGreen
-import com.example.ui.theme.EmeraldSoft
-import com.example.ui.theme.InkMuted
-import com.example.ui.theme.InkPrimary
-import com.example.ui.theme.InkSecondary
-import com.example.ui.theme.RedSoft
 import com.example.ui.theme.RoyalViolet
-import com.example.ui.theme.SignalRedDark
-import com.example.ui.theme.StudioCard
-import com.example.ui.theme.StudioOutline
-import com.example.ui.theme.StudioSurfaceSubtle
-import com.example.ui.theme.VioletSoft
+import com.example.ui.theme.StudioTheme
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun AskAiScreen(
     settings: PilotSettings,
     uiState: AskAiUiState,
+    isCallActive: Boolean,
     onSelectTextModel: (String) -> Unit,
     onToggleSearchGrounding: (Boolean) -> Unit,
     onSendPrompt: (String) -> Unit,
+    onSendToLiveCall: (String) -> Unit,
     onClearThread: () -> Unit
 ) {
+    val palette = StudioTheme.colors
     var inputText by rememberSaveable { mutableStateOf("") }
     val listState = rememberLazyListState()
     val context = LocalContext.current
@@ -115,28 +110,40 @@ fun AskAiScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Column {
+            Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = "Ask AI",
                     style = MaterialTheme.typography.headlineMedium,
-                    color = InkPrimary
+                    color = palette.inkPrimary
                 )
                 Text(
-                    text = "Multi-turn Gemini chat + Google Search Grounding",
+                    text = "Saved multi-turn chat + Google Search Grounding",
                     style = MaterialTheme.typography.bodySmall,
-                    color = InkSecondary
+                    color = palette.inkSecondary
                 )
             }
-            if (uiState.messages.isNotEmpty()) {
-                IconButton(
-                    onClick = onClearThread,
-                    modifier = Modifier.testTag("ask_ai_clear_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.DeleteSweep,
-                        contentDescription = "Clear conversation",
-                        tint = InkSecondary
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (isCallActive) {
+                    StatusPillBadge(
+                        label = "CALL LIVE",
+                        accentColor = palette.emeraldAccent,
+                        containerColor = palette.emeraldSoft
                     )
+                }
+                if (uiState.messages.isNotEmpty()) {
+                    IconButton(
+                        onClick = onClearThread,
+                        modifier = Modifier.testTag("ask_ai_clear_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.DeleteSweep,
+                            contentDescription = "Clear conversation",
+                            tint = palette.inkSecondary
+                        )
+                    }
                 }
             }
         }
@@ -147,8 +154,8 @@ fun AskAiScreen(
         Surface(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(18.dp),
-            color = StudioCard,
-            border = BorderStroke(1.dp, StudioOutline)
+            color = palette.card,
+            border = BorderStroke(1.dp, palette.outline)
         ) {
             Column(modifier = Modifier.padding(12.dp)) {
                 Row(
@@ -156,11 +163,14 @@ fun AskAiScreen(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
                         Icon(
                             imageVector = Icons.Filled.Public,
                             contentDescription = "Google Search Grounding",
-                            tint = if (uiState.searchGroundingEnabled) EmeraldDark else InkMuted,
+                            tint = if (uiState.searchGroundingEnabled) palette.emeraldAccent else palette.inkMuted,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -168,12 +178,12 @@ fun AskAiScreen(
                             Text(
                                 text = "Google Search Grounding",
                                 style = MaterialTheme.typography.titleSmall,
-                                color = InkPrimary
+                                color = palette.inkPrimary
                             )
                             Text(
-                                text = "Live web data & clickable citations",
+                                text = "Live web data & clickable source links",
                                 style = MaterialTheme.typography.bodySmall,
-                                color = InkSecondary
+                                color = palette.inkSecondary
                             )
                         }
                     }
@@ -190,9 +200,7 @@ fun AskAiScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                LazyRow(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     items(selectableModels) { modelId ->
                         val selected = modelId.equals(settings.textModel, ignoreCase = true)
                         FilterChip(
@@ -205,8 +213,8 @@ fun AskAiScreen(
                                 )
                             },
                             colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = VioletSoft,
-                                selectedLabelColor = RoyalViolet
+                                selectedContainerColor = palette.violetSoft,
+                                selectedLabelColor = palette.violetAccent
                             )
                         )
                     }
@@ -223,12 +231,12 @@ fun AskAiScreen(
                     .fillMaxWidth()
                     .padding(bottom = 8.dp),
                 shape = RoundedCornerShape(14.dp),
-                color = RedSoft
+                color = palette.redSoft
             ) {
                 Text(
                     text = uiState.errorText,
                     style = MaterialTheme.typography.bodySmall,
-                    color = SignalRedDark,
+                    color = palette.redAccent,
                     modifier = Modifier.padding(12.dp)
                 )
             }
@@ -247,13 +255,13 @@ fun AskAiScreen(
                     modifier = Modifier
                         .size(56.dp)
                         .clip(CircleShape)
-                        .background(VioletSoft),
+                        .background(palette.violetSoft),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = Icons.Filled.AutoAwesome,
                         contentDescription = "Ask AI",
-                        tint = RoyalViolet,
+                        tint = palette.violetAccent,
                         modifier = Modifier.size(28.dp)
                     )
                 }
@@ -261,13 +269,13 @@ fun AskAiScreen(
                 Text(
                     text = "Ask Anything with Live Search",
                     style = MaterialTheme.typography.titleLarge,
-                    color = InkPrimary
+                    color = palette.inkPrimary
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Ask in Bengali or English. Change or customize the text model anytime in Settings.",
+                    text = "Ask in Bengali or English. Answers stay saved and can be pushed to your Live Call.",
                     style = MaterialTheme.typography.bodySmall,
-                    color = InkSecondary
+                    color = palette.inkSecondary
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -284,15 +292,16 @@ fun AskAiScreen(
                         Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .clip(RoundedCornerShape(14.dp))
                                 .clickable { onSendPrompt(suggestion) },
                             shape = RoundedCornerShape(14.dp),
-                            color = StudioCard,
-                            border = BorderStroke(1.dp, StudioOutline)
+                            color = palette.card,
+                            border = BorderStroke(1.dp, palette.outline)
                         ) {
                             Text(
                                 text = suggestion,
                                 style = MaterialTheme.typography.bodyMedium,
-                                color = InkPrimary,
+                                color = palette.inkPrimary,
                                 modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp)
                             )
                         }
@@ -311,7 +320,11 @@ fun AskAiScreen(
                 items(uiState.messages, key = { it.id }) { msg ->
                     ChatMessageBubble(
                         message = msg,
+                        isCallActive = isCallActive,
                         onCopy = { clipboard.setText(AnnotatedString(msg.text)) },
+                        onSendToLiveCall = {
+                            onSendToLiveCall("Follow this plan or speak this briefly: ${msg.text.take(400)}")
+                        },
                         onOpenUrl = { url ->
                             runCatching {
                                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -329,7 +342,7 @@ fun AskAiScreen(
                             CircularProgressIndicator(
                                 modifier = Modifier.size(16.dp),
                                 strokeWidth = 2.dp,
-                                color = RoyalViolet
+                                color = palette.violetAccent
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
@@ -339,7 +352,7 @@ fun AskAiScreen(
                                     "Thinking with ${settings.textModel}..."
                                 },
                                 style = MaterialTheme.typography.bodySmall,
-                                color = InkSecondary
+                                color = palette.inkSecondary
                             )
                         }
                     }
@@ -358,17 +371,27 @@ fun AskAiScreen(
             OutlinedTextField(
                 value = inputText,
                 onValueChange = { inputText = it },
-                placeholder = { Text("Ask in Bengali or English...", color = InkMuted) },
+                placeholder = { Text("Ask in Bengali or English...", color = palette.inkMuted) },
                 modifier = Modifier
                     .weight(1f)
                     .testTag("ask_ai_input"),
                 shape = RoundedCornerShape(18.dp),
                 maxLines = 3,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                keyboardActions = KeyboardActions(
+                    onSend = {
+                        if (inputText.isNotBlank() && !uiState.isGenerating) {
+                            val toSend = inputText
+                            inputText = ""
+                            onSendPrompt(toSend)
+                        }
+                    }
+                ),
                 colors = OutlinedTextFieldDefaults.colors(
-                    focusedContainerColor = StudioCard,
-                    unfocusedContainerColor = StudioCard,
-                    focusedBorderColor = RoyalViolet,
-                    unfocusedBorderColor = StudioOutline
+                    focusedContainerColor = palette.card,
+                    unfocusedContainerColor = palette.card,
+                    focusedBorderColor = palette.violetAccent,
+                    unfocusedBorderColor = palette.outline
                 )
             )
             Surface(
@@ -381,13 +404,13 @@ fun AskAiScreen(
                         onSendPrompt(toSend)
                     }
                     .testTag("ask_ai_send_button"),
-                color = if (inputText.isNotBlank() && !uiState.isGenerating) RoyalViolet else StudioSurfaceSubtle
+                color = if (inputText.isNotBlank() && !uiState.isGenerating) RoyalViolet else palette.surfaceSubtle
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send prompt",
-                        tint = if (inputText.isNotBlank() && !uiState.isGenerating) Color.White else InkMuted,
+                        tint = if (inputText.isNotBlank() && !uiState.isGenerating) Color.White else palette.inkMuted,
                         modifier = Modifier.size(22.dp)
                     )
                 }
@@ -400,9 +423,12 @@ fun AskAiScreen(
 @Composable
 private fun ChatMessageBubble(
     message: AskAiMessage,
+    isCallActive: Boolean,
     onCopy: () -> Unit,
+    onSendToLiveCall: () -> Unit,
     onOpenUrl: (String) -> Unit
 ) {
+    val palette = StudioTheme.colors
     val alignment = if (message.isUser) Alignment.End else Alignment.Start
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -416,22 +442,31 @@ private fun ChatMessageBubble(
                 bottomStart = if (message.isUser) 18.dp else 6.dp,
                 bottomEnd = if (message.isUser) 6.dp else 18.dp
             ),
-            color = if (message.isUser) CobaltBlue else StudioCard,
-            border = if (message.isUser) null else BorderStroke(1.dp, StudioOutline)
+            color = if (message.isUser) CobaltBlue else palette.card,
+            border = if (message.isUser) null else BorderStroke(1.dp, palette.outline)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (message.isUser) Color.White else InkPrimary
-                )
+                if (message.isUser) {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color.White
+                    )
+                } else {
+                    Text(
+                        text = formatAiRichText(message.text),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = palette.inkPrimary
+                    )
+                }
 
                 if (message.citations.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "Sources",
+                        text = "Verified Sources",
                         style = MaterialTheme.typography.labelMedium,
-                        color = EmeraldDark
+                        color = palette.emeraldAccent,
+                        fontWeight = FontWeight.SemiBold
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     FlowRow(
@@ -439,26 +474,48 @@ private fun ChatMessageBubble(
                         verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         message.citations.forEach { citation ->
+                            val domain = extractDomain(citation.url)
                             Surface(
-                                modifier = Modifier.clickable { onOpenUrl(citation.url) },
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .clickable { onOpenUrl(citation.url) },
                                 shape = RoundedCornerShape(50),
-                                color = EmeraldSoft,
-                                border = BorderStroke(1.dp, EmeraldGreen.copy(alpha = 0.35f))
+                                color = palette.emeraldSoft,
+                                border = BorderStroke(1.dp, palette.emeraldAccent.copy(alpha = 0.35f))
                             ) {
-                                Text(
-                                    text = citation.title,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = EmeraldDark,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
-                                )
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (!domain.isNullOrBlank()) {
+                                        Surface(
+                                            shape = RoundedCornerShape(50),
+                                            color = palette.emeraldAccent.copy(alpha = 0.16f)
+                                        ) {
+                                            Text(
+                                                text = domain,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = palette.emeraldAccent,
+                                                fontWeight = FontWeight.Bold,
+                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                    }
+                                    Text(
+                                        text = citation.title,
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = palette.emeraldAccent,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(6.dp))
+                Spacer(modifier = Modifier.height(8.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -473,25 +530,68 @@ private fun ChatMessageBubble(
                             }
                         },
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (message.isUser) Color.White.copy(alpha = 0.78f) else InkMuted
+                        color = if (message.isUser) Color.White.copy(alpha = 0.78f) else palette.inkMuted,
+                        modifier = Modifier.weight(1f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                     if (!message.isUser) {
-                        IconButton(
-                            onClick = onCopy,
-                            modifier = Modifier.size(32.dp)
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.ContentCopy,
-                                contentDescription = "Copy reply",
-                                tint = InkMuted,
-                                modifier = Modifier.size(16.dp)
-                            )
+                            if (isCallActive) {
+                                Surface(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .clickable(onClick = onSendToLiveCall)
+                                        .testTag("ask_ai_send_to_call_button"),
+                                    shape = RoundedCornerShape(50),
+                                    color = palette.cobaltSoft,
+                                    border = BorderStroke(1.dp, palette.cobaltAccent.copy(alpha = 0.25f))
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 5.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.PhoneInTalk,
+                                            contentDescription = "Send to Live Call",
+                                            tint = palette.cobaltAccent,
+                                            modifier = Modifier.size(13.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = "Send to Call",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = palette.cobaltAccent,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
+                            }
+                            IconButton(
+                                onClick = onCopy,
+                                modifier = Modifier.size(34.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.ContentCopy,
+                                    contentDescription = "Copy reply",
+                                    tint = palette.inkMuted,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+private fun extractDomain(url: String): String? {
+    val host = runCatching { Uri.parse(url).host }.getOrNull() ?: return null
+    return host.removePrefix("www.").take(24)
 }
 
 private fun rememberSelectableModels(currentTextModel: String): List<String> {

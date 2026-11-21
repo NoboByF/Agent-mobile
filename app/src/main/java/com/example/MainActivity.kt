@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -13,6 +14,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
@@ -36,6 +39,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -44,7 +48,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -59,26 +65,46 @@ import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.SettingsLogsScreen
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.LivePilotTheme
-import com.example.ui.theme.StudioBackground
+import com.example.ui.theme.StudioTheme
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            LivePilotTheme {
-                LivePilotAppRoot()
-            }
+            LivePilotAppEntry()
         }
     }
 }
 
 @Composable
-private fun LivePilotAppRoot(
+private fun LivePilotAppEntry(
     viewModel: PilotViewModel = viewModel()
+) {
+    val settings by viewModel.settings.collectAsStateWithLifecycle()
+
+    LivePilotTheme(themeMode = settings.themeMode) {
+        val isDark = StudioTheme.colors.isDark
+        val view = LocalView.current
+        if (!view.isInEditMode) {
+            SideEffect {
+                val window = (view.context as? Activity)?.window ?: return@SideEffect
+                val controller = WindowCompat.getInsetsController(window, view)
+                controller.isAppearanceLightStatusBars = !isDark
+                controller.isAppearanceLightNavigationBars = !isDark
+            }
+        }
+        LivePilotAppRoot(viewModel = viewModel)
+    }
+}
+
+@Composable
+private fun LivePilotAppRoot(
+    viewModel: PilotViewModel
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
+    val palette = StudioTheme.colors
 
     var selectedTab by rememberSaveable { mutableStateOf(PilotTab.HOME) }
 
@@ -88,6 +114,8 @@ private fun LivePilotAppRoot(
     val connectionTest by viewModel.connectionTest.collectAsStateWithLifecycle()
     val logs by viewModel.logs.collectAsStateWithLifecycle()
     val captions by viewModel.captions.collectAsStateWithLifecycle()
+    val recentToolEvents by viewModel.recentToolEvents.collectAsStateWithLifecycle()
+    val routines by viewModel.routines.collectAsStateWithLifecycle()
     val incomingMessages by viewModel.incomingMessages.collectAsStateWithLifecycle()
     val discoveredModels by viewModel.discoveredModels.collectAsStateWithLifecycle()
     val isFetchingModels by viewModel.isFetchingModels.collectAsStateWithLifecycle()
@@ -95,14 +123,12 @@ private fun LivePilotAppRoot(
     val askAiState by viewModel.askAiState.collectAsStateWithLifecycle()
     val bannerMessage by viewModel.bannerMessage.collectAsStateWithLifecycle()
 
-    // Runtime permission launcher for Microphone (+ POST_NOTIFICATIONS on Android 13+)
     val runtimePermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshPermissions()
     }
 
-    // Refresh permissions every time user returns from Android system settings
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -113,7 +139,6 @@ private fun LivePilotAppRoot(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    // Back press from secondary tabs returns smoothly to Home tab
     BackHandler(enabled = selectedTab != PilotTab.HOME) {
         selectedTab = PilotTab.HOME
     }
@@ -121,7 +146,7 @@ private fun LivePilotAppRoot(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(StudioBackground)
+            .background(palette.background)
             .statusBarsPadding()
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -165,101 +190,138 @@ private fun LivePilotAppRoot(
             }
 
             Box(modifier = Modifier.weight(1f)) {
-                when (selectedTab) {
-                    PilotTab.HOME -> HomeScreen(
-                        settings = settings,
-                        sessionState = sessionState,
-                        permissions = permissions,
-                        connectionTest = connectionTest,
-                        recentCaptions = captions,
-                        onStartOrStopCall = {
-                            val needed = buildList {
-                                add(Manifest.permission.RECORD_AUDIO)
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                    add(Manifest.permission.POST_NOTIFICATIONS)
+                Crossfade(
+                    targetState = selectedTab,
+                    animationSpec = tween(durationMillis = 190),
+                    label = "tab_crossfade"
+                ) { tab ->
+                    when (tab) {
+                        PilotTab.HOME -> HomeScreen(
+                            settings = settings,
+                            sessionState = sessionState,
+                            permissions = permissions,
+                            connectionTest = connectionTest,
+                            recentCaptions = captions,
+                            recentToolEvents = recentToolEvents,
+                            routines = routines,
+                            onStartOrStopCall = {
+                                val needed = buildList {
+                                    add(Manifest.permission.RECORD_AUDIO)
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        add(Manifest.permission.POST_NOTIFICATIONS)
+                                    }
                                 }
-                            }
-                            if (!permissions.micGranted) {
+                                if (!permissions.micGranted) {
+                                    runtimePermLauncher.launch(needed.toTypedArray())
+                                } else {
+                                    viewModel.startOrStopLiveCall()
+                                }
+                            },
+                            onTestConnection = { viewModel.testLiveConnection() },
+                            onToggleMute = { viewModel.toggleMute() },
+                            onToggleAutoVision = { viewModel.toggleAutoVision() },
+                            onCaptureVision = { viewModel.triggerVisionCapture() },
+                            onSendSilentCommand = { viewModel.sendSilentCommandToCall(it) },
+                            onEmergencyStop = { viewModel.emergencyStop() },
+                            onLaunchRoutine = { routine ->
+                                if (!permissions.micGranted) {
+                                    val needed = buildList {
+                                        add(Manifest.permission.RECORD_AUDIO)
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                            add(Manifest.permission.POST_NOTIFICATIONS)
+                                        }
+                                    }
+                                    runtimePermLauncher.launch(needed.toTypedArray())
+                                } else {
+                                    viewModel.launchRoutine(routine)
+                                }
+                            },
+                            onAddRoutine = { t, s, p, a -> viewModel.addCustomRoutine(t, s, p, a) },
+                            onDeleteRoutine = { viewModel.deleteCustomRoutine(it) },
+                            onToggleTheme = { currentlyDark -> viewModel.cycleThemeMode(currentlyDark) },
+                            onRequestMicPermission = {
+                                val needed = buildList {
+                                    add(Manifest.permission.RECORD_AUDIO)
+                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                        add(Manifest.permission.POST_NOTIFICATIONS)
+                                    }
+                                }
                                 runtimePermLauncher.launch(needed.toTypedArray())
-                            } else {
-                                viewModel.startOrStopLiveCall()
-                            }
-                        },
-                        onTestConnection = { viewModel.testLiveConnection() },
-                        onToggleMute = { viewModel.toggleMute() },
-                        onCaptureVision = { viewModel.triggerVisionCapture() },
-                        onEmergencyStop = { viewModel.emergencyStop() },
-                        onRequestMicPermission = {
-                            val needed = buildList {
-                                add(Manifest.permission.RECORD_AUDIO)
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                    add(Manifest.permission.POST_NOTIFICATIONS)
+                            },
+                            onOpenOverlaySettings = {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                runCatching { context.startActivity(intent) }
+                            },
+                            onOpenAccessibilitySettings = {
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                                 }
-                            }
-                            runtimePermLauncher.launch(needed.toTypedArray())
-                        },
-                        onOpenOverlaySettings = {
-                            val intent = Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:${context.packageName}")
-                            )
-                            runCatching { context.startActivity(intent) }
-                        },
-                        onOpenAccessibilitySettings = {
-                            runCatching {
-                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                            }
-                        },
-                        onOpenNotificationSettings = {
-                            runCatching {
-                                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                            }
-                        },
-                        onGoToSettings = { selectedTab = PilotTab.SETTINGS }
-                    )
+                            },
+                            onOpenNotificationSettings = {
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                }
+                            },
+                            onGoToSettings = { selectedTab = PilotTab.SETTINGS }
+                        )
 
-                    PilotTab.ASK_AI -> AskAiScreen(
-                        settings = settings,
-                        uiState = askAiState,
-                        onSelectTextModel = { viewModel.updateTextModel(it) },
-                        onToggleSearchGrounding = { viewModel.toggleSearchGrounding(it) },
-                        onSendPrompt = { viewModel.sendAskAiPrompt(it) },
-                        onClearThread = { viewModel.clearAskAiThread() }
-                    )
+                        PilotTab.ASK_AI -> AskAiScreen(
+                            settings = settings,
+                            uiState = askAiState,
+                            isCallActive = sessionState.isServiceRunning,
+                            onSelectTextModel = { viewModel.updateTextModel(it) },
+                            onToggleSearchGrounding = { viewModel.toggleSearchGrounding(it) },
+                            onSendPrompt = { viewModel.sendAskAiPrompt(it) },
+                            onSendToLiveCall = { viewModel.sendSilentCommandToCall(it) },
+                            onClearThread = { viewModel.clearAskAiThread() }
+                        )
 
-                    PilotTab.AUTO_CHAT -> AutoChatScreen(
-                        settings = settings,
-                        permissions = permissions,
-                        messages = incomingMessages,
-                        onUpdateMode = { viewModel.updateAutoChatMode(it) },
-                        onUpdateDelivery = { viewModel.updateAutoReplyDelivery(it) },
-                        onUpdatePersona = { viewModel.updateAutoReplyPersona(it) },
-                        onToggleApp = { viewModel.toggleMessagingApp(it) },
-                        onOpenNotificationSettings = {
-                            runCatching {
-                                context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                            }
-                        },
-                        onOpenChat = { viewModel.openChatFromFeed(it) },
-                        onQuickAiReply = { viewModel.sendQuickAiReplyFromFeed(it) },
-                        onClearFeed = { viewModel.clearIncomingFeed() }
-                    )
+                        PilotTab.AUTO_CHAT -> AutoChatScreen(
+                            settings = settings,
+                            permissions = permissions,
+                            messages = incomingMessages,
+                            onUpdateMode = { viewModel.updateAutoChatMode(it) },
+                            onUpdateDelivery = { viewModel.updateAutoReplyDelivery(it) },
+                            onUpdatePersona = { viewModel.updateAutoReplyPersona(it) },
+                            onToggleApp = { viewModel.toggleMessagingApp(it) },
+                            onOpenNotificationSettings = {
+                                runCatching {
+                                    context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                }
+                            },
+                            onOpenChat = { viewModel.openChatFromFeed(it) },
+                            onQuickAiReply = { viewModel.sendQuickAiReplyFromFeed(it) },
+                            onTemplateReply = { msg, replyText ->
+                                viewModel.sendTemplateDirectReply(msg, replyText)
+                            },
+                            onClearFeed = { viewModel.clearIncomingFeed() }
+                        )
 
-                    PilotTab.SETTINGS -> SettingsLogsScreen(
-                        settings = settings,
-                        discoveredModels = discoveredModels,
-                        isFetchingModels = isFetchingModels,
-                        modelFetchStatus = modelFetchStatus,
-                        logs = logs,
-                        onUpdateApiKey = { viewModel.updateApiKey(it) },
-                        onUpdateLiveModel = { viewModel.updateLiveModel(it) },
-                        onUpdateTextModel = { viewModel.updateTextModel(it) },
-                        onFetchModels = { viewModel.fetchModels() },
-                        onUpdateVoice = { viewModel.updateVoiceName(it) },
-                        onUpdateSpeakerphone = { viewModel.updateSpeakerphone(it) },
-                        onClearLogs = { viewModel.clearLogs() },
-                        onExportLogsText = { viewModel.buildLogsExportText() }
-                    )
+                        PilotTab.SETTINGS -> SettingsLogsScreen(
+                            settings = settings,
+                            discoveredModels = discoveredModels,
+                            isFetchingModels = isFetchingModels,
+                            modelFetchStatus = modelFetchStatus,
+                            logs = logs,
+                            onUpdateApiKey = { viewModel.updateApiKey(it) },
+                            onUpdateLiveModel = { viewModel.updateLiveModel(it) },
+                            onUpdateTextModel = { viewModel.updateTextModel(it) },
+                            onFetchModels = { viewModel.fetchModels() },
+                            onUpdateVoice = { viewModel.updateVoiceName(it) },
+                            onUpdateSpeakerphone = { viewModel.updateSpeakerphone(it) },
+                            onUpdateAutoVisionDefault = { viewModel.updateAutoVisionDefault(it) },
+                            onUpdateAutoVisionInterval = { viewModel.updateAutoVisionInterval(it) },
+                            onUpdateShowTouchVisualizer = { viewModel.updateShowTouchVisualizer(it) },
+                            onUpdateShowFloatingCaptions = { viewModel.updateShowFloatingCaptions(it) },
+                            onUpdateThemeMode = { viewModel.updateThemeMode(it) },
+                            onUpdateCustomVoiceInstructions = { viewModel.updateCustomVoiceInstructions(it) },
+                            onClearLogs = { viewModel.clearLogs() },
+                            onExportLogsText = { viewModel.buildLogsExportText() }
+                        )
+                    }
                 }
             }
         }

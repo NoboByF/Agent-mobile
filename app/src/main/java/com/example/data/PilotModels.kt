@@ -28,6 +28,37 @@ enum class AutoReplyDelivery {
     VISUAL_ACCESSIBILITY
 }
 
+enum class AppThemeMode {
+    SYSTEM,
+    LIGHT,
+    DARK
+}
+
+enum class RoutineAccent {
+    COBALT,
+    EMERALD,
+    VIOLET,
+    AMBER,
+    ROSE
+}
+
+data class PilotRoutine(
+    val id: String,
+    val title: String,
+    val subtitle: String,
+    val prompt: String,
+    val accent: RoutineAccent = RoutineAccent.COBALT,
+    val isBuiltIn: Boolean = false
+)
+
+data class RecentToolEvent(
+    val id: Long,
+    val toolName: String,
+    val summary: String,
+    val succeeded: Boolean,
+    val timestamp: String
+)
+
 enum class MessagingApp(
     val displayName: String,
     val packages: Set<String>
@@ -156,6 +187,13 @@ data class LiveSessionState(
     val isMuted: Boolean = false,
     val isSpeakerOn: Boolean = true,
     val isScrollingActive: Boolean = false,
+    val isAutoVisionActive: Boolean = false,
+    val micLevel: Float = 0f,
+    val aiAudioLevel: Float = 0f,
+    val callStartedAtMs: Long? = null,
+    val toolsExecutedCount: Int = 0,
+    val lastToolSummary: String? = null,
+    val lastCaptionPreview: String = "",
     val sessionHandle: String? = null,
     val lastError: String? = null
 )
@@ -166,6 +204,12 @@ data class PilotSettings(
     val textModel: String = DEFAULT_TEXT_MODEL,
     val voiceName: String = DEFAULT_VOICE,
     val speakerphoneOn: Boolean = true,
+    val autoVisionDefaultOn: Boolean = false,
+    val autoVisionIntervalSec: Int = 4,
+    val showTouchVisualizer: Boolean = true,
+    val showFloatingCaptions: Boolean = true,
+    val themeMode: AppThemeMode = AppThemeMode.SYSTEM,
+    val customVoiceInstructions: String = "",
     val autoChatMode: AutoChatMode = AutoChatMode.LIVE_VOICE_ALERT,
     val autoReplyDelivery: AutoReplyDelivery = AutoReplyDelivery.SILENT_DIRECT_REPLY,
     val autoReplyPersona: String = DEFAULT_AUTO_REPLY_PERSONA,
@@ -202,6 +246,49 @@ data class PilotSettings(
             "Puck",
             "Charon",
             "Fenrir"
+        )
+
+        val DEFAULT_ROUTINES = listOf(
+            PilotRoutine(
+                id = "builtin_morning",
+                title = "Live Briefing",
+                subtitle = "Weather, news & battery",
+                prompt = "Check my device battery and time with get_device_status, then search Google with web_search_and_answer for today's top Bangladesh news and Dhaka weather, and brief me warmly in Bengali.",
+                accent = RoutineAccent.COBALT,
+                isBuiltIn = true
+            ),
+            PilotRoutine(
+                id = "builtin_inbox",
+                title = "Inbox Reader",
+                subtitle = "Read imo & WhatsApp",
+                prompt = "Call read_recent_notifications to check my latest incoming messages and tell me briefly who messaged me and ask if I want to reply.",
+                accent = RoutineAccent.ROSE,
+                isBuiltIn = true
+            ),
+            PilotRoutine(
+                id = "builtin_youtube",
+                title = "YouTube DJ",
+                subtitle = "Search & play music",
+                prompt = "Open YouTube with search_youtube for 'Bangla lofi chill songs', wait 1200ms, then inspect the screen and play the top result.",
+                accent = RoutineAccent.EMERALD,
+                isBuiltIn = true
+            ),
+            PilotRoutine(
+                id = "builtin_vision",
+                title = "Screen Guide",
+                subtitle = "Watch & assist live",
+                prompt = "Capture screen vision right now, inspect the UI, and briefly explain in Bengali what is on my screen and how you can help.",
+                accent = RoutineAccent.VIOLET,
+                isBuiltIn = true
+            ),
+            PilotRoutine(
+                id = "builtin_torch",
+                title = "Torch & Status",
+                subtitle = "Quick hardware check",
+                prompt = "Check my phone status using get_device_status and tell me battery percentage, time, and volume level in one short sentence.",
+                accent = RoutineAccent.AMBER,
+                isBuiltIn = true
+            )
         )
     }
 }

@@ -11,6 +11,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.automation.PilotAccessibilityService
+import com.example.data.AppThemeMode
 import com.example.data.AskAiMessage
 import com.example.data.AutoChatMode
 import com.example.data.AutoReplyDelivery
@@ -20,11 +21,13 @@ import com.example.data.DiscoveredModel
 import com.example.data.IncomingMessageRecord
 import com.example.data.LiveCaptionLine
 import com.example.data.LiveSessionState
-import com.example.data.LogLevel
 import com.example.data.MessagingApp
 import com.example.data.PermissionSnapshot
+import com.example.data.PilotRoutine
 import com.example.data.PilotSettings
 import com.example.data.PilotStateHub
+import com.example.data.RecentToolEvent
+import com.example.data.RoutineAccent
 import com.example.messaging.IncomingMessageListener
 import com.example.service.FloatingCallOverlayService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -32,6 +35,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
 data class AskAiUiState(
@@ -43,15 +47,20 @@ data class AskAiUiState(
 
 class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val chatIdCounter = AtomicLong(1L)
+    private val prefs = PilotStateHub.getPreferences(application.applicationContext)
+    private val chatIdCounter: AtomicLong
 
     val settings: StateFlow<PilotSettings> = PilotStateHub.settings
     val sessionState: StateFlow<LiveSessionState> = PilotStateHub.sessionState
     val permissions: StateFlow<PermissionSnapshot> = PilotStateHub.permissions
     val logs: StateFlow<List<DiagnosticLogEntry>> = PilotStateHub.logs
     val captions: StateFlow<List<LiveCaptionLine>> = PilotStateHub.captions
+    val recentToolEvents: StateFlow<List<RecentToolEvent>> = PilotStateHub.recentToolEvents
     val incomingMessages: StateFlow<List<IncomingMessageRecord>> = PilotStateHub.incomingMessages
     val discoveredModels: StateFlow<List<DiscoveredModel>> = PilotStateHub.discoveredModels
+
+    private val _routines = MutableStateFlow(prefs.loadRoutines())
+    val routines: StateFlow<List<PilotRoutine>> = _routines.asStateFlow()
 
     private val _connectionTest = MutableStateFlow(ConnectionTestState())
     val connectionTest: StateFlow<ConnectionTestState> = _connectionTest.asStateFlow()
@@ -62,14 +71,17 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     private val _modelFetchStatus = MutableStateFlow<String?>(null)
     val modelFetchStatus: StateFlow<String?> = _modelFetchStatus.asStateFlow()
 
-    private val _askAiState = MutableStateFlow(AskAiUiState())
+    private val _askAiState = MutableStateFlow(
+        AskAiUiState(messages = prefs.loadAskAiHistory())
+    )
     val askAiState: StateFlow<AskAiUiState> = _askAiState.asStateFlow()
 
     private val _bannerMessage = MutableStateFlow<String?>(null)
     val bannerMessage: StateFlow<String?> = _bannerMessage.asStateFlow()
 
     init {
-        PilotStateHub.ensureInitialized(application.applicationContext)
+        val maxExistingId = _askAiState.value.messages.maxOfOrNull { it.id } ?: 0L
+        chatIdCounter = AtomicLong(maxExistingId + 1L)
         refreshPermissions()
     }
 
@@ -118,8 +130,66 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         FloatingCallOverlayService.start(ctx)
     }
 
+    /**
+     * One-tap Smart Routine launcher: executes immediately if call is live,
+     * or auto-starts the Live Call and triggers the routine automatically upon connect!
+     */
+    fun launchRoutine(routine: PilotRoutine) {
+        if (sessionState.value.isServiceRunning) {
+            sendSilentCommandToCall(routine.prompt)
+            _bannerMessage.value = "Running '${routine.title}'..."
+            return
+        }
+        val currentSettings = settings.value
+        if (currentSettings.apiKey.isBlank()) {
+            _bannerMessage.value = "Add your Gemini API Key in Settings first to run '${routine.title}'."
+            return
+        }
+        refreshPermissions()
+        if (!permissions.value.micGranted) {
+            _bannerMessage.value = "Grant Microphone permission first to run '${routine.title}'."
+            return
+        }
+        PilotStateHub.pendingStartupCommand = routine.prompt
+        FloatingCallOverlayService.start(getApplication())
+        _bannerMessage.value = "Starting call & queuing '${routine.title}'..."
+    }
+
+    fun addCustomRoutine(
+        title: String,
+        subtitle: String,
+        prompt: String,
+        accent: RoutineAccent
+    ) {
+        val cleanTitle = title.trim()
+        val cleanPrompt = prompt.trim()
+        if (cleanTitle.isEmpty() || cleanPrompt.isEmpty()) return
+        val newRoutine = PilotRoutine(
+            id = "custom_${UUID.randomUUID().toString().take(8)}",
+            title = cleanTitle,
+            subtitle = subtitle.trim().ifBlank { "Custom Automation" },
+            prompt = cleanPrompt,
+            accent = accent,
+            isBuiltIn = false
+        )
+        val updated = listOf(newRoutine) + _routines.value
+        _routines.value = updated
+        prefs.saveCustomRoutines(updated)
+        _bannerMessage.value = "Saved custom routine '${newRoutine.title}'!"
+    }
+
+    fun deleteCustomRoutine(id: String) {
+        val updated = _routines.value.filterNot { it.id == id && !it.isBuiltIn }
+        _routines.value = updated
+        prefs.saveCustomRoutines(updated)
+    }
+
     fun toggleMute() {
         PilotStateHub.activeController?.toggleMute()
+    }
+
+    fun toggleAutoVision() {
+        PilotStateHub.activeController?.toggleAutoVision()
     }
 
     fun triggerVisionCapture() {
@@ -128,6 +198,20 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
     fun emergencyStop() {
         PilotStateHub.activeController?.emergencyStopActions()
+    }
+
+    fun sendSilentCommandToCall(commandText: String) {
+        val clean = commandText.trim()
+        if (clean.isEmpty()) return
+        val controller = PilotStateHub.activeController
+        if (controller == null) {
+            _bannerMessage.value = "Start a Live Call first to send live voice/tool commands."
+            return
+        }
+        val ok = controller.sendUserTextCommand(clean)
+        if (!ok) {
+            _bannerMessage.value = "Live call is still connecting—please wait a moment."
+        }
     }
 
     fun testLiveConnection() {
@@ -195,6 +279,35 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun updateAutoVisionDefault(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(autoVisionDefaultOn = enabled) }
+    }
+
+    fun updateAutoVisionInterval(seconds: Int) {
+        PilotStateHub.updateSettings { it.copy(autoVisionIntervalSec = seconds.coerceIn(2, 10)) }
+    }
+
+    fun updateShowTouchVisualizer(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(showTouchVisualizer = enabled) }
+    }
+
+    fun updateShowFloatingCaptions(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(showFloatingCaptions = enabled) }
+    }
+
+    fun updateThemeMode(mode: AppThemeMode) {
+        PilotStateHub.updateSettings { it.copy(themeMode = mode) }
+    }
+
+    fun cycleThemeMode(currentlyDark: Boolean) {
+        val next = if (currentlyDark) AppThemeMode.LIGHT else AppThemeMode.DARK
+        PilotStateHub.updateSettings { it.copy(themeMode = next) }
+    }
+
+    fun updateCustomVoiceInstructions(instructions: String) {
+        PilotStateHub.updateSettings { it.copy(customVoiceInstructions = instructions) }
+    }
+
     fun updateAutoChatMode(mode: AutoChatMode) {
         PilotStateHub.updateSettings { it.copy(autoChatMode = mode) }
     }
@@ -235,6 +348,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             timestamp = PilotStateHub.formatNow()
         )
         val updatedHistory = _askAiState.value.messages + userMsg
+        prefs.saveAskAiHistory(updatedHistory)
         _askAiState.update {
             it.copy(
                 messages = updatedHistory,
@@ -261,9 +375,11 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                     modelUsed = gen.modelUsed,
                     timestamp = PilotStateHub.formatNow()
                 )
+                val finalHistory = _askAiState.value.messages + aiMsg
+                prefs.saveAskAiHistory(finalHistory)
                 _askAiState.update {
                     it.copy(
-                        messages = it.messages + aiMsg,
+                        messages = finalHistory,
                         isGenerating = false,
                         errorText = null
                     )
@@ -280,6 +396,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearAskAiThread() {
+        prefs.saveAskAiHistory(emptyList())
         _askAiState.update { it.copy(messages = emptyList(), errorText = null) }
     }
 
@@ -299,6 +416,26 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 _bannerMessage.value = "Enable Accessibility Service to jump directly into ${record.app.displayName}."
             }
+        }
+    }
+
+    fun sendTemplateDirectReply(record: IncomingMessageRecord, replyText: String) {
+        val handle = PilotStateHub.getNotificationHandleById(record.id)
+        val directAction = handle?.replyAction
+        if (directAction != null) {
+            val sent = IncomingMessageListener.sendDirectReply(
+                getApplication(),
+                directAction,
+                replyText
+            )
+            if (sent) {
+                PilotStateHub.markMessageAutoReplied(record.id, replyText)
+                _bannerMessage.value = "Replied to ${record.senderName}: \"$replyText\""
+            } else {
+                _bannerMessage.value = "Direct reply failed; tap Open Chat to reply."
+            }
+        } else {
+            _bannerMessage.value = "This notification doesn't support Direct Reply; tap Open Chat instead."
         }
     }
 
@@ -349,6 +486,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     fun clearLogs() {
         PilotStateHub.clearLogs()
         PilotStateHub.clearCaptions()
+        PilotStateHub.clearRecentToolEvents()
     }
 
     fun buildLogsExportText(): String {

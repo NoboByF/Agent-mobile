@@ -1,5 +1,8 @@
 package com.example.service
 
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.AnimatorSet
 import android.animation.ObjectAnimator
 import android.animation.PropertyValuesHolder
 import android.animation.ValueAnimator
@@ -25,7 +28,9 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
-import android.widget.ImageButton
+import android.view.animation.DecelerateInterpolator
+import android.view.animation.OvershootInterpolator
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
@@ -47,7 +52,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 
@@ -60,15 +67,25 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     private var overlayView: View? = null
     private var overlayParams: WindowManager.LayoutParams? = null
 
+    private var capsuleBg: GradientDrawable? = null
     private var orbView: View? = null
     private var tickerTextView: TextView? = null
+    private var captionStripView: TextView? = null
     private var muteButton: TextView? = null
+    private var autoVisionButton: TextView? = null
+    private var visionButton: TextView? = null
+    private var appButton: TextView? = null
+    private var collapseButton: TextView? = null
+    private var endButton: TextView? = null
     private var orbAnimator: ObjectAnimator? = null
+
+    private var isCompactMode = false
 
     private var liveClient: GeminiLiveClient? = null
     private var audioEngine: LiveAudioEngine? = null
     private var toolDispatcher: ToolDispatcher? = null
     private var stateObserverJob: Job? = null
+    private var autoVisionJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -83,6 +100,14 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             ACTION_STOP -> {
                 endCallSession()
                 return START_NOT_STICKY
+            }
+            ACTION_TOGGLE_MUTE -> {
+                toggleMute()
+                return START_STICKY
+            }
+            ACTION_SNAP_VISION -> {
+                triggerManualVisionCapture()
+                return START_STICKY
             }
             ACTION_UPDATE_SPEAKER -> {
                 val speaker = intent.getBooleanExtra(EXTRA_SPEAKER, true)
@@ -102,8 +127,8 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     /**
-     * Safety Check #1: Guard FOREGROUND_SERVICE_TYPE_SPECIAL_USE with API 34+ (Android 14) check
-     * and use FOREGROUND_SERVICE_TYPE_MICROPHONE on Android 11-13 (API 30-33) to prevent crashes.
+     * Guard FOREGROUND_SERVICE_TYPE_SPECIAL_USE with API 34+ (Android 14) check
+     * and use FOREGROUND_SERVICE_TYPE_MICROPHONE on Android 11-13 (API 30-33).
      */
     private fun startForegroundSafely() {
         val notification = buildPersistentNotification("LivePilot AI call active")
@@ -124,6 +149,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
 
     private fun startLiveSession() {
         val settings = PilotStateHub.settings.value
+        PilotStateHub.clearRecentToolEvents()
         PilotStateHub.updateSession {
             it.copy(
                 isServiceRunning = true,
@@ -132,6 +158,13 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 statusTicker = "Connecting to ${settings.liveModel}...",
                 isMuted = false,
                 isSpeakerOn = settings.speakerphoneOn,
+                isAutoVisionActive = settings.autoVisionDefaultOn,
+                callStartedAtMs = System.currentTimeMillis(),
+                toolsExecutedCount = 0,
+                lastToolSummary = null,
+                lastCaptionPreview = "",
+                micLevel = 0f,
+                aiAudioLevel = 0f,
                 lastError = null
             )
         }
@@ -155,21 +188,36 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         client.connect(
             apiKey = settings.apiKey,
             modelId = settings.liveModel,
-            voiceName = settings.voiceName
+            voiceName = settings.voiceName,
+            customInstructions = settings.customVoiceInstructions
         )
     }
 
     // --- GeminiLiveCallbacks ---
 
     override fun onSetupComplete() {
-        val speaker = PilotStateHub.settings.value.speakerphoneOn
-        audioEngine?.start(speakerphone = speaker)
+        val settings = PilotStateHub.settings.value
+        audioEngine?.start(speakerphone = settings.speakerphoneOn)
         PilotStateHub.updateSession {
             it.copy(
                 phase = LiveConnectionPhase.READY,
                 activity = AgentActivity.LISTENING,
                 statusTicker = "Listening..."
             )
+        }
+        if (PilotStateHub.sessionState.value.isAutoVisionActive) {
+            startAutoVisionLoop()
+        }
+
+        // Auto-run queued Routine if user tapped a 1-tap Routine while idle
+        val queued = PilotStateHub.pendingStartupCommand
+        if (!queued.isNullOrBlank()) {
+            PilotStateHub.pendingStartupCommand = null
+            serviceScope.launch {
+                delay(450L)
+                liveClient?.sendUserTextTurn(queued)
+                PilotStateHub.log(LogLevel.INFO, "Routine", "Auto-ran queued routine on connect.")
+            }
         }
     }
 
@@ -253,6 +301,39 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 statusTicker = if (nextMuted) "Mic muted" else "Listening..."
             )
         }
+        updateNotificationText(if (nextMuted) "Mic muted • LivePilot AI" else "Listening • LivePilot AI")
+    }
+
+    override fun toggleAutoVision() {
+        val next = !PilotStateHub.sessionState.value.isAutoVisionActive
+        PilotStateHub.updateSession {
+            it.copy(
+                isAutoVisionActive = next,
+                statusTicker = if (next) "Auto-Vision ON" else "Auto-Vision OFF"
+            )
+        }
+        if (next) {
+            startAutoVisionLoop()
+        } else {
+            autoVisionJob?.cancel()
+            autoVisionJob = null
+        }
+        PilotStateHub.log(LogLevel.INFO, "Vision", "Auto-Vision stream ${if (next) "enabled" else "disabled"}.")
+    }
+
+    private fun startAutoVisionLoop() {
+        autoVisionJob?.cancel()
+        autoVisionJob = serviceScope.launch(Dispatchers.Default) {
+            while (isActive && PilotStateHub.sessionState.value.isAutoVisionActive) {
+                val intervalSec = PilotStateHub.settings.value.autoVisionIntervalSec.coerceIn(2, 10)
+                delay(intervalSec * 1000L)
+                if (!isActive || !PilotStateHub.sessionState.value.isAutoVisionActive) break
+                if (liveClient?.isReadyForRealtimeInput() != true) continue
+                val accessibility = PilotAccessibilityService.instance ?: continue
+                if (accessibility.isCurrentScreenBlocked()) continue
+                accessibility.captureScreenVisionAndStream()
+            }
+        }
     }
 
     override fun triggerManualVisionCapture() {
@@ -273,13 +354,16 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     override fun emergencyStopActions() {
+        autoVisionJob?.cancel()
+        autoVisionJob = null
         audioEngine?.interruptPlayback()
         toolDispatcher?.cancelAllActiveActions()
         PilotAccessibilityService.instance?.stopContinuousScroll()
-        PilotStateHub.log(LogLevel.TOOL, "STOP", "Emergency STOP pressed — halted scroll & active gestures.")
+        PilotStateHub.log(LogLevel.TOOL, "STOP", "Emergency STOP pressed — halted scroll, auto-vision & active gestures.")
         PilotStateHub.updateSession {
             it.copy(
                 isScrollingActive = false,
+                isAutoVisionActive = false,
                 activity = if (it.isMuted) AgentActivity.MUTED else AgentActivity.LISTENING,
                 statusTicker = "Stopped actions • Call active"
             )
@@ -288,6 +372,9 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
 
     override fun endCallSession() {
         PilotStateHub.activeController = null
+        PilotStateHub.pendingStartupCommand = null
+        autoVisionJob?.cancel()
+        autoVisionJob = null
         stateObserverJob?.cancel()
         toolDispatcher?.cancelAllActiveActions()
         audioEngine?.stop()
@@ -303,6 +390,11 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 activity = AgentActivity.IDLE,
                 isMuted = false,
                 isScrollingActive = false,
+                isAutoVisionActive = false,
+                micLevel = 0f,
+                aiAudioLevel = 0f,
+                callStartedAtMs = null,
+                lastCaptionPreview = "",
                 statusTicker = "Ready to pilot your phone"
             )
         }
@@ -324,15 +416,94 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         }
     }
 
+    /**
+     * Draws a futuristic non-touchable animated radial ripple right at (x, y) over any app
+     * whenever LivePilot taps, clicks, long-presses, or drags on screen.
+     */
+    override fun showTouchIndicator(x: Int, y: Int, label: String) {
+        if (!Settings.canDrawOverlays(this)) return
+        mainHandler.post {
+            val wm = windowManager ?: (getSystemService(WINDOW_SERVICE) as WindowManager)
+            val rippleSize = dp(64)
+            val rippleContainer = FrameLayout(this)
+
+            val outerRing = View(this).apply {
+                layoutParams = FrameLayout.LayoutParams(rippleSize, rippleSize, Gravity.CENTER)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.parseColor("#333B82F6"))
+                    setStroke(dp(3), Color.parseColor("#38BDF8"))
+                }
+            }
+            val centerDot = View(this).apply {
+                layoutParams = FrameLayout.LayoutParams(dp(14), dp(14), Gravity.CENTER)
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(Color.parseColor("#2563EB"))
+                    setStroke(dp(2), Color.WHITE)
+                }
+            }
+            rippleContainer.addView(outerRing)
+            rippleContainer.addView(centerDot)
+
+            val params = WindowManager.LayoutParams(
+                rippleSize,
+                rippleSize,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+                this.x = (x - rippleSize / 2).coerceAtLeast(0)
+                this.y = (y - rippleSize / 2).coerceAtLeast(0)
+            }
+
+            val added = runCatching {
+                wm.addView(rippleContainer, params)
+                true
+            }.getOrDefault(false)
+            if (!added) return@post
+
+            val expand = ObjectAnimator.ofPropertyValuesHolder(
+                outerRing,
+                PropertyValuesHolder.ofFloat(View.SCALE_X, 0.35f, 1.35f),
+                PropertyValuesHolder.ofFloat(View.SCALE_Y, 0.35f, 1.35f),
+                PropertyValuesHolder.ofFloat(View.ALPHA, 1.0f, 0.0f)
+            ).apply {
+                duration = 460L
+                interpolator = DecelerateInterpolator()
+            }
+            val dotFade = ObjectAnimator.ofFloat(centerDot, View.ALPHA, 1f, 0f).apply {
+                startDelay = 220L
+                duration = 240L
+            }
+            AnimatorSet().apply {
+                playTogether(expand, dotFade)
+                addListener(object : AnimatorListenerAdapter() {
+                    override fun onAnimationEnd(animation: Animator) {
+                        runCatching { wm.removeView(rippleContainer) }
+                    }
+                })
+                start()
+            }
+        }
+    }
+
     override fun pushIncomingMessageAlert(alertText: String) {
         liveClient?.sendSystemAlert(alertText)
+    }
+
+    override fun sendUserTextCommand(commandText: String): Boolean {
+        return liveClient?.sendUserTextTurn(commandText) ?: false
     }
 
     override fun sendVisionFrame(jpegBytes: ByteArray): Boolean {
         return liveClient?.sendVisionFrame(jpegBytes) ?: false
     }
 
-    // --- Draggable Floating Pill Overlay ---
+    // --- Next-Gen Snap-to-Edge Dynamic Floating Capsule + Subtitle Strip ---
 
     private fun attachFloatingPillOverlay() {
         mainHandler.post {
@@ -340,66 +511,111 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
             windowManager = wm
 
-            val container = LinearLayout(this).apply {
+            val rootColumn = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.START
+            }
+
+            val bgDrawable = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = dp(28).toFloat()
+                setColor(Color.parseColor("#F20B1220"))
+                setStroke(dp(1), Color.parseColor("#883B82F6"))
+            }
+            capsuleBg = bgDrawable
+
+            val pillRow = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(dp(10), dp(8), dp(10), dp(8))
-                background = GradientDrawable().apply {
-                    shape = GradientDrawable.RECTANGLE
-                    cornerRadius = dp(28).toFloat()
-                    setColor(Color.parseColor("#EE0F172A"))
-                    setStroke(dp(1), Color.parseColor("#403B82F6"))
-                }
-                elevation = dp(10).toFloat()
+                setPadding(dp(10), dp(7), dp(10), dp(7))
+                background = bgDrawable
+                elevation = dp(14).toFloat()
             }
 
             val orb = View(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(16), dp(16)).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(20), dp(20)).apply {
                     marginEnd = dp(8)
                 }
                 background = GradientDrawable().apply {
                     shape = GradientDrawable.OVAL
-                    setColor(Color.parseColor("#2563EB"))
+                    setColor(Color.parseColor("#3B82F6"))
+                    setStroke(dp(2), Color.parseColor("#93C5FD"))
                 }
             }
             orbView = orb
             startOrbPulse(orb)
 
             val ticker = TextView(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(122), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    marginEnd = dp(6)
+                layoutParams = LinearLayout.LayoutParams(dp(104), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    marginEnd = dp(4)
                 }
                 text = "LivePilot AI"
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
             }
             tickerTextView = ticker
 
-            val muteBtn = createPillActionButton("MIC", "#1E293B", "#E2E8F0") {
-                toggleMute()
-            }
+            val muteBtn = createPillActionButton("MIC", "#1E293B", "#E2E8F0") { toggleMute() }
             muteButton = muteBtn
 
-            val visionBtn = createPillActionButton("EYE", "#4C1D95", "#DDD6FE") {
-                triggerManualVisionCapture()
-            }
+            val autoBtn = createPillActionButton("AUTO", "#1E293B", "#C4B5FD") { toggleAutoVision() }
+            autoVisionButton = autoBtn
 
-            val stopBtn = createPillActionButton("STOP", "#DC2626", "#FFFFFF") {
-                emergencyStopActions()
-            }
+            val visionBtn = createPillActionButton("EYE", "#4C1D95", "#EDE9FE") { triggerManualVisionCapture() }
+            visionButton = visionBtn
 
-            val endBtn = createPillActionButton("END", "#334155", "#FCA5A5") {
-                endCallSession()
-            }
+            val stopBtn = createPillActionButton("STOP", "#DC2626", "#FFFFFF") { emergencyStopActions() }
 
-            container.addView(orb)
-            container.addView(ticker)
-            container.addView(muteBtn)
-            container.addView(visionBtn)
-            container.addView(stopBtn)
-            container.addView(endBtn)
+            val appBtn = createPillActionButton("APP", "#1E3A8A", "#DBEAFE") {
+                val launch = Intent(this, MainActivity::class.java).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                }
+                runCatching { startActivity(launch) }
+            }
+            appButton = appBtn
+
+            val collapseBtn = createPillActionButton("–", "#1E293B", "#CBD5E1") { toggleCompactMode() }
+            collapseButton = collapseBtn
+
+            val endBtn = createPillActionButton("END", "#334155", "#FCA5A5") { endCallSession() }
+            endButton = endBtn
+
+            pillRow.addView(orb)
+            pillRow.addView(ticker)
+            pillRow.addView(muteBtn)
+            pillRow.addView(autoBtn)
+            pillRow.addView(visionBtn)
+            pillRow.addView(stopBtn)
+            pillRow.addView(appBtn)
+            pillRow.addView(collapseBtn)
+            pillRow.addView(endBtn)
+
+            val captionStrip = TextView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    topMargin = dp(4)
+                }
+                maxWidth = dp(310)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setTextColor(Color.parseColor("#E2E8F0"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.RECTANGLE
+                    cornerRadius = dp(12).toFloat()
+                    setColor(Color.parseColor("#CC0F172A"))
+                }
+                visibility = View.GONE
+            }
+            captionStripView = captionStrip
+
+            rootColumn.addView(pillRow)
+            rootColumn.addView(captionStrip)
 
             val params = WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
@@ -409,19 +625,41 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 PixelFormat.TRANSLUCENT
             ).apply {
                 gravity = Gravity.TOP or Gravity.START
-                x = dp(14)
-                y = dp(74)
+                x = dp(10)
+                y = dp(72)
             }
 
-            setupDragTouchListener(container, params, wm)
+            setupDragAndSnapListener(rootColumn, params, wm)
 
             overlayParams = params
-            overlayView = container
-            runCatching { wm.addView(container, params) }
+            overlayView = rootColumn
+            runCatching { wm.addView(rootColumn, params) }
                 .onFailure { err ->
                     PilotStateHub.log(LogLevel.ERROR, "Overlay", "Failed to add overlay: ${err.message}")
                     overlayView = null
                 }
+        }
+    }
+
+    private fun toggleCompactMode() {
+        isCompactMode = !isCompactMode
+        mainHandler.post {
+            val vis = if (isCompactMode) View.GONE else View.VISIBLE
+            tickerTextView?.visibility = vis
+            muteButton?.visibility = vis
+            autoVisionButton?.visibility = vis
+            visionButton?.visibility = vis
+            appButton?.visibility = vis
+            endButton?.visibility = vis
+            if (isCompactMode) {
+                captionStripView?.visibility = View.GONE
+            }
+            collapseButton?.text = if (isCompactMode) "+" else "–"
+            overlayView?.let { v ->
+                overlayParams?.let { p ->
+                    runCatching { windowManager?.updateViewLayout(v, p) }
+                }
+            }
         }
     }
 
@@ -434,11 +672,11 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         return TextView(this).apply {
             text = label
             setTextColor(Color.parseColor(textHex))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9.5f)
             gravity = Gravity.CENTER
-            minHeight = dp(34)
-            minWidth = dp(38)
-            setPadding(dp(7), dp(5), dp(7), dp(5))
+            minHeight = dp(31)
+            minWidth = dp(30)
+            setPadding(dp(5), dp(4), dp(5), dp(4))
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
@@ -447,14 +685,14 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             }
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
-                cornerRadius = dp(14).toFloat()
+                cornerRadius = dp(12).toFloat()
                 setColor(Color.parseColor(bgHex))
             }
             setOnClickListener { onClick() }
         }
     }
 
-    private fun setupDragTouchListener(
+    private fun setupDragAndSnapListener(
         view: View,
         params: WindowManager.LayoutParams,
         wm: WindowManager
@@ -463,6 +701,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         var initialY = 0
         var initialTouchX = 0f
         var initialTouchY = 0f
+        var moved = false
 
         view.setOnTouchListener { _, event ->
             when (event.action) {
@@ -471,15 +710,43 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                     initialY = params.y
                     initialTouchX = event.rawX
                     initialTouchY = event.rawY
+                    moved = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - initialTouchX).toInt()
                     val dy = (event.rawY - initialTouchY).toInt()
-                    if (abs(dx) > 4 || abs(dy) > 4) {
+                    if (abs(dx) > 6 || abs(dy) > 6) {
+                        moved = true
                         params.x = initialX + dx
                         params.y = initialY + dy
                         runCatching { wm.updateViewLayout(view, params) }
+                    }
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    if (!moved && isCompactMode) {
+                        toggleCompactMode()
+                    } else if (moved) {
+                        // Snap smoothly to nearest horizontal screen edge
+                        val screenW = resources.displayMetrics.widthPixels
+                        val viewW = view.width.coerceAtLeast(dp(120))
+                        val centerX = params.x + viewW / 2
+                        val margin = dp(10)
+                        val targetX = if (centerX < screenW / 2) {
+                            margin
+                        } else {
+                            (screenW - viewW - margin).coerceAtLeast(margin)
+                        }
+                        ValueAnimator.ofInt(params.x, targetX).apply {
+                            duration = 240L
+                            interpolator = OvershootInterpolator(0.8f)
+                            addUpdateListener { anim ->
+                                params.x = anim.animatedValue as Int
+                                runCatching { wm.updateViewLayout(view, params) }
+                            }
+                            start()
+                        }
                     }
                     true
                 }
@@ -492,11 +759,11 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         orbAnimator?.cancel()
         orbAnimator = ObjectAnimator.ofPropertyValuesHolder(
             view,
-            PropertyValuesHolder.ofFloat(View.SCALE_X, 0.88f, 1.24f),
-            PropertyValuesHolder.ofFloat(View.SCALE_Y, 0.88f, 1.24f),
-            PropertyValuesHolder.ofFloat(View.ALPHA, 0.72f, 1.0f)
+            PropertyValuesHolder.ofFloat(View.SCALE_X, 0.88f, 1.22f),
+            PropertyValuesHolder.ofFloat(View.SCALE_Y, 0.88f, 1.22f),
+            PropertyValuesHolder.ofFloat(View.ALPHA, 0.78f, 1.0f)
         ).apply {
-            duration = 850L
+            duration = 820L
             repeatCount = ValueAnimator.INFINITE
             repeatMode = ValueAnimator.REVERSE
             start()
@@ -509,18 +776,40 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             PilotStateHub.sessionState.collectLatest { state ->
                 tickerTextView?.text = state.statusTicker
                 val orbColor = when (state.activity) {
-                    AgentActivity.LISTENING -> Color.parseColor("#3B82F6") // Cobalt Blue
-                    AgentActivity.SPEAKING -> Color.parseColor("#10B981")  // Emerald Green
-                    AgentActivity.EXECUTING_TOOL, AgentActivity.SCROLLING -> Color.parseColor("#F59E0B") // Amber
+                    AgentActivity.LISTENING -> Color.parseColor("#3B82F6")
+                    AgentActivity.SPEAKING -> Color.parseColor("#10B981")
+                    AgentActivity.EXECUTING_TOOL, AgentActivity.SCROLLING -> Color.parseColor("#F59E0B")
                     AgentActivity.MUTED -> Color.parseColor("#64748B")
                     AgentActivity.IDLE -> Color.parseColor("#7C3AED")
                 }
                 (orbView?.background as? GradientDrawable)?.setColor(orbColor)
 
+                val energy = maxOf(state.micLevel, state.aiAudioLevel)
+                val borderAlpha = ((0.35f + energy * 0.65f) * 255).toInt().coerceIn(90, 255)
+                val reactiveBorder = Color.argb(
+                    borderAlpha,
+                    Color.red(orbColor),
+                    Color.green(orbColor),
+                    Color.blue(orbColor)
+                )
+                capsuleBg?.setStroke(dp(if (energy > 0.28f) 2 else 1), reactiveBorder)
+
                 muteButton?.text = if (state.isMuted) "OFF" else "MIC"
                 (muteButton?.background as? GradientDrawable)?.setColor(
                     Color.parseColor(if (state.isMuted) "#B45309" else "#1E293B")
                 )
+
+                (autoVisionButton?.background as? GradientDrawable)?.setColor(
+                    Color.parseColor(if (state.isAutoVisionActive) "#059669" else "#1E293B")
+                )
+
+                val showCaption = !isCompactMode &&
+                    PilotStateHub.settings.value.showFloatingCaptions &&
+                    state.lastCaptionPreview.isNotBlank()
+                captionStripView?.apply {
+                    visibility = if (showCaption) View.VISIBLE else View.GONE
+                    if (showCaption) text = state.lastCaptionPreview
+                }
             }
         }
     }
@@ -534,9 +823,16 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             }
             overlayView = null
             overlayParams = null
+            capsuleBg = null
             orbView = null
             tickerTextView = null
+            captionStripView = null
             muteButton = null
+            autoVisionButton = null
+            visionButton = null
+            appButton = null
+            collapseButton = null
+            endButton = null
         }
     }
 
@@ -552,11 +848,28 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         manager.createNotificationChannel(channel)
     }
 
+    private fun updateNotificationText(text: String) {
+        val manager = getSystemService(NotificationManager::class.java)
+        runCatching { manager.notify(NOTIFICATION_ID, buildPersistentNotification(text)) }
+    }
+
     private fun buildPersistentNotification(contentText: String): Notification {
         val openAppIntent = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val muteIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, FloatingCallOverlayService::class.java).setAction(ACTION_TOGGLE_MUTE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val visionIntent = PendingIntent.getService(
+            this,
+            3,
+            Intent(this, FloatingCallOverlayService::class.java).setAction(ACTION_SNAP_VISION),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val stopIntent = PendingIntent.getService(
@@ -566,13 +879,17 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val mutedLabel = if (PilotStateHub.sessionState.value.isMuted) "Unmute" else "Mute"
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(contentText)
             .setOngoing(true)
             .setContentIntent(openAppIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "End Call", stopIntent)
+            .addAction(android.R.drawable.ic_btn_speak_now, mutedLabel, muteIntent)
+            .addAction(android.R.drawable.ic_menu_camera, "Vision", visionIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "End", stopIntent)
             .build()
     }
 
@@ -584,6 +901,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         ).toInt()
 
     override fun onDestroy() {
+        autoVisionJob?.cancel()
         serviceScope.cancel()
         removeFloatingOverlay()
         super.onDestroy()
@@ -594,6 +912,8 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         private const val NOTIFICATION_ID = 4201
         const val ACTION_START = "com.example.livepilot.START_CALL"
         const val ACTION_STOP = "com.example.livepilot.STOP_CALL"
+        const val ACTION_TOGGLE_MUTE = "com.example.livepilot.TOGGLE_MUTE"
+        const val ACTION_SNAP_VISION = "com.example.livepilot.SNAP_VISION"
         const val ACTION_UPDATE_SPEAKER = "com.example.livepilot.UPDATE_SPEAKER"
         const val EXTRA_SPEAKER = "extra_speaker"
 

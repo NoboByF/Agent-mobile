@@ -22,6 +22,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.sqrt
 
 class LiveAudioEngine(
     context: Context,
@@ -47,6 +48,12 @@ class LiveAudioEngine(
     @Volatile
     private var previousAudioMode: Int = AudioManager.MODE_NORMAL
 
+    @Volatile
+    private var lastMicUiPushMs = 0L
+
+    @Volatile
+    private var lastAiUiPushMs = 0L
+
     @SuppressLint("MissingPermission")
     fun start(speakerphone: Boolean) {
         if (!isRunning.compareAndSet(false, true)) return
@@ -69,6 +76,9 @@ class LiveAudioEngine(
 
     fun setMuted(muted: Boolean) {
         isMuted.set(muted)
+        if (muted) {
+            PilotStateHub.updateAudioLevels(mic = 0f)
+        }
         PilotStateHub.log(LogLevel.AUDIO, "AudioEngine", if (muted) "Mic muted." else "Mic unmuted.")
     }
 
@@ -87,11 +97,9 @@ class LiveAudioEngine(
         }
     }
 
-    /**
-     * Instant barge-in interruption: clears queued audio chunks and flushes AudioTrack immediately.
-     */
     fun interruptPlayback() {
         playbackQueue.clear()
+        PilotStateHub.updateAudioLevels(ai = 0f)
         val track = audioTrack ?: return
         runCatching {
             if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
@@ -109,6 +117,7 @@ class LiveAudioEngine(
         captureJob = null
         playbackJob = null
         playbackQueue.clear()
+        PilotStateHub.updateAudioLevels(mic = 0f, ai = 0f)
 
         runCatching { echoCanceler?.release() }
         runCatching { noiseSuppressor?.release() }
@@ -262,8 +271,18 @@ class LiveAudioEngine(
             while (isActive && isRunning.get()) {
                 val record = audioRecord ?: break
                 val read = record.read(buffer, 0, buffer.size)
-                if (read > 0 && !isMuted.get()) {
-                    onPcmCaptured(buffer.copyOf(read))
+                if (read > 0) {
+                    if (!isMuted.get()) {
+                        val copy = buffer.copyOf(read)
+                        onPcmCaptured(copy)
+                        val now = System.currentTimeMillis()
+                        if (now - lastMicUiPushMs >= 70L) {
+                            lastMicUiPushMs = now
+                            PilotStateHub.updateAudioLevels(mic = computeNormalizedRms(copy, read))
+                        }
+                    } else {
+                        PilotStateHub.updateAudioLevels(mic = 0f)
+                    }
                 }
             }
         }
@@ -275,16 +294,41 @@ class LiveAudioEngine(
                 val chunk = runCatching { playbackQueue.take() }.getOrNull() ?: break
                 val track = audioTrack ?: continue
                 if (isRunning.get() && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastAiUiPushMs >= 70L) {
+                        lastAiUiPushMs = now
+                        PilotStateHub.updateAudioLevels(ai = computeNormalizedRms(chunk, chunk.size))
+                    }
                     track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+                    if (playbackQueue.isEmpty()) {
+                        PilotStateHub.updateAudioLevels(ai = 0f)
+                    }
                 }
             }
         }
     }
 
+    private fun computeNormalizedRms(pcmBytes: ByteArray, length: Int): Float {
+        if (length < 2) return 0f
+        var sumSq = 0.0
+        var samples = 0
+        var i = 0
+        while (i + 1 < length) {
+            val lo = pcmBytes[i].toInt() and 0xFF
+            val hi = pcmBytes[i + 1].toInt()
+            val sample = ((hi shl 8) or lo).toShort().toDouble()
+            sumSq += sample * sample
+            samples++
+            i += 4 // Stride 2 samples for fast telemetry
+        }
+        if (samples == 0) return 0f
+        val rms = sqrt(sumSq / samples)
+        return (rms / 9500.0).toFloat().coerceIn(0f, 1f)
+    }
+
     companion object {
         private const val INPUT_SAMPLE_RATE = 16000
         private const val OUTPUT_SAMPLE_RATE = 24000
-        // ~100ms at 16kHz 16-bit mono = 3200 bytes
         private const val INPUT_CHUNK_BYTES = 3200
     }
 }

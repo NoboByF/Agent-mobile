@@ -71,12 +71,20 @@ class GeminiLiveClient(
     @Volatile
     private var currentVoice: String = "Kore"
 
+    @Volatile
+    private var currentCustomInstructions: String = ""
+
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
 
     fun isReadyForRealtimeInput(): Boolean = setupCompleted.get() && webSocket != null
 
-    fun connect(apiKey: String, modelId: String, voiceName: String) {
+    fun connect(
+        apiKey: String,
+        modelId: String,
+        voiceName: String,
+        customInstructions: String = ""
+    ) {
         manuallyClosed.set(false)
         setupCompleted.set(false)
         reconnectAttempt = 0
@@ -85,6 +93,7 @@ class GeminiLiveClient(
         currentApiKey = apiKey.trim()
         currentModel = normalizeModelPath(modelId)
         currentVoice = voiceName.trim().ifBlank { "Kore" }
+        currentCustomInstructions = customInstructions.trim()
 
         openSocketInternal(isReconnect = false)
     }
@@ -135,11 +144,11 @@ class GeminiLiveClient(
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 PilotStateHub.log(LogLevel.WS, "onOpen", "HTTP ${response.code} connected. Sending setup handshake...")
                 callbacks.onConnectionPhaseChanged(LiveConnectionPhase.WAITING_SETUP, "Sending setup handshake...")
-                // STRICT HANDSHAKE: Send ONLY the setup JSON message on onOpen
                 val setupPayload = buildSetupPayload(
                     modelPath = currentModel,
                     voiceName = currentVoice,
-                    resumptionHandle = savedResumptionHandle
+                    resumptionHandle = savedResumptionHandle,
+                    customInstructions = currentCustomInstructions
                 )
                 val sent = webSocket.send(setupPayload.toString())
                 if (!sent) {
@@ -187,7 +196,6 @@ class GeminiLiveClient(
             return
         }
 
-        // 1. Setup Complete acknowledgement
         if (json.has("setupComplete")) {
             reconnectAttempt = 0
             setupCompleted.set(true)
@@ -197,7 +205,6 @@ class GeminiLiveClient(
             return
         }
 
-        // 2. Session Resumption Handle Update
         json.optJSONObject("sessionResumptionUpdate")?.let { update ->
             val newHandle = update.optString("newHandle", "")
             val resumable = update.optBoolean("resumable", true)
@@ -208,7 +215,6 @@ class GeminiLiveClient(
             }
         }
 
-        // 3. GoAway proactive server reconnect notice
         json.optJSONObject("goAway")?.let { goAway ->
             val timeLeft = goAway.optString("timeLeft", "soon")
             PilotStateHub.log(LogLevel.WS, "goAway", "Server requested reconnect (timeLeft=$timeLeft). Reconnecting...")
@@ -217,7 +223,6 @@ class GeminiLiveClient(
             }
         }
 
-        // 4. Tool Call Cancellation (Barge-In!)
         json.optJSONObject("toolCallCancellation")?.let { cancelObj ->
             val idsArray = cancelObj.optJSONArray("ids")
             val ids = mutableListOf<String>()
@@ -230,7 +235,6 @@ class GeminiLiveClient(
             callbacks.onToolCallCancellation(ids)
         }
 
-        // 5. Tool Calls
         json.optJSONObject("toolCall")?.let { toolCallObj ->
             val funcCalls = toolCallObj.optJSONArray("functionCalls")
             if (funcCalls != null && funcCalls.length() > 0) {
@@ -255,7 +259,6 @@ class GeminiLiveClient(
             }
         }
 
-        // 6. Server Content (Audio chunks, transcriptions, barge-in interruption)
         json.optJSONObject("serverContent")?.let { content ->
             if (content.optBoolean("interrupted", false)) {
                 PilotStateHub.log(LogLevel.AUDIO, "Barge-In", "Server signaled interruption — flushing audio & gestures.")
@@ -315,10 +318,6 @@ class GeminiLiveClient(
         }
     }
 
-    /**
-     * Streams raw 16kHz mono PCM audio using realtimeInput.audio.
-     * STRICT: Ignored until setupComplete has been received.
-     */
     fun sendAudioPcm(pcmBytes: ByteArray): Boolean {
         if (!setupCompleted.get()) return false
         val ws = webSocket ?: return false
@@ -335,9 +334,6 @@ class GeminiLiveClient(
         return ws.send(payload.toString())
     }
 
-    /**
-     * Streams on-demand screen capture JPEG frames using realtimeInput.video.
-     */
     fun sendVisionFrame(jpegBytes: ByteArray): Boolean {
         if (!setupCompleted.get()) return false
         val ws = webSocket ?: return false
@@ -356,9 +352,6 @@ class GeminiLiveClient(
         return ok
     }
 
-    /**
-     * Injects mid-session system notices (e.g., incoming imo/WhatsApp messages) via clientContent.
-     */
     fun sendSystemAlert(alertText: String): Boolean {
         if (!setupCompleted.get()) return false
         val ws = webSocket ?: return false
@@ -383,9 +376,35 @@ class GeminiLiveClient(
         return ok
     }
 
-    /**
-     * Sends function tool execution result back via toolResponse.functionResponses.
-     */
+    fun sendUserTextTurn(text: String): Boolean {
+        if (!setupCompleted.get()) return false
+        val clean = text.trim()
+        if (clean.isEmpty()) return false
+        val ws = webSocket ?: return false
+        val payload = JSONObject().put(
+            "clientContent",
+            JSONObject()
+                .put(
+                    "turns",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("role", "user")
+                            .put(
+                                "parts",
+                                JSONArray().put(JSONObject().put("text", clean))
+                            )
+                    )
+                )
+                .put("turnComplete", true)
+        )
+        val ok = ws.send(payload.toString())
+        if (ok) {
+            PilotStateHub.appendCaption("You", clean)
+            PilotStateHub.log(LogLevel.WS, "TextTurn", "Sent typed command: ${clean.take(80)}")
+        }
+        return ok
+    }
+
     fun sendToolResponse(callId: String, toolName: String, result: JSONObject): Boolean {
         val ws = webSocket ?: return false
         val responseEntry = JSONObject()
@@ -414,14 +433,14 @@ class GeminiLiveClient(
         fun buildSetupPayload(
             modelPath: String,
             voiceName: String,
-            resumptionHandle: String?
+            resumptionHandle: String?,
+            customInstructions: String = ""
         ): JSONObject {
             val prebuiltVoice = JSONObject().put("voiceName", voiceName.ifBlank { "Kore" })
             val speechConfig = JSONObject().put(
                 "voiceConfig",
                 JSONObject().put("prebuiltVoiceConfig", prebuiltVoice)
             )
-            // STRICT: Only ["AUDIO"] in responseModalities, no TEXT, no responseMimeType
             val generationConfig = JSONObject()
                 .put("responseModalities", JSONArray().put("AUDIO"))
                 .put("speechConfig", speechConfig)
@@ -433,7 +452,12 @@ class GeminiLiveClient(
 
             val systemInstruction = JSONObject().put(
                 "parts",
-                JSONArray().put(JSONObject().put("text", GeminiToolSchemas.LIVE_SYSTEM_INSTRUCTION.trim()))
+                JSONArray().put(
+                    JSONObject().put(
+                        "text",
+                        GeminiToolSchemas.buildSystemInstruction(customInstructions)
+                    )
+                )
             )
 
             val setup = JSONObject()
@@ -448,10 +472,6 @@ class GeminiLiveClient(
             return JSONObject().put("setup", setup)
         }
 
-        /**
-         * One-tap diagnostic test that opens a real WebSocket, sends the exact setup handshake,
-         * awaits setupComplete, measures latency, and closes cleanly.
-         */
         suspend fun testLiveHandshake(
             apiKey: String,
             modelId: String,
