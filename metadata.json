@@ -1,0 +1,6 @@
+{
+  "name": "LivePilot AI",
+  "description": "Real-time conversational AI voice, screen vision, UI automation, auto-chat, and Search-grounded assistant for Android.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

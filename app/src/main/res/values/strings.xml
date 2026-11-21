@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LivePilot AI</string>
+    <string name="accessibility_service_description">LivePilot AI reads screen elements, captures visual frames for video editors and apps, and performs voice-directed taps, scrolls, drags, and typing while blocking sensitive financial apps.</string>
+    <string name="notification_listener_label">LivePilot AI Auto-Chat Listener</string>
+    <string name="overlay_service_channel_name">LivePilot AI Active Call</string>
+    <string name="overlay_service_channel_desc">Persistent notification while LivePilot AI real-time voice and overlay agent is active.</string>
+    <string name="tab_home">Home</string>
+    <string name="tab_ask_ai">Ask AI</string>
+    <string name="tab_auto_chat">Auto-Chat</string>
+    <string name="tab_settings">Settings</string>
+</resources>
