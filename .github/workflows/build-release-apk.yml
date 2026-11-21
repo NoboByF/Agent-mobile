@@ -19,8 +19,13 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Set up Android SDK (API 36)
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK Licenses & Prepare SDK
+        run: |
+          SDK_MGR=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)
+          echo "Using sdkmanager: $SDK_MGR"
+          yes | "$SDK_MGR" --licenses > /dev/null 2>&1 || true
+          "$SDK_MGR" "platform-tools" "platforms;android-36" "build-tools;36.0.0" || true
+          "$SDK_MGR" "platforms;android-36.1" || true
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
@@ -29,7 +34,7 @@ jobs:
 
       - name: Generate personal release upload keystore
         run: |
-          keytool -genkeypair -v \
+          keytool -genkeypair -noprompt \
             -keystore "$GITHUB_WORKSPACE/my-upload-key.jks" \
             -alias upload \
             -keyalg RSA \
