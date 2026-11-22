@@ -37,6 +37,7 @@ import com.example.data.RoutineAccent
 import com.example.data.VoiceLanguage
 import com.example.firebase.CloudSyncRepository
 import com.example.firebase.DeviceProfileIdentity
+import com.example.messaging.ChatModerationEngine
 import com.example.messaging.IncomingMessageListener
 import com.example.service.FloatingCallOverlayService
 import com.google.firebase.Firebase
@@ -121,28 +122,43 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     private fun startCloudSyncIfAuthenticated() {
         val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
         if (currentUser == null) {
-            _cloudSyncStatus.value = "অটো ডিভাইস প্রোফাইল (লোকাল সেভ চালু) • ${deviceProfile.displayLabel}"
+            _cloudSyncStatus.value = "লোকাল মোড চালু (অফলাইন সেভ) • ${deviceProfile.displayLabel}"
             return
         }
 
-        // Push any local settings/API-key/model change automatically to THIS device's Firestore doc
-        PilotStateHub.onSettingsChangedListener = { updatedSettings ->
-            scheduleDeviceConfigCloudSave(updatedSettings)
+        val accountLabel = currentUser.email?.takeIf { it.isNotBlank() }
+            ?: currentUser.displayName?.takeIf { it.isNotBlank() }
+            ?: "Firebase"
+
+        // Seed ownerDisplayName automatically from signed-in account if user hasn't set a custom name yet
+        val fbDisplayName = currentUser.displayName?.trim().orEmpty()
+        if (PilotStateHub.settings.value.ownerDisplayName.isBlank() && fbDisplayName.isNotBlank()) {
+            PilotStateHub.updateSettings { it.copy(ownerDisplayName = fbDisplayName.take(80)) }
         }
 
-        // 1. Observe THIS device's isolated config (API keys, deleted models, settings)
+        // Push any local settings/API-key/model change automatically to this account's Firestore doc
+        PilotStateHub.onSettingsChangedListener = { updatedSettings ->
+            scheduleAccountConfigCloudSave(updatedSettings)
+        }
+
+        // 1. Observe this account's cross-device cloud config (API keys, models, deleted models, owner name, settings)
         viewModelScope.launch {
-            cloudRepo.observeDeviceConfig().collect { cloudSettings ->
+            cloudRepo.observeAccountConfig().collect { cloudSettings ->
                 if (cloudSettings != null) {
                     initialDeviceCloudChecked = true
-                    PilotStateHub.applySettingsFromCloud(cloudSettings)
-                    _cloudSyncStatus.value = "Firebase Synced • ${deviceProfile.displayLabel}"
+                    val merged = if (cloudSettings.ownerDisplayName.isBlank() && fbDisplayName.isNotBlank()) {
+                        cloudSettings.copy(ownerDisplayName = fbDisplayName.take(80))
+                    } else {
+                        cloudSettings
+                    }
+                    PilotStateHub.applySettingsFromCloud(merged)
+                    _cloudSyncStatus.value = "Account Cloud Synced • $accountLabel"
                 } else if (!initialDeviceCloudChecked) {
                     initialDeviceCloudChecked = true
-                    // First login on this device: back up existing local settings to this device's Firestore profile
-                    val res = cloudRepo.saveDeviceConfig(PilotStateHub.settings.value)
+                    // First cloud sync for this account: back up existing local settings to Firestore
+                    val res = cloudRepo.saveAccountConfig(PilotStateHub.settings.value)
                     _cloudSyncStatus.value = if (res.isSuccess) {
-                        "Firebase Synced • ${deviceProfile.displayLabel}"
+                        "Account Cloud Synced • $accountLabel"
                     } else {
                         "Cloud backup pending (offline)"
                     }
@@ -198,15 +214,16 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun scheduleDeviceConfigCloudSave(settingsSnapshot: PilotSettings) {
-        if (runCatching { Firebase.auth.currentUser }.getOrNull() == null) return
+    private fun scheduleAccountConfigCloudSave(settingsSnapshot: PilotSettings) {
+        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull() ?: return
+        val accountLabel = currentUser.email?.takeIf { it.isNotBlank() } ?: "Firebase"
         pendingSettingsSyncJob?.cancel()
         pendingSettingsSyncJob = viewModelScope.launch {
             delay(450L)
-            _cloudSyncStatus.value = "Saving to Firebase..."
-            val res = cloudRepo.saveDeviceConfig(settingsSnapshot)
+            _cloudSyncStatus.value = "Saving account to Firebase..."
+            val res = cloudRepo.saveAccountConfig(settingsSnapshot)
             _cloudSyncStatus.value = if (res.isSuccess) {
-                "Firebase Synced • ${deviceProfile.displayLabel}"
+                "Account Cloud Synced • $accountLabel"
             } else {
                 "Sync retry pending"
             }
@@ -214,16 +231,17 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun syncNowToCloud() {
-        if (runCatching { Firebase.auth.currentUser }.getOrNull() == null) return
+        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull() ?: return
+        val accountLabel = currentUser.email?.takeIf { it.isNotBlank() } ?: "Firebase"
         viewModelScope.launch {
-            _cloudSyncStatus.value = "Syncing all device data..."
-            val cfgRes = cloudRepo.saveDeviceConfig(PilotStateHub.settings.value)
+            _cloudSyncStatus.value = "Syncing account data..."
+            val cfgRes = cloudRepo.saveAccountConfig(PilotStateHub.settings.value)
             PilotStateHub.personalData.value.forEach { cloudRepo.upsertPersonalData(it) }
             _routines.value.filter { !it.isBuiltIn }.forEach { cloudRepo.saveCustomRoutine(it) }
             _askAiState.value.messages.takeLast(30).forEach { cloudRepo.saveAskAiMessage(it) }
             if (cfgRes.isSuccess) {
-                _cloudSyncStatus.value = "Firebase Synced • ${deviceProfile.displayLabel}"
-                _bannerMessage.value = "✓ এই মোবাইলের সকল ডাটা Firebase ক্লাউডে সেভ হয়েছে।"
+                _cloudSyncStatus.value = "Account Cloud Synced • $accountLabel"
+                _bannerMessage.value = "✓ আপনার অ্যাকাউন্টের সকল ডাটা (API Key, মডেল, আমার ডাটা, সেটিংস) Firebase ক্লাউডে সেভ হয়েছে।"
             } else {
                 _cloudSyncStatus.value = "Sync failed"
                 _bannerMessage.value = "ক্লাউড সিঙ্ক ব্যর্থ হয়েছে: ${cfgRes.exceptionOrNull()?.localizedMessage ?: "ইন্টারনেট চেক করুন"}"
@@ -629,6 +647,16 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         PilotStateHub.updateSettings { it.copy(handsFreeVoiceEscalationEnabled = enabled) }
     }
 
+    fun updateOwnerDisplayName(name: String) {
+        val clean = name.trim().take(80)
+        PilotStateHub.updateSettings { it.copy(ownerDisplayName = clean) }
+        _bannerMessage.value = if (clean.isNotBlank()) {
+            "✓ অ্যাকাউন্টের নাম \"$clean\" সেভ হয়েছে — আপনি দূরে থাকলে রিপ্লাইতে এই নাম যাবে।"
+        } else {
+            "অ্যাকাউন্টের কাস্টম নাম মুছে ফেলা হয়েছে।"
+        }
+    }
+
     fun deleteModelFromDevice(modelId: String) {
         val clean = modelId.trim().removePrefix("models/")
         if (clean.isBlank()) return
@@ -636,7 +664,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             val updatedDeleted = (current.deletedModels + clean).distinct()
             current.copy(deletedModels = updatedDeleted)
         }
-        _bannerMessage.value = "মডেল '$clean' এই ডিভাইস থেকে ডিলিট/হাইড করা হয়েছে (Firebase-এ সেভ হয়েছে)।"
+        _bannerMessage.value = "মডেল '$clean' হাইড/ডিলিট করা হয়েছে (আপনার অ্যাকাউন্টে Firebase-এ সেভ হয়েছে)।"
     }
 
     fun restoreDeletedModel(modelId: String) {
@@ -903,6 +931,9 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             )
             if (sent) {
                 PilotStateHub.markSensitiveMessageResolved(record.id, clean)
+                ChatModerationEngine.markOwnerRespondedForSender(
+                    IncomingMessageListener.conversationKey(record.packageName, record.senderName)
+                )
                 _bannerMessage.value = "✓ ${record.senderName}-কে আপনার উত্তর পাঠানো হয়েছে: \"$clean\""
                 return
             }
@@ -924,6 +955,9 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 if (visualRes.optString("status") == "ok") {
                     PilotStateHub.markSensitiveMessageResolved(record.id, clean)
+                    ChatModerationEngine.markOwnerRespondedForSender(
+                        IncomingMessageListener.conversationKey(record.packageName, record.senderName)
+                    )
                     _bannerMessage.value = "✓ ${record.senderName}-কে চ্যাট খুলে উত্তর পাঠানো হয়েছে।"
                 } else {
                     _bannerMessage.value = "Direct Reply পাওয়া যায়নি; Open Chat চাপ দিয়ে উত্তর পাঠান।"

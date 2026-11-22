@@ -8,11 +8,11 @@ import com.google.firebase.firestore.ServerTimestamp
 
 @Keep
 @IgnoreExtraProperties
-data class DeviceCloudConfigDoc(
+data class AccountCloudConfigDoc(
     @DocumentId val id: String = "",
-    val deviceId: String = "",
-    val deviceModel: String = "",
-    val deviceManufacturer: String = "",
+    val ownerDisplayName: String = "",
+    val ownerEmail: String = "",
+    val lastDeviceModel: String = "",
     val apiKeysJson: String = "[]",
     val activeApiKeyId: String = "",
     val autoRotateApiKeys: Boolean = true,

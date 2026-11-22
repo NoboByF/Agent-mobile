@@ -504,6 +504,7 @@ private fun LivePilotAppRoot(
                             onSyncNow = { viewModel.syncNowToCloud() },
                             onSignOut = onSignOut,
                             onOpenGoogleSignIn = onOpenGoogleSignIn,
+                            onUpdateOwnerDisplayName = { viewModel.updateOwnerDisplayName(it) },
                             onExportBackupFile = {
                                 exportBackupLauncher.launch("LivePilot_${viewModel.deviceProfile.deviceId}_backup.json")
                             },

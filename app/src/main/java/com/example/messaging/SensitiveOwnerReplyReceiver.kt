@@ -43,6 +43,9 @@ class SensitiveOwnerReplyReceiver : BroadcastReceiver() {
             )
             if (sent) {
                 PilotStateHub.markSensitiveMessageResolved(recordId, ownerReply)
+                ChatModerationEngine.markOwnerRespondedForSender(
+                    IncomingMessageListener.conversationKey(handle.packageName, handle.senderName)
+                )
                 PilotStateHub.log(
                     LogLevel.INFO,
                     "SensitiveGuard",
@@ -58,8 +61,14 @@ class SensitiveOwnerReplyReceiver : BroadcastReceiver() {
         } else if (handle?.contentIntent != null) {
             runCatching { handle.contentIntent.send() }
             PilotStateHub.markSensitiveMessageResolved(recordId, ownerReply)
+            ChatModerationEngine.markOwnerRespondedForSender(
+                IncomingMessageListener.conversationKey(handle.packageName, handle.senderName)
+            )
         } else if (record != null) {
             PilotStateHub.markSensitiveMessageResolved(recordId, ownerReply)
+            ChatModerationEngine.markOwnerRespondedForSender(
+                IncomingMessageListener.conversationKey(record.packageName, record.senderName)
+            )
         }
 
         if (notifId > 0) {

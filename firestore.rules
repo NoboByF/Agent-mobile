@@ -35,10 +35,10 @@ service cloud.firestore {
 
     // --- Entity Validators (standalone, safe for both create & update) ---
 
-    function isValidDeviceConfig(data, deviceId) {
-      return data.deviceId is string && data.deviceId == deviceId && data.deviceId.size() >= 1 && data.deviceId.size() <= 80
-        && data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 100
-        && data.deviceManufacturer is string && data.deviceManufacturer.size() <= 80
+    function isValidAccountConfig(data) {
+      return data.ownerDisplayName is string && data.ownerDisplayName.size() <= 80
+        && data.ownerEmail is string && data.ownerEmail.size() <= 160
+        && data.lastDeviceModel is string && data.lastDeviceModel.size() >= 1 && data.lastDeviceModel.size() <= 120
         && data.apiKeysJson is string && data.apiKeysJson.size() <= 32000
         && data.activeApiKeyId is string && data.activeApiKeyId.size() <= 80
         && data.autoRotateApiKeys is bool
@@ -95,15 +95,15 @@ service cloud.firestore {
         && isValidTimestamp(data.updatedAt);
     }
 
-    // --- Per-User, Per-Device Isolated Collections ---
-    match /users/{userId}/devices/{deviceId} {
+    // --- Account-Level Cross-Device Collections (/users/{userId}/...) ---
+    match /users/{userId}/account/{docId} {
+      allow get: if isOwner(userId) && docId == 'config';
       allow list: if isOwner(userId);
-      allow get: if isOwner(userId) && isValidId(deviceId);
 
       allow create: if isOwner(userId)
-        && isValidId(deviceId)
+        && docId == 'config'
         && incoming().keys().hasAll([
-          'deviceId', 'deviceModel', 'deviceManufacturer', 'apiKeysJson',
+          'ownerDisplayName', 'ownerEmail', 'lastDeviceModel', 'apiKeysJson',
           'activeApiKeyId', 'autoRotateApiKeys', 'liveModel', 'agentModel',
           'textModel', 'deletedModels', 'verifyTaskCompletion', 'voiceName',
           'voiceLanguage', 'speakerphoneOn', 'autoVisionDefaultOn',
@@ -114,7 +114,7 @@ service cloud.firestore {
           'createdAt', 'updatedAt'
         ])
         && incoming().keys().hasOnly([
-          'deviceId', 'deviceModel', 'deviceManufacturer', 'apiKeysJson',
+          'ownerDisplayName', 'ownerEmail', 'lastDeviceModel', 'apiKeysJson',
           'activeApiKeyId', 'autoRotateApiKeys', 'liveModel', 'agentModel',
           'textModel', 'deletedModels', 'verifyTaskCompletion', 'voiceName',
           'voiceLanguage', 'speakerphoneOn', 'autoVisionDefaultOn',
@@ -124,12 +124,12 @@ service cloud.firestore {
           'handsFreeVoiceEscalationEnabled', 'enabledMessagingApps',
           'createdAt', 'updatedAt'
         ])
-        && isValidDeviceConfig(incoming(), deviceId);
+        && isValidAccountConfig(incoming());
 
       allow update: if isOwner(userId)
-        && isValidId(deviceId)
+        && docId == 'config'
         && incoming().diff(existing()).affectedKeys().hasOnly([
-          'deviceModel', 'deviceManufacturer', 'apiKeysJson',
+          'ownerDisplayName', 'ownerEmail', 'lastDeviceModel', 'apiKeysJson',
           'activeApiKeyId', 'autoRotateApiKeys', 'liveModel', 'agentModel',
           'textModel', 'deletedModels', 'verifyTaskCompletion', 'voiceName',
           'voiceLanguage', 'speakerphoneOn', 'autoVisionDefaultOn',
@@ -139,79 +139,72 @@ service cloud.firestore {
           'handsFreeVoiceEscalationEnabled', 'enabledMessagingApps',
           'updatedAt'
         ])
-        && incoming().deviceId == existing().deviceId
         && incoming().createdAt == existing().createdAt
-        && isValidDeviceConfig(incoming(), deviceId);
+        && isValidAccountConfig(incoming());
 
-      allow delete: if isOwner(userId) && isValidId(deviceId);
+      allow delete: if isOwner(userId) && docId == 'config';
+    }
 
-      // Personal Data ('আমার ডাটা') scoped to this device
-      match /personalData/{entryId} {
-        allow list: if isOwner(userId) && isValidId(deviceId);
-        allow get: if isOwner(userId) && isValidId(deviceId) && isValidId(entryId);
+    // Account-level Personal Data ('আমার ডাটা')
+    match /users/{userId}/personalData/{entryId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(entryId);
 
-        allow create: if isOwner(userId)
-          && isValidId(deviceId)
-          && isValidId(entryId)
-          && incoming().keys().hasAll(['title', 'content', 'category', 'shareInAutoReply', 'createdAt', 'updatedAt'])
-          && incoming().keys().hasOnly(['title', 'content', 'category', 'shareInAutoReply', 'createdAt', 'updatedAt'])
-          && isValidPersonalData(incoming());
+      allow create: if isOwner(userId)
+        && isValidId(entryId)
+        && incoming().keys().hasAll(['title', 'content', 'category', 'shareInAutoReply', 'createdAt', 'updatedAt'])
+        && incoming().keys().hasOnly(['title', 'content', 'category', 'shareInAutoReply', 'createdAt', 'updatedAt'])
+        && isValidPersonalData(incoming());
 
-        allow update: if isOwner(userId)
-          && isValidId(deviceId)
-          && isValidId(entryId)
-          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'category', 'shareInAutoReply', 'updatedAt'])
-          && incoming().createdAt == existing().createdAt
-          && isValidPersonalData(incoming());
+      allow update: if isOwner(userId)
+        && isValidId(entryId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'category', 'shareInAutoReply', 'updatedAt'])
+        && incoming().createdAt == existing().createdAt
+        && isValidPersonalData(incoming());
 
-        allow delete: if isOwner(userId) && isValidId(deviceId) && isValidId(entryId);
-      }
+      allow delete: if isOwner(userId) && isValidId(entryId);
+    }
 
-      // Custom Routines scoped to this device
-      match /routines/{routineId} {
-        allow list: if isOwner(userId) && isValidId(deviceId);
-        allow get: if isOwner(userId) && isValidId(deviceId) && isValidId(routineId);
+    // Account-level Custom Routines
+    match /users/{userId}/routines/{routineId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(routineId);
 
-        allow create: if isOwner(userId)
-          && isValidId(deviceId)
-          && isValidId(routineId)
-          && incoming().keys().hasAll(['title', 'subtitle', 'prompt', 'accent', 'createdAt', 'updatedAt'])
-          && incoming().keys().hasOnly(['title', 'subtitle', 'prompt', 'accent', 'createdAt', 'updatedAt'])
-          && isValidRoutine(incoming());
+      allow create: if isOwner(userId)
+        && isValidId(routineId)
+        && incoming().keys().hasAll(['title', 'subtitle', 'prompt', 'accent', 'createdAt', 'updatedAt'])
+        && incoming().keys().hasOnly(['title', 'subtitle', 'prompt', 'accent', 'createdAt', 'updatedAt'])
+        && isValidRoutine(incoming());
 
-        allow update: if isOwner(userId)
-          && isValidId(deviceId)
-          && isValidId(routineId)
-          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'subtitle', 'prompt', 'accent', 'updatedAt'])
-          && incoming().createdAt == existing().createdAt
-          && isValidRoutine(incoming());
+      allow update: if isOwner(userId)
+        && isValidId(routineId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'subtitle', 'prompt', 'accent', 'updatedAt'])
+        && incoming().createdAt == existing().createdAt
+        && isValidRoutine(incoming());
 
-        allow delete: if isOwner(userId) && isValidId(deviceId) && isValidId(routineId);
-      }
+      allow delete: if isOwner(userId) && isValidId(routineId);
+    }
 
-      // Ask AI Messages scoped to this device
-      match /askAiMessages/{messageId} {
-        allow list: if isOwner(userId) && isValidId(deviceId);
-        allow get: if isOwner(userId) && isValidId(deviceId) && isValidId(messageId);
+    // Account-level Ask AI Messages
+    match /users/{userId}/askAiMessages/{messageId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(messageId);
 
-        allow create: if isOwner(userId)
-          && isValidId(deviceId)
-          && isValidId(messageId)
-          && incoming().keys().hasAll(['clientId', 'senderRole', 'text', 'modelUsed', 'timestampLabel', 'citationsJson', 'createdAt', 'updatedAt'])
-          && incoming().keys().hasOnly(['clientId', 'senderRole', 'text', 'modelUsed', 'timestampLabel', 'citationsJson', 'createdAt', 'updatedAt'])
-          && isValidAskAiMessage(incoming());
+      allow create: if isOwner(userId)
+        && isValidId(messageId)
+        && incoming().keys().hasAll(['clientId', 'senderRole', 'text', 'modelUsed', 'timestampLabel', 'citationsJson', 'createdAt', 'updatedAt'])
+        && incoming().keys().hasOnly(['clientId', 'senderRole', 'text', 'modelUsed', 'timestampLabel', 'citationsJson', 'createdAt', 'updatedAt'])
+        && isValidAskAiMessage(incoming());
 
-        allow update: if isOwner(userId)
-          && isValidId(deviceId)
-          && isValidId(messageId)
-          && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'modelUsed', 'timestampLabel', 'citationsJson', 'updatedAt'])
-          && incoming().clientId == existing().clientId
-          && incoming().senderRole == existing().senderRole
-          && incoming().createdAt == existing().createdAt
-          && isValidAskAiMessage(incoming());
+      allow update: if isOwner(userId)
+        && isValidId(messageId)
+        && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'modelUsed', 'timestampLabel', 'citationsJson', 'updatedAt'])
+        && incoming().clientId == existing().clientId
+        && incoming().senderRole == existing().senderRole
+        && incoming().createdAt == existing().createdAt
+        && isValidAskAiMessage(incoming());
 
-        allow delete: if isOwner(userId) && isValidId(deviceId) && isValidId(messageId);
-      }
+      allow delete: if isOwner(userId) && isValidId(messageId);
     }
   }
 }

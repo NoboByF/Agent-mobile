@@ -226,14 +226,14 @@ fun AuthGateScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "এক ক্লিকে অটোমেটিক এই মোবাইলের প্রোফাইল চালু করুন—কোনো লগইন লাগবে না। চাইলে পরে Google দিয়ে Firebase ক্লাউড সিঙ্কও চালু করতে পারবেন।",
+                    text = "আপনার Gmail অ্যাকাউন্ট দিয়ে লগইন করলে API Key, মডেল, \"আমার ডাটা\" ও সেটিংস সব Firebase-এ সেভ থাকবে—নতুন মোবাইলেও অটোমেটিক রিস্টোর হবে।",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.inkSecondary,
                     textAlign = TextAlign.Center
                 )
             }
 
-            // Per-Device Isolation Preview Card
+            // Account-Level Cross-Device Cloud Sync Card
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(20.dp),
@@ -254,7 +254,7 @@ fun AuthGateScreen(
                         ) {
                             Icon(
                                 imageVector = Icons.Filled.PhoneAndroid,
-                                contentDescription = "Device isolation",
+                                contentDescription = "Cross-device account sync",
                                 tint = EmeraldGreen,
                                 modifier = Modifier.size(20.dp)
                             )
@@ -262,39 +262,34 @@ fun AuthGateScreen(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "এই মোবাইলের আলাদা প্রোফাইল",
+                                text = "অ্যাকাউন্ট-ভিত্তিক ক্লাউড সিঙ্ক",
                                 style = MaterialTheme.typography.titleSmall,
                                 color = palette.inkPrimary,
                                 fontWeight = FontWeight.SemiBold
                             )
                             Text(
-                                text = deviceProfile.displayLabel,
+                                text = "বর্তমান ডিভাইস: ${deviceProfile.displayLabel}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = palette.emeraldAccent,
                                 fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                text = "ID: ${deviceProfile.deviceId}",
-                                style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
-                                color = palette.inkMuted
                             )
                         }
                     }
 
                     FeatureRow(
-                        icon = Icons.Filled.Shield,
-                        tint = CobaltBlue,
-                        text = "আপনার API Key, ডিলিট করা মডেল ও সেটিংস শুধুমাত্র এই মোবাইলের আন্ডারেই আলাদা থাকবে — অন্য মোবাইলে যাবে না।"
-                    )
-                    FeatureRow(
                         icon = Icons.Filled.CloudDone,
                         tint = EmeraldGreen,
-                        text = "আপনার \"আমার ডাটা\" (My Data), রুটিন ও চ্যাট হিস্ট্রি Firebase-এ সুরক্ষিত থাকবে — অ্যাপ ডিলিট করলেও মুছবে না।"
+                        text = "আপনার অ্যাকাউন্টের অধীনে API Key, নির্বাচিত/ডিলিট করা মডেল, \"আমার ডাটা\" ও রুটিন সুরক্ষিত থাকবে — যেকোনো নতুন মোবাইলে অটো চলে আসবে।"
+                    )
+                    FeatureRow(
+                        icon = Icons.Filled.Shield,
+                        tint = CobaltBlue,
+                        text = "স্মার্ট অটো-রিপ্লাই গার্ড: ৩ বার সতর্কতার পর বকাবাজি/স্প্যাম এড়িয়ে যাবে, কিন্তু ভালো মেসেজ ও কবিতা/ছবির অনুরোধ নিজেই সুন্দরভাবে উত্তর দেবে।"
                     )
                     FeatureRow(
                         icon = Icons.AutoMirrored.Filled.VolumeUp,
                         tint = palette.roseAccent,
-                        text = "স্ক্রিন অফ থাকলেও গুরুত্বপূর্ণ মেসেজ জোরে পড়ে শোনাবে ও দূর থেকে আপনার ভয়েস শুনে অটো রিপ্লাই দেবে।"
+                        text = "শুধু আসল জরুরি/ব্যক্তিগত মেসেজেই ১ বার জিজ্ঞেস করবে; কাছে না থাকলে আপনার অ্যাকাউন্টের নাম জানিয়ে অপেক্ষা করতে বলবে।"
                     )
                 }
             }
@@ -315,71 +310,71 @@ fun AuthGateScreen(
                 }
             }
 
-            // Primary 1-Click Automatic Entry (No Google Sign-In required)
+            // Primary Gmail / Google Account Cloud Sync Sign-In (1-Tap, no separate password to remember)
             Button(
-                onClick = onOneClickAutoStart,
-                enabled = !isSigningIn,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-                    .testTag("one_click_auto_start_button"),
-                shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = EmeraldGreen,
-                    contentColor = Color.White
-                )
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.Bolt,
-                    contentDescription = "One-click auto start",
-                    modifier = Modifier.size(22.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "এক ক্লিকে অটো চালু করুন (লগইন ছাড়াই)",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            // Optional Google Sign-In for Firebase Cloud Sync
-            OutlinedButton(
                 onClick = { startInteractiveGoogleSignIn() },
                 enabled = !isSigningIn,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(52.dp)
+                    .height(56.dp)
                     .testTag("google_sign_in_button"),
                 shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.2.dp, CobaltBlue.copy(alpha = 0.6f))
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CobaltBlue,
+                    contentColor = Color.White
+                )
             ) {
                 if (isSigningIn) {
                     CircularProgressIndicator(
-                        color = CobaltBlue,
+                        color = Color.White,
                         strokeWidth = 2.5.dp,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = "Google সাইন-ইন হচ্ছে...",
-                        style = MaterialTheme.typography.titleSmall,
-                        color = CobaltBlue
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Login,
-                        contentDescription = "Sign in with Google",
-                        tint = CobaltBlue,
                         modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
-                        text = "Google দিয়ে Firebase সিঙ্ক (ঐচ্ছিক)",
+                        text = "অ্যাকাউন্ট সাইন-ইন হচ্ছে...",
                         style = MaterialTheme.typography.titleSmall,
-                        color = CobaltBlue,
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.Bold
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Login,
+                        contentDescription = "Sign in with Gmail account",
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Gmail অ্যাকাউন্ট দিয়ে চালু করুন (ক্লাউড সিঙ্ক)",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold
                     )
                 }
+            }
+
+            // 1-Click Offline / Local Mode Entry (no sign-in required)
+            OutlinedButton(
+                onClick = onOneClickAutoStart,
+                enabled = !isSigningIn,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+                    .testTag("one_click_auto_start_button"),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.2.dp, EmeraldGreen.copy(alpha = 0.65f))
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Bolt,
+                    contentDescription = "One-click local start",
+                    tint = EmeraldGreen,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "লগইন ছাড়াই লোকাল মোডে চালু করুন",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = EmeraldGreen,
+                    fontWeight = FontWeight.SemiBold
+                )
             }
         }
     }

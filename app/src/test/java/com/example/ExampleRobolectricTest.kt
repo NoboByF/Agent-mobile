@@ -24,7 +24,9 @@ import com.example.data.PilotStateHub
 import com.example.data.RoutineAccent
 import com.example.data.SafetyGuardrails
 import com.example.data.VoiceLanguage
+import com.example.messaging.ChatModerationEngine
 import com.example.messaging.IncomingMessageListener
+import com.example.messaging.ModerationAction
 import com.example.messaging.SensitiveMessageGuard
 import com.example.ui.components.formatAiRichText
 import org.junit.Assert.assertEquals
@@ -492,21 +494,115 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `sensitive question guard detects financial, OTP, and private questions and defers politely`() {
-        val bkash = SensitiveMessageGuard.assessSensitivityLocally("ভাই আমাকে ৫০০০ টাকা বিকাশ করে দাও জরুরি")
+    fun `sensitive question guard detects financial, OTP, and private questions and defers politely with owner name`() {
+        val bkash = SensitiveMessageGuard.assessSensitivityLocally(
+            messageText = "ভাই আমাকে ৫০০০ টাকা বিকাশ করে দাও জরুরি",
+            ownerName = "ফাহিম"
+        )
         assertTrue(bkash.isSensitive)
-        assertEquals("আমি জেনে বলছি।", bkash.deferralReply)
+        assertEquals("উত্তরের জন্য অপেক্ষা করুন, ফাহিম আসলেই উত্তর দেবেন।", bkash.deferralReply)
 
-        val otp = SensitiveMessageGuard.assessSensitivityLocally("Can you send me the OTP verification code?")
+        val otp = SensitiveMessageGuard.assessSensitivityLocally(
+            messageText = "Can you send me the OTP verification code?",
+            ownerName = "Fahim"
+        )
         assertTrue(otp.isSensitive)
-        assertEquals("Let me check and get back to you.", otp.deferralReply)
+        assertEquals("Please wait for a reply, Fahim will respond as soon as they are back.", otp.deferralReply)
 
-        val address = SensitiveMessageGuard.assessSensitivityLocally("তোমার বাসার ঠিকানা দাও এখন")
+        val address = SensitiveMessageGuard.assessSensitivityLocally(
+            messageText = "তোমার বাসার ঠিকানা দাও এখন",
+            ownerName = "ফাহিম"
+        )
         assertTrue(address.isSensitive)
-        assertEquals("আমি জেনে বলছি।", address.deferralReply)
+        assertEquals("উত্তরের জন্য অপেক্ষা করুন, ফাহিম আসলেই উত্তর দেবেন।", address.deferralReply)
 
-        val casual = SensitiveMessageGuard.assessSensitivityLocally("হাই কেমন আছো?")
-        assertFalse(casual.isSensitive)
+        // Casual, poem, and image creation requests MUST NOT be escalated as sensitive!
+        assertFalse(SensitiveMessageGuard.assessSensitivityLocally("হাই কেমন আছো?").isSensitive)
+        assertFalse(SensitiveMessageGuard.assessSensitivityLocally("আমাকে একটা সুন্দর কবিতা লিখে পাঠাও").isSensitive)
+        assertFalse(SensitiveMessageGuard.assessSensitivityLocally("একটা সূর্যাস্তের ছবি তৈরি করে দাও").isSensitive)
+        assertFalse(SensitiveMessageGuard.assessSensitivityLocally("Write a short poem about rain").isSensitive)
+    }
+
+    @Test
+    fun `chat moderation engine warns 3 times for abuse, ignores 4th+, and still replies to polite messages`() {
+        ChatModerationEngine.clearAllForTest()
+        val convKey = "com.whatsapp|abusive_user"
+
+        val strike1 = ChatModerationEngine.evaluateIncomingLocally(convKey, "তুই একটা গাধা বেয়াদব")
+        assertEquals(ModerationAction.WARN_ABUSE, strike1.action)
+        assertEquals(1, strike1.strikeCount)
+        assertTrue(strike1.replyText.contains("ভালোভাবে কথা বলুন"))
+
+        val strike2 = ChatModerationEngine.evaluateIncomingLocally(convKey, "শালা হারামি")
+        assertEquals(ModerationAction.WARN_ABUSE, strike2.action)
+        assertEquals(2, strike2.strikeCount)
+
+        val strike3 = ChatModerationEngine.evaluateIncomingLocally(convKey, "কুত্তার বাচ্চা")
+        assertEquals(ModerationAction.WARN_ABUSE, strike3.action)
+        assertEquals(3, strike3.strikeCount)
+
+        // 4th+ abusive message -> silently ignored (empty reply)
+        val strike4 = ChatModerationEngine.evaluateIncomingLocally(convKey, "তুই একটা শুয়োর")
+        assertEquals(ModerationAction.SILENT_IGNORE_ABUSE, strike4.action)
+        assertEquals("", strike4.replyText)
+        assertEquals(4, strike4.strikeCount)
+
+        // Good/polite message from the SAME sender -> proceeds to AI normally!
+        val polite = ChatModerationEngine.evaluateIncomingLocally(convKey, "দুঃখিত ভাই, আজকে আবহাওয়া কেমন?")
+        assertEquals(ModerationAction.PROCEED_TO_AI, polite.action)
+
+        // Subsequent abuse is still silently ignored
+        val strike5 = ChatModerationEngine.evaluateIncomingLocally(convKey, "হারামজাদা")
+        assertEquals(ModerationAction.SILENT_IGNORE_ABUSE, strike5.action)
+    }
+
+    @Test
+    fun `chat moderation avoids abul-tabul spam and mutes after threshold while allowing real messages`() {
+        ChatModerationEngine.clearAllForTest()
+        val convKey = "com.whatsapp|spam_user"
+        val t0 = 5_000_000L
+
+        val s1 = ChatModerationEngine.evaluateIncomingLocally(convKey, "asdfghjkl", nowMs = t0)
+        assertEquals(ModerationAction.AVOID_SPAM_ONCE, s1.action)
+
+        val s2 = ChatModerationEngine.evaluateIncomingLocally(convKey, "qwertyuiop", nowMs = t0 + 30_000L)
+        assertEquals(ModerationAction.SILENT_IGNORE_SPAM, s2.action)
+
+        val s3 = ChatModerationEngine.evaluateIncomingLocally(convKey, "😂😂😂😂", nowMs = t0 + 60_000L)
+        assertEquals(ModerationAction.SILENT_IGNORE_SPAM, s3.action)
+
+        val s4 = ChatModerationEngine.evaluateIncomingLocally(convKey, "আবুল তাবুল", nowMs = t0 + 90_000L)
+        assertEquals(ModerationAction.SILENT_IGNORE_SPAM, s4.action)
+        assertTrue(s4.strikeCount >= ChatModerationEngine.MAX_SPAM_STRIKES_BEFORE_MUTE)
+
+        // Meaningful real message after flood window still gets answered
+        val realMsg = ChatModerationEngine.evaluateIncomingLocally(
+            convKey,
+            "ভাই একটা সুন্দর কবিতা লিখে দাও তো",
+            nowMs = t0 + 150_000L
+        )
+        assertEquals(ModerationAction.PROCEED_TO_AI, realMsg.action)
+    }
+
+    @Test
+    fun `anti-nag escalation cooldown prevents repeated disturbance and resets when owner responds`() {
+        ChatModerationEngine.clearAllForTest()
+        val convKey = "com.whatsapp|important_sender"
+        val t0 = 9_000_000L
+
+        assertTrue(ChatModerationEngine.canEscalateToOwner(convKey, nowMs = t0))
+        // Second escalation 1 minute later must be suppressed (no nagging!)
+        assertFalse(ChatModerationEngine.canEscalateToOwner(convKey, nowMs = t0 + 60_000L))
+
+        assertTrue(ChatModerationEngine.shouldSendAwayNotice(convKey, nowMs = t0))
+        assertFalse(ChatModerationEngine.shouldSendAwayNotice(convKey, nowMs = t0 + 60_000L))
+
+        // Once owner responds, cooldown clears immediately
+        ChatModerationEngine.markOwnerRespondedForSender(convKey)
+        assertTrue(ChatModerationEngine.canEscalateToOwner(convKey, nowMs = t0 + 90_000L))
+
+        val bnAway = ChatModerationEngine.buildOwnerAwayMessage("রাকিব", "ভাই জরুরি টাকা লাগবে")
+        assertEquals("উত্তরের জন্য অপেক্ষা করুন, রাকিব আসলেই উত্তর দেবেন।", bnAway)
     }
 
     @Test
@@ -523,7 +619,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `device identity is valid for Firestore path and personal data plus deleted models persist`() {
+    fun `device identity is valid for Firestore path and personal data, owner name, deleted models, and JSON backup persist`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val profile = com.example.firebase.DeviceIdentityHelper.resolve(context)
         assertTrue(profile.deviceId.matches(Regex("^[a-zA-Z0-9_\\-]+$")))
@@ -532,11 +628,15 @@ class ExampleRobolectricTest {
 
         val prefs = PilotPreferences(context)
         val savedSettings = PilotSettings(
+            ownerDisplayName = "ফাহিম",
+            apiKeys = listOf(GeminiApiKeyEntry(id = "k1", label = "Main", key = "AIzaSyBackupKey001")),
+            activeApiKeyId = "k1",
             deletedModels = listOf("gemini-2.0-flash", "gemini-1.5-pro"),
             handsFreeVoiceEscalationEnabled = true
         )
         prefs.saveSettings(savedSettings)
         val reloadedSettings = prefs.loadSettings()
+        assertEquals("ফাহিম", reloadedSettings.ownerDisplayName)
         assertTrue(reloadedSettings.deletedModels.contains("gemini-2.0-flash"))
         assertTrue(reloadedSettings.handsFreeVoiceEscalationEnabled)
 
@@ -558,27 +658,36 @@ class ExampleRobolectricTest {
         assertTrue(prompt.contains("আমি একজন Android ডেভেলপার।"))
         PilotStateHub.setPersonalData(emptyList())
 
-        // Verify zero-login JSON backup export and restore round-trip
-        val backupJson = com.example.data.DeviceBackupManager.exportToJson(
-            deviceProfile = profile,
-            settings = reloadedSettings.copy(
-                apiKeys = listOf(GeminiApiKeyEntry(id = "k1", label = "Main", key = "AIzaSyBackupKey001"))
-            ),
-            personalData = reloadedFacts,
-            allRoutines = listOf(
+        // Verify JSON backup export and import round-trip via PilotPreferences
+        prefs.saveCustomRoutines(
+            listOf(
                 PilotRoutine("r_custom", "Morning", "Open news", "Open news app", RoutineAccent.COBALT, isBuiltIn = false)
-            ) + PilotSettings.DEFAULT_ROUTINES,
-            askAiMessages = listOf(AskAiMessage(id = 10L, isUser = true, text = "Hello", timestamp = "10:00"))
+            ) + PilotSettings.DEFAULT_ROUTINES
         )
-        val restored = com.example.data.DeviceBackupManager.parseFromJson(backupJson).getOrThrow()
-        assertEquals(profile.deviceId, restored.sourceDeviceId)
-        assertEquals(1, restored.settings.apiKeys.size)
-        assertEquals("AIzaSyBackupKey001", restored.settings.apiKeys.first().key)
-        assertTrue(restored.settings.deletedModels.contains("gemini-2.0-flash"))
-        assertEquals(1, restored.personalData.size)
-        assertEquals("আমার পেশা", restored.personalData.first().title)
-        assertEquals(1, restored.customRoutines.size)
-        assertEquals(1, restored.askAiMessages.size)
+        prefs.saveAskAiHistory(listOf(AskAiMessage(id = 10L, isUser = true, text = "Hello", timestamp = "10:00")))
+
+        val backupJson = prefs.exportDeviceBackupJson(
+            deviceId = profile.deviceId,
+            deviceLabel = profile.displayLabel
+        )
+        // Wipe prefs then restore from backup JSON
+        prefs.saveSettings(PilotSettings())
+        prefs.savePersonalData(emptyList())
+        prefs.saveCustomRoutines(PilotSettings.DEFAULT_ROUTINES)
+        prefs.saveAskAiHistory(emptyList())
+
+        val importResult = prefs.importDeviceBackupJson(backupJson)
+        assertTrue(importResult.isSuccess)
+
+        val restoredSettings = prefs.loadSettings()
+        assertEquals("ফাহিম", restoredSettings.ownerDisplayName)
+        assertEquals(1, restoredSettings.apiKeys.size)
+        assertEquals("AIzaSyBackupKey001", restoredSettings.apiKeys.first().key)
+        assertTrue(restoredSettings.deletedModels.contains("gemini-2.0-flash"))
+        assertEquals(1, prefs.loadPersonalData().size)
+        assertEquals("আমার পেশা", prefs.loadPersonalData().first().title)
+        assertTrue(prefs.loadRoutines().any { it.id == "r_custom" })
+        assertEquals(1, prefs.loadAskAiHistory().size)
     }
 }
 

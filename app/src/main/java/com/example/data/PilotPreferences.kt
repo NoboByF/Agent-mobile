@@ -120,6 +120,7 @@ class PilotPreferences(context: Context) {
         val deletedModels = deletedModelsSet.map { it.trim() }.filter { it.isNotBlank() }.sorted()
 
         return PilotSettings(
+            ownerDisplayName = prefs.getString(KEY_OWNER_DISPLAY_NAME, "").orEmpty().trim(),
             apiKey = effectiveKey,
             apiKeys = migratedKeys,
             activeApiKeyId = resolvedActiveId,
@@ -173,6 +174,7 @@ class PilotPreferences(context: Context) {
             ?: settings.apiKey.trim()
 
         prefs.edit()
+            .putString(KEY_OWNER_DISPLAY_NAME, settings.ownerDisplayName.trim().take(80))
             .putString(KEY_API_KEY, mirrorKey)
             .putString(KEY_API_KEYS_JSON, serializeApiKeysJson(syncedKeys))
             .putString(KEY_ACTIVE_API_KEY_ID, activeId)
@@ -391,6 +393,7 @@ class PilotPreferences(context: Context) {
 
         val settings = loadSettings()
         val settingsObj = JSONObject()
+            .put("ownerDisplayName", settings.ownerDisplayName)
             .put("apiKeysJson", serializeApiKeysJson(settings.apiKeys))
             .put("activeApiKeyId", settings.activeApiKeyId.orEmpty())
             .put("autoRotateApiKeys", settings.autoRotateApiKeys)
@@ -453,6 +456,7 @@ class PilotPreferences(context: Context) {
             }.ifEmpty { MessagingApp.entries.toSet() }
 
             val restoredSettings = PilotSettings(
+                ownerDisplayName = sObj.optString("ownerDisplayName", "").trim().take(80),
                 apiKey = mirrorKey,
                 apiKeys = parsedKeys,
                 activeApiKeyId = resolvedActive,
@@ -515,6 +519,7 @@ class PilotPreferences(context: Context) {
     companion object {
         private const val PREFS_NAME = "livepilot_ai_secure_prefs"
         private const val KEY_AUTO_LOCAL_DEVICE_MODE = "auto_local_device_mode_enabled"
+        private const val KEY_OWNER_DISPLAY_NAME = "owner_display_name"
         private const val KEY_API_KEY = "gemini_api_key"
         private const val KEY_API_KEYS_JSON = "gemini_api_keys_json"
         private const val KEY_ACTIVE_API_KEY_ID = "gemini_active_api_key_id"

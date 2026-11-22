@@ -68,20 +68,23 @@ object SensitiveMessageGuard {
         "waiting for this message"
     )
 
-    // Fast local heuristic keywords for sensitive/private/financial/personal questions (Bengali, Banglish & English)
+    // Fast local heuristic ONLY for unmistakable hard security secrets or direct money transfers.
+    // General chat, poems, stories, image creation, advice, and normal questions are NEVER matched here!
     private val SENSITIVE_PATTERNS: List<Pair<String, Regex>> = listOf(
-        "আর্থিক / টাকা / পেমেন্ট সংক্রান্ত" to Regex(
-            "(?i)(টাকা|ধার|পাঠাও|পাঠান|বিকাশ|নগদ|রকেট|উপায়|ব্যাংক|একাউন্ট|অ্যাকাউন্ট|কার্ড|লোন|বেতন|স্যালারি|দাম কত|কত টাকা|পাওনা|হিসাব|bkash|nagad|rocket|upay|bank|account\\s*number|card\\s*number|credit\\s*card|debit\\s*card|send\\s*money|lend|loan|borrow|transfer|salary|payment|pay\\s*me|taka|dhar)"
-        ),
         "পাসওয়ার্ড / পিন / OTP / সিকিউরিটি" to Regex(
-            "(?i)(পাসওয়ার্ড|পাসওয়ার্ড|পিন|ওটিপি|কোডটা|ভেরিফিকেশন|লগইন|password|passcode|pin\\s*code|otp|verification\\s*code|secret\\s*code|login\\s*code|2fa|cvv|nid|এনআইডি|পাসপোর্ট|passport)"
+            "(?i)(পাসওয়ার্ড|পাসওয়ার্ড|পিন\\s*কোড|পিন\\s*নাম্বার|ওটিপি|ভেরিফিকেশন\\s*কোড|লগইন\\s*কোড|password|passcode|pin\\s*code|\\botp\\b|verification\\s*code|secret\\s*code|login\\s*code|\\b2fa\\b|\\bcvv\\b|এনআইডি\\s*নাম্বার|nid\\s*number|পাসপোর্ট\\s*নাম্বার|passport\\s*number)"
         ),
-        "ব্যক্তিগত ঠিকানা / লোকেশন / নাম্বার" to Regex(
-            "(?i)(বাসার\\s*ঠিকানা|ঠিকানা\\s*দাও|এখন\\s*কোথায়|এখন\\s*কোথায়|কোথায়\\s*আছ|কোথায়\\s*আছ|লোকেশন\\s*দাও|ফোন\\s*নাম্বার|নাম্বারটা\\s*দাও|home\\s*address|exact\\s*address|live\\s*location|where\\s*are\\s*you\\s*right\\s*now|phone\\s*number|personal\\s*number)"
+        "আর্থিক লেনদেন / টাকা পাঠানো" to Regex(
+            "(?i)((টাকা|তাকা)\\s*(দাও|দেন|পাঠাও|পাঠান|ধার|লাগবে|দরকার)|(বিকাশ|নগদ|রকেট|উপায়|উপায়)\\s*(কর|করে|দাও|দেন|পাঠা|নাম্বার)|ব্যাংক\\s*একাউন্ট\\s*নাম্বার|ব্যাংক\\s*অ্যাকাউন্ট\\s*নাম্বার|কার্ড\\s*নাম্বার|send\\s*(me\\s*)?money|lend\\s*me|transfer\\s*money|bank\\s*account\\s*number|credit\\s*card\\s*number|debit\\s*card\\s*number|bkash\\s*(me|kor|koro|number)|nagad\\s*(me|kor|koro|number))"
         ),
-        "ব্যক্তিগত সিদ্ধান্ত / কমিটমেন্ট / জরুরি বিষয়" to Regex(
-            "(?i)(দেখা\\s*করবে|দেখা\\s*করব|আসবে\\s*কখন|কয়টায়\\s*আসবে|কয়টায়\\s*আসবে|কনফার্ম\\s*কর|কথা\\s*দাও|বিয়ে|বিয়ে|ডিভোর্স|গোপন\\s*কথা|ব্যক্তিগত|হাসপাতাল|অসুস্থ|জরুরি\\s*দরকার|emergency|hospital|promise|confirm\\s*meeting|private\\s*matter|confidential|secret|agreement|contract|deal)"
+        "ব্যক্তিগত ঠিকানা / লাইভ লোকেশন" to Regex(
+            "(?i)(বাসার\\s*ঠিকানা|ঠিকানা\\s*দাও|ঠিকানাটা\\s*দাও|এখন\\s*কোথায়\\s*আছ|এখন\\s*কোথায়\\s*আছ|লাইভ\\s*লোকেশন|লোকেশন\\s*দাও|home\\s*address|exact\\s*address|live\\s*location|where\\s*are\\s*you\\s*right\\s*now)"
         )
+    )
+
+    // Requests AI should ALWAYS fulfill itself (poems, stories, images, jokes, explanations, etc.)
+    private val CREATIVE_OR_AI_SOLVABLE_REGEX = Regex(
+        "(?iu)(কবিতা|গল্প|ছড়া|ছড়া|গান|জোক|কৌতুক|রচনা|অনুবাদ|ছবি\\s*(তৈরি|বানা|আঁক|আক)|পোস্টার|আর্ট|ডিজাইন|poem|poetry|story|joke|essay|translate|translation|generate\\s*(an?\\s*)?image|create\\s*(an?\\s*)?image|draw\\s*(a|an|me)|write\\s*(a|an|me)\\s*(poem|story|song|letter|caption|code))"
     )
 
     /**
@@ -213,19 +216,32 @@ object SensitiveMessageGuard {
         return false
     }
 
+    fun isCreativeOrAiSolvableRequest(messageText: String): Boolean {
+        val clean = messageText.trim()
+        if (clean.isBlank()) return false
+        return CREATIVE_OR_AI_SOLVABLE_REGEX.containsMatchIn(clean)
+    }
+
     /**
      * Local fast sensitive-question detector (Layer 1 before Gemini JSON classifier).
+     * Never flags creative / AI-solvable tasks like poems, stories, jokes, or image prompts.
      */
-    fun assessSensitivityLocally(messageText: String): SensitiveAssessment {
+    fun assessSensitivityLocally(
+        messageText: String,
+        ownerName: String = ""
+    ): SensitiveAssessment {
         val clean = messageText.trim()
         if (clean.isBlank()) return SensitiveAssessment(isSensitive = false)
+        if (isCreativeOrAiSolvableRequest(clean)) {
+            return SensitiveAssessment(isSensitive = false)
+        }
 
         for ((reason, regex) in SENSITIVE_PATTERNS) {
             if (regex.containsMatchIn(clean)) {
                 return SensitiveAssessment(
                     isSensitive = true,
                     reason = reason,
-                    deferralReply = defaultDeferralReply(clean),
+                    deferralReply = defaultDeferralReply(clean, ownerName),
                     questionForOwner = "উনি জিজ্ঞেস করেছেন: \"${clean.take(140)}\" — এর উত্তর কী পাঠাবো?"
                 )
             }
@@ -238,16 +254,20 @@ object SensitiveMessageGuard {
         val lower = text.lowercase()
         val banglishHints = listOf(
             "kemon", "kothay", "taka", "bhai", "vai", "ami", "tumi", "apni",
-            "ki kor", "kobe", "ekhon", "basha", "basa", "dhar", "lagbe", "bolo", "bolen", "accho", "acho"
+            "ki kor", "kobe", "ekhon", "basha", "basa", "dhar", "lagbe", "bolo", "bolen", "accho", "acho",
+            "kobita", "golpo", "chobi", "valobasha", "valo", "bhalo"
         )
         return banglishHints.any { lower.contains(it) }
     }
 
-    fun defaultDeferralReply(incomingText: String): String {
-        return if (isLikelyBengaliOrBanglish(incomingText)) {
-            "আমি জেনে বলছি।"
+    fun defaultDeferralReply(incomingText: String, ownerName: String = ""): String {
+        val cleanOwner = ownerName.trim()
+        return if (cleanOwner.isNotBlank()) {
+            ChatModerationEngine.buildOwnerAwayMessage(cleanOwner, incomingText)
+        } else if (isLikelyBengaliOrBanglish(incomingText)) {
+            "উত্তরের জন্য অপেক্ষা করুন, অ্যাকাউন্টের মালিক আসলেই উত্তর দেবেন।"
         } else {
-            "Let me check and get back to you."
+            "Please wait for a reply, the owner will respond as soon as they are back."
         }
     }
 

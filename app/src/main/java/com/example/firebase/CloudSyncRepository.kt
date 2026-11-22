@@ -43,37 +43,43 @@ class CloudSyncRepository(context: Context) {
         Firebase.auth.currentUser?.uid
             ?: throw IllegalStateException("User must be signed in to access cloud storage")
 
-    private fun deviceDocPath(uid: String): String =
-        "users/$uid/devices/${deviceProfile.deviceId}"
+    private fun accountConfigPath(uid: String): String =
+        "users/$uid/account/config"
 
-    private fun deviceDocRef(uid: String) =
+    private fun accountConfigRef(uid: String) =
         db.collection("users")
             .document(uid)
-            .collection("devices")
-            .document(deviceProfile.deviceId)
+            .collection("account")
+            .document("config")
 
     private fun personalDataColRef(uid: String) =
-        deviceDocRef(uid).collection("personalData")
+        db.collection("users")
+            .document(uid)
+            .collection("personalData")
 
     private fun routinesColRef(uid: String) =
-        deviceDocRef(uid).collection("routines")
+        db.collection("users")
+            .document(uid)
+            .collection("routines")
 
     private fun askAiColRef(uid: String) =
-        deviceDocRef(uid).collection("askAiMessages")
+        db.collection("users")
+            .document(uid)
+            .collection("askAiMessages")
 
     /**
-     * Real-time listener for THIS device's isolated config (API keys, deleted models, settings).
-     * Never reads or overwrites any other device's branch!
+     * Real-time listener for THIS account's cloud config (owner name, API keys, selected models,
+     * deleted models, settings). Restores automatically on ANY new phone signed into this account!
      */
-    fun observeDeviceConfig(): Flow<PilotSettings?> {
+    fun observeAccountConfig(): Flow<PilotSettings?> {
         val uid = requireUserId()
-        val path = deviceDocPath(uid)
-        return deviceDocRef(uid)
+        val path = accountConfigPath(uid)
+        return accountConfigRef(uid)
             .snapshots()
             .map { snapshot ->
                 if (!snapshot.exists()) return@map null
                 val doc = snapshot.toObject(
-                    DeviceCloudConfigDoc::class.java,
+                    AccountCloudConfigDoc::class.java,
                     DocumentSnapshot.ServerTimestampBehavior.ESTIMATE
                 ) ?: return@map null
                 doc.toPilotSettings()
@@ -94,14 +100,15 @@ class CloudSyncRepository(context: Context) {
     }
 
     /**
-     * Saves this device's complete settings, API key pool, and deletedModels list to Firestore.
-     * Uses full set() on initial creation and update() thereafter to preserve immutable createdAt & deviceId.
+     * Saves this account's complete settings, API key pool, selected models, deletedModels,
+     * and ownerDisplayName to Firestore so logging into a new phone restores everything automatically.
      */
-    suspend fun saveDeviceConfig(settings: PilotSettings): Result<Unit> {
+    suspend fun saveAccountConfig(settings: PilotSettings): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
-        val path = deviceDocPath(uid)
+        val path = accountConfigPath(uid)
         return try {
-            val docRef = deviceDocRef(uid)
+            val currentUser = Firebase.auth.currentUser
+            val docRef = accountConfigRef(uid)
             val exists = docRef.get().await().exists()
             val serializedKeys = PilotPreferences.serializeApiKeysJson(settings.apiKeys).take(31500)
             val cleanDeletedModels = settings.deletedModels
@@ -110,10 +117,15 @@ class CloudSyncRepository(context: Context) {
                 .distinct()
                 .take(100)
             val enabledAppsList = settings.enabledMessagingApps.map { it.name }.sorted().take(10)
+            val resolvedOwnerName = settings.ownerDisplayName.trim()
+                .ifBlank { currentUser?.displayName?.trim().orEmpty() }
+                .take(80)
+            val resolvedEmail = currentUser?.email?.trim().orEmpty().take(160)
 
             val mutableFields = hashMapOf<String, Any>(
-                "deviceModel" to deviceProfile.model,
-                "deviceManufacturer" to deviceProfile.manufacturer,
+                "ownerDisplayName" to resolvedOwnerName,
+                "ownerEmail" to resolvedEmail,
+                "lastDeviceModel" to deviceProfile.displayLabel.ifBlank { "Android" }.take(120),
                 "apiKeysJson" to serializedKeys,
                 "activeApiKeyId" to settings.activeApiKeyId.orEmpty().take(80),
                 "autoRotateApiKeys" to settings.autoRotateApiKeys,
@@ -144,7 +156,6 @@ class CloudSyncRepository(context: Context) {
                 docRef.update(mutableFields).await()
             } else {
                 val createFields = HashMap(mutableFields)
-                createFields["deviceId"] = deviceProfile.deviceId
                 createFields["createdAt"] = FieldValue.serverTimestamp()
                 docRef.set(createFields).await()
             }
@@ -157,11 +168,11 @@ class CloudSyncRepository(context: Context) {
         }
     }
 
-    // --- Personal Data ('আমার ডাটা') ---
+    // --- Account-Level Personal Data ('আমার ডাটা') ---
 
     fun observePersonalData(): Flow<List<PersonalDataItem>> {
         val uid = requireUserId()
-        val path = "${deviceDocPath(uid)}/personalData"
+        val path = "users/$uid/personalData"
         return personalDataColRef(uid)
             .orderBy("createdAt", Query.Direction.DESCENDING)
             .snapshots()
@@ -201,7 +212,7 @@ class CloudSyncRepository(context: Context) {
     suspend fun upsertPersonalData(item: PersonalDataItem): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
         val safeId = sanitizeDocId(item.id, "pd")
-        val path = "${deviceDocPath(uid)}/personalData/$safeId"
+        val path = "users/$uid/personalData/$safeId"
         return try {
             val docRef = personalDataColRef(uid).document(safeId)
             val exists = docRef.get().await().exists()
@@ -242,7 +253,7 @@ class CloudSyncRepository(context: Context) {
     suspend fun deletePersonalData(entryId: String): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
         val safeId = sanitizeDocId(entryId, "pd")
-        val path = "${deviceDocPath(uid)}/personalData/$safeId"
+        val path = "users/$uid/personalData/$safeId"
         return try {
             personalDataColRef(uid).document(safeId).delete().await()
             Result.success(Unit)
@@ -254,11 +265,11 @@ class CloudSyncRepository(context: Context) {
         }
     }
 
-    // --- Custom Routines ---
+    // --- Account-Level Custom Routines ---
 
     fun observeCustomRoutines(): Flow<List<PilotRoutine>> {
         val uid = requireUserId()
-        val path = "${deviceDocPath(uid)}/routines"
+        val path = "users/$uid/routines"
         return routinesColRef(uid)
             .orderBy("createdAt", Query.Direction.DESCENDING)
             .snapshots()
@@ -298,7 +309,7 @@ class CloudSyncRepository(context: Context) {
     suspend fun saveCustomRoutine(routine: PilotRoutine): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
         val safeId = sanitizeDocId(routine.id, "routine")
-        val path = "${deviceDocPath(uid)}/routines/$safeId"
+        val path = "users/$uid/routines/$safeId"
         return try {
             val docRef = routinesColRef(uid).document(safeId)
             val exists = docRef.get().await().exists()
@@ -326,7 +337,7 @@ class CloudSyncRepository(context: Context) {
     suspend fun deleteCustomRoutine(routineId: String): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
         val safeId = sanitizeDocId(routineId, "routine")
-        val path = "${deviceDocPath(uid)}/routines/$safeId"
+        val path = "users/$uid/routines/$safeId"
         return try {
             routinesColRef(uid).document(safeId).delete().await()
             Result.success(Unit)
@@ -338,11 +349,11 @@ class CloudSyncRepository(context: Context) {
         }
     }
 
-    // --- Ask AI Chat History ---
+    // --- Account-Level Ask AI Chat History ---
 
     fun observeAskAiMessages(): Flow<List<AskAiMessage>> {
         val uid = requireUserId()
-        val path = "${deviceDocPath(uid)}/askAiMessages"
+        val path = "users/$uid/askAiMessages"
         return askAiColRef(uid)
             .orderBy("clientId", Query.Direction.ASCENDING)
             .limitToLast(40)
@@ -381,7 +392,7 @@ class CloudSyncRepository(context: Context) {
     suspend fun saveAskAiMessage(message: AskAiMessage): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
         val safeId = "msg_${message.id}"
-        val path = "${deviceDocPath(uid)}/askAiMessages/$safeId"
+        val path = "users/$uid/askAiMessages/$safeId"
         return try {
             val docRef = askAiColRef(uid).document(safeId)
             val exists = docRef.get().await().exists()
@@ -422,7 +433,7 @@ class CloudSyncRepository(context: Context) {
 
     suspend fun clearAskAiMessages(): Result<Unit> {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
-        val path = "${deviceDocPath(uid)}/askAiMessages"
+        val path = "users/$uid/askAiMessages"
         return try {
             val snap = askAiColRef(uid).get().await()
             val batch = db.batch()
@@ -437,7 +448,7 @@ class CloudSyncRepository(context: Context) {
         }
     }
 
-    private fun DeviceCloudConfigDoc.toPilotSettings(): PilotSettings {
+    private fun AccountCloudConfigDoc.toPilotSettings(): PilotSettings {
         val parsedKeys = PilotPreferences.parseApiKeysJson(apiKeysJson)
         val resolvedActiveId = activeApiKeyId.takeIf { id -> id.isNotBlank() && parsedKeys.any { it.id == id } }
             ?: parsedKeys.firstOrNull { it.enabled }?.id
@@ -451,6 +462,7 @@ class CloudSyncRepository(context: Context) {
         }.toSet().ifEmpty { MessagingApp.entries.toSet() }
 
         return PilotSettings(
+            ownerDisplayName = ownerDisplayName.trim(),
             apiKey = mirrorKey,
             apiKeys = parsedKeys,
             activeApiKeyId = resolvedActiveId,

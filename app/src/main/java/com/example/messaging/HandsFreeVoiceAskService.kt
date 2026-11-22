@@ -70,13 +70,14 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
     private var currentAppName: String = ""
     private var currentPackageName: String = ""
     private var currentMessageText: String = ""
-    private var listenAttempts: Int = 0
+    private var currentOwnerName: String = ""
+    private var awayNoticeAlreadySent: Boolean = false
     private var isStopped: Boolean = false
 
     private val safetyTimeoutRunnable = Runnable {
         if (!isStopped) {
-            PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Hands-free escalation timed out; stopping cleanly.")
-            stopSelfSafely()
+            PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner did not respond in time; sending named away notice once.")
+            sendOwnerAwayNoticeAndStop()
         }
     }
 
@@ -94,6 +95,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
         val appName = intent?.getStringExtra(EXTRA_APP_NAME).orEmpty()
         val pkgName = intent?.getStringExtra(EXTRA_PACKAGE_NAME).orEmpty()
         val messageText = intent?.getStringExtra(EXTRA_MESSAGE_TEXT).orEmpty()
+        val ownerName = intent?.getStringExtra(EXTRA_OWNER_NAME).orEmpty()
 
         if (recordId.isBlank() || sender.isBlank() || messageText.isBlank()) {
             stopSelf()
@@ -106,16 +108,22 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
         currentAppName = appName
         currentPackageName = pkgName
         currentMessageText = messageText
-        listenAttempts = 0
+        currentOwnerName = ownerName.ifBlank {
+            ChatModerationEngine.resolveOwnerDisplayName(
+                PilotStateHub.settings.value,
+                PilotStateHub.personalData.value
+            )
+        }
+        awayNoticeAlreadySent = false
 
         startAsForeground("🔊 $sender ($appName)-এর মেসেজ পড়ে শোনানো হচ্ছে...")
         acquireWakeLockAndAudio()
 
-        // Hard safety cutoff (70s) so wake lock & mic can never stay stuck
+        // Single clean safety cutoff (38s) — asks ONCE, never nags repeatedly
         mainHandler.removeCallbacks(safetyTimeoutRunnable)
-        mainHandler.postDelayed(safetyTimeoutRunnable, 70_000L)
+        mainHandler.postDelayed(safetyTimeoutRunnable, 38_000L)
 
-        // Initialize TTS to read the message loudly
+        // Initialize TTS to read the message loudly ONCE
         shutdownTts()
         tts = TextToSpeech(applicationContext, this)
         return START_NOT_STICKY
@@ -201,17 +209,13 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
     private fun startDistantVoiceListening() {
         if (isStopped) return
         if (!hasMicPermission() || !SpeechRecognizer.isRecognitionAvailable(applicationContext)) {
-            PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Mic permission or SpeechRecognizer unavailable.")
-            speakAloud(
-                "ভয়েস রিকগনিশন চালু করা যায়নি। নোটিফিকেশন থেকে উত্তর দিন।",
-                UTTERANCE_FINAL_DONE
-            )
+            PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Mic unavailable; sending named owner-away waiting message.")
+            sendOwnerAwayNoticeAndStop()
             return
         }
 
-        listenAttempts++
-        updateForegroundNotification("🎤 আপনার উত্তর শুনছি... ($currentSenderName-কে পাঠানোর জন্য বলুন)")
-        PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Listening for distant voice reply (attempt #$listenAttempts)...")
+        updateForegroundNotification("🎤 একবার শুনছি... ($currentSenderName-কে উত্তর দিতে বলুন)")
+        PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Listening ONCE for owner voice reply...")
 
         destroyRecognizer()
         val recognizer = SpeechRecognizer.createSpeechRecognizer(applicationContext)
@@ -219,7 +223,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
 
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
-                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Mic open — listening from distance...")
+                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Mic open — listening once for owner...")
             }
 
             override fun onBeginningOfSpeech() {}
@@ -229,16 +233,10 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
 
             override fun onError(error: Int) {
                 if (isStopped) return
-                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "SpeechRecognizer error code=$error (attempt $listenAttempts)")
+                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner away / no speech (code=$error); sending waiting notice once.")
                 destroyRecognizer()
-                if (listenAttempts < 2 && (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
-                    speakAloud("শুনতে পাইনি, আবার বলুন কী উত্তর পাঠাবো?", UTTERANCE_RETRY_PROMPT)
-                } else {
-                    speakAloud(
-                        "কোনো উত্তর শোনা যায়নি। আপনি পরে নোটিফিকেশন থেকেও উত্তর পাঠাতে পারবেন।",
-                        UTTERANCE_FINAL_DONE
-                    )
-                }
+                // Do NOT nag or retry repeatedly — owner is away, send named waiting reply and finish!
+                sendOwnerAwayNoticeAndStop()
             }
 
             override fun onResults(results: Bundle?) {
@@ -248,11 +246,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                 destroyRecognizer()
 
                 if (spoken.isBlank()) {
-                    if (listenAttempts < 2) {
-                        speakAloud("শুনতে পাইনি, আবার বলুন কী উত্তর পাঠাবো?", UTTERANCE_RETRY_PROMPT)
-                    } else {
-                        speakAloud("উত্তর পাওয়া যায়নি, নোটিফিকেশনে সেভ রাখা হয়েছে।", UTTERANCE_FINAL_DONE)
-                    }
+                    sendOwnerAwayNoticeAndStop()
                     return
                 }
 
@@ -269,16 +263,81 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "bn-BD")
             putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, false)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3200L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2600L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3500L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 2200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
         }
 
         runCatching {
             recognizer.startListening(listenIntent)
         }.onFailure { err ->
             PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Failed to start SpeechRecognizer: ${err.message}")
-            speakAloud("মাইক্রোফোন চালু করতে সমস্যা হয়েছে।", UTTERANCE_FINAL_DONE)
+            sendOwnerAwayNoticeAndStop()
+        }
+    }
+
+    /**
+     * When the owner is away from the phone (didn't answer on the single prompt),
+     * sends ONE polite waiting reply with the owner's account name and stops cleanly without nagging.
+     */
+    private fun sendOwnerAwayNoticeAndStop() {
+        if (awayNoticeAlreadySent || isStopped) {
+            stopSelfSafely()
+            return
+        }
+        awayNoticeAlreadySent = true
+        destroyRecognizer()
+
+        val awayReply = ChatModerationEngine.buildOwnerAwayMessage(currentOwnerName, currentMessageText)
+        val convKey = IncomingMessageListener.conversationKey(currentPackageName, currentSenderName)
+        if (!ChatModerationEngine.shouldSendAwayNotice(convKey)) {
+            PilotStateHub.log(LogLevel.SAFETY, "VoiceAsk", "Away notice already sent recently for $currentSenderName; stopping quietly.")
+            stopSelfSafely()
+            return
+        }
+
+        serviceScope.launch {
+            var delivered = false
+            val handle = PilotStateHub.getNotificationHandleById(currentRecordId)
+                ?: PilotStateHub.findNotificationHandle(currentSenderName)
+            val directAction = handle?.replyAction
+
+            if (directAction != null) {
+                delivered = IncomingMessageListener.sendDirectReply(
+                    context = applicationContext,
+                    action = directAction,
+                    replyText = awayReply,
+                    packageName = currentPackageName,
+                    senderName = currentSenderName
+                )
+            }
+
+            if (!delivered) {
+                val svc = PilotAccessibilityService.instance
+                if (svc != null) {
+                    IncomingMessageListener.registerSentReply(currentPackageName, currentSenderName, awayReply)
+                    svc.openNotificationChat(currentSenderName)
+                    delay(900L)
+                    val visualRes = svc.typeText(
+                        index = -1,
+                        x = 0,
+                        y = 0,
+                        text = awayReply,
+                        pressSend = true
+                    )
+                    delivered = visualRes.optString("status") == "ok"
+                }
+            }
+
+            if (delivered) {
+                PilotStateHub.markMessageAutoReplied(currentRecordId, awayReply)
+                PilotStateHub.log(
+                    LogLevel.SAFETY,
+                    "VoiceAsk",
+                    "Owner away — auto-sent named waiting reply to $currentSenderName: \"$awayReply\""
+                )
+            }
+            mainHandler.post { stopSelfSafely() }
         }
     }
 
@@ -335,6 +394,9 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             }
 
             if (delivered) {
+                ChatModerationEngine.markOwnerRespondedForSender(
+                    IncomingMessageListener.conversationKey(currentPackageName, currentSenderName)
+                )
                 PilotStateHub.markSensitiveMessageResolved(currentRecordId, cleanedReply)
                 // Dismiss the pending sensitive owner notification too
                 val notifId = (currentRecordId.hashCode() and 0x0FFFFFFF) + 4100
@@ -550,6 +612,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
         private const val EXTRA_APP_NAME = "extra_app_name"
         private const val EXTRA_PACKAGE_NAME = "extra_package_name"
         private const val EXTRA_MESSAGE_TEXT = "extra_message_text"
+        private const val EXTRA_OWNER_NAME = "extra_owner_name"
 
         private const val UTTERANCE_READ_MESSAGE = "utt_read_message"
         private const val UTTERANCE_RETRY_PROMPT = "utt_retry_prompt"
@@ -561,7 +624,8 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             senderName: String,
             appName: String,
             packageName: String,
-            messageText: String
+            messageText: String,
+            ownerName: String = ""
         ) {
             val intent = Intent(context, HandsFreeVoiceAskService::class.java).apply {
                 putExtra(EXTRA_RECORD_ID, recordId)
@@ -569,6 +633,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                 putExtra(EXTRA_APP_NAME, appName)
                 putExtra(EXTRA_PACKAGE_NAME, packageName)
                 putExtra(EXTRA_MESSAGE_TEXT, messageText)
+                putExtra(EXTRA_OWNER_NAME, ownerName)
             }
             runCatching {
                 ContextCompat.startForegroundService(context, intent)

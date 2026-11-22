@@ -214,21 +214,65 @@ class IncomingMessageListener : NotificationListenerService() {
         replyAction: Notification.Action?
     ) {
         val settings = PilotStateHub.settings.value
+        val personalData = PilotStateHub.personalData.value
+        val ownerName = ChatModerationEngine.resolveOwnerDisplayName(settings, personalData)
+
+        // Step 1: Fast Local Moderation (Abuse 3-strike guard + Spam/Abul-Tabul guard).
+        // Polite/normal messages from any sender ALWAYS proceed to AI normally!
+        val localMod = ChatModerationEngine.evaluateIncomingLocally(convKey, combinedIncomingText)
+        when (localMod.action) {
+            ModerationAction.SILENT_IGNORE_ABUSE,
+            ModerationAction.SILENT_IGNORE_SPAM -> {
+                PilotStateHub.log(
+                    LogLevel.SAFETY,
+                    "Moderation",
+                    "Ignored message from ${record.senderName}: ${localMod.reason}"
+                )
+                return
+            }
+            ModerationAction.WARN_ABUSE,
+            ModerationAction.AVOID_SPAM_ONCE -> {
+                val warnReply = localMod.replyText
+                if (warnReply.isNotBlank()) {
+                    registerSentReply(record.packageName, record.senderName, warnReply)
+                    lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                    val delivered = deliverReply(
+                        settingsDelivery = settings.autoReplyDelivery,
+                        record = record,
+                        replyAction = replyAction,
+                        replyText = warnReply
+                    )
+                    if (delivered) {
+                        appendConversationHistory(convKey, "Me: $warnReply")
+                        PilotStateHub.markMessageAutoReplied(record.id, warnReply)
+                        PilotStateHub.log(
+                            LogLevel.SAFETY,
+                            "Moderation",
+                            "${localMod.reason} -> Sent to ${record.senderName}: \"$warnReply\""
+                        )
+                    }
+                }
+                return
+            }
+            ModerationAction.PROCEED_TO_AI -> Unit
+        }
+
         if (!settings.hasAnyApiKey) {
             PilotStateHub.log(LogLevel.ERROR, "AutoReply", "Skipped auto-reply: API key not set.")
             return
         }
 
-        val shareablePersonalData = PilotStateHub.personalData.value.filter {
+        val shareablePersonalData = personalData.filter {
             it.shareInAutoReply && it.title.isNotBlank() && it.content.isNotBlank()
         }
 
-        // Layer 1: Fast local sensitive question check.
-        // Ultra-critical security secrets (OTP/PIN/password/NID) are ALWAYS deferred locally.
-        // Other topics (e.g. address/profession/schedule) can defer to Layer 2 Gemini if the user
-        // explicitly saved facts in "আমার ডাটা", so AI can answer from saved personal data!
+        // Step 2: Tight local hard-secret check (OTP/PIN/Password/Direct Money Transfer).
+        // Creative/AI-solvable requests (poems, image creation, stories, general chat) are NEVER flagged here!
         val localSensitive = if (settings.sensitiveQuestionGuardEnabled) {
-            val assessment = SensitiveMessageGuard.assessSensitivityLocally(combinedIncomingText)
+            val assessment = SensitiveMessageGuard.assessSensitivityLocally(
+                messageText = combinedIncomingText,
+                ownerName = ownerName
+            )
             val isHardSecret = assessment.reason?.contains("পাসওয়ার্ড") == true
             if (assessment.isSensitive && (isHardSecret || shareablePersonalData.isEmpty())) {
                 assessment
@@ -245,7 +289,7 @@ class IncomingMessageListener : NotificationListenerService() {
         var finalReplyText = localSensitive.deferralReply
 
         if (!isSensitive) {
-            // Layer 2: Context-aware Gemini Smart Auto-Reply + Personal Data ("আমার ডাটা") + AI Sensitive Detector
+            // Step 3: Context-aware Gemini Smart Auto-Reply + AI Classifier (NORMAL / ABUSIVE / SPAM_NONSENSE / SENSITIVE_OWNER_ONLY)
             val screenContext = if (settings.autoReplyDelivery == AutoReplyDelivery.VISUAL_ACCESSIBILITY || replyAction == null) {
                 val accessibility = PilotAccessibilityService.instance
                 if (accessibility != null) {
@@ -270,11 +314,42 @@ class IncomingMessageListener : NotificationListenerService() {
                 conversationHistory = historySnapshot,
                 screenContext = screenContext,
                 sensitiveGuardEnabled = settings.sensitiveQuestionGuardEnabled,
-                personalDataFacts = shareablePersonalData
+                personalDataFacts = shareablePersonalData,
+                ownerDisplayName = ownerName
             )
 
             val smart = aiResult.getOrElse { err ->
                 PilotStateHub.log(LogLevel.ERROR, "AutoReply", "AI reply generation failed: ${err.message}")
+                return
+            }
+
+            // Handle AI-detected subtle abuse (বকাবাজি) with the exact 3-strike policy!
+            if (smart.messageType == "ABUSIVE") {
+                val decision = ChatModerationEngine.recordAbuseAndDecide(convKey, combinedIncomingText)
+                if (decision.action == ModerationAction.WARN_ABUSE && decision.replyText.isNotBlank()) {
+                    registerSentReply(record.packageName, record.senderName, decision.replyText)
+                    lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                    if (deliverReply(settings.autoReplyDelivery, record, replyAction, decision.replyText)) {
+                        appendConversationHistory(convKey, "Me: ${decision.replyText}")
+                        PilotStateHub.markMessageAutoReplied(record.id, decision.replyText)
+                    }
+                }
+                PilotStateHub.log(LogLevel.SAFETY, "Moderation", "AI detected abuse from ${record.senderName}: ${decision.reason}")
+                return
+            }
+
+            // Handle AI-detected spam / abul-tabul with 3-5 strike silence policy!
+            if (smart.messageType == "SPAM_NONSENSE") {
+                val decision = ChatModerationEngine.recordSpamAndDecide(convKey, combinedIncomingText)
+                if (decision.action == ModerationAction.AVOID_SPAM_ONCE && decision.replyText.isNotBlank()) {
+                    registerSentReply(record.packageName, record.senderName, decision.replyText)
+                    lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                    if (deliverReply(settings.autoReplyDelivery, record, replyAction, decision.replyText)) {
+                        appendConversationHistory(convKey, "Me: ${decision.replyText}")
+                        PilotStateHub.markMessageAutoReplied(record.id, decision.replyText)
+                    }
+                }
+                PilotStateHub.log(LogLevel.SAFETY, "Moderation", "AI detected spam/nonsense from ${record.senderName}: ${decision.reason}")
                 return
             }
 
@@ -284,9 +359,91 @@ class IncomingMessageListener : NotificationListenerService() {
             finalReplyText = smart.replyText
         }
 
-        if (finalReplyText.isBlank()) return
+        // Step 4: Truly Owner-Only Sensitive Message -> Smart Non-Nagging Escalation
+        if (isSensitive) {
+            val resolvedQuestion = ownerQuestion.ifBlank {
+                "${record.senderName} (${record.app.displayName}) জিজ্ঞেস করেছে: \"${combinedIncomingText.take(140)}\" — এর উত্তর কী পাঠাবো?"
+            }
+            val namedAwayReply = ChatModerationEngine.buildOwnerAwayMessage(ownerName, combinedIncomingText)
 
-        // Register sent reply BEFORE dispatching RemoteInput so instant WhatsApp notification echo is 100% blocked!
+            // Anti-nag check: if we ALREADY asked the owner for this sender recently and owner is away,
+            // do NOT nag again! Just record quietly and send at most 1 away notice if not yet sent.
+            val allowedToEscalate = ChatModerationEngine.canEscalateToOwner(convKey)
+            if (!allowedToEscalate) {
+                PilotStateHub.markMessageSensitiveEscalated(
+                    recordId = record.id,
+                    deferralReply = namedAwayReply,
+                    reason = sensitivityReason,
+                    ownerQuestion = resolvedQuestion
+                )
+                PilotStateHub.log(
+                    LogLevel.SAFETY,
+                    "SensitiveGuard",
+                    "Owner already notified recently for ${record.senderName}; skipped repeated voice ask."
+                )
+                return
+            }
+
+            val controller = PilotStateHub.activeController
+            val canUseVoiceAsk = controller == null && settings.handsFreeVoiceEscalationEnabled
+
+            if (canUseVoiceAsk) {
+                // Ask owner ONCE aloud; if owner answers -> sends owner's answer directly.
+                // If owner is NOT near the phone -> HandsFreeVoiceAskService automatically sends namedAwayReply!
+                PilotStateHub.markMessageSensitiveEscalated(
+                    recordId = record.id,
+                    deferralReply = namedAwayReply,
+                    reason = sensitivityReason,
+                    ownerQuestion = resolvedQuestion
+                )
+                HandsFreeVoiceAskService.startEscalation(
+                    context = applicationContext,
+                    recordId = record.id,
+                    senderName = record.senderName,
+                    appName = record.app.displayName,
+                    packageName = record.packageName,
+                    messageText = combinedIncomingText,
+                    ownerName = ownerName
+                )
+            } else {
+                // Immediately send the named away waiting message once
+                if (ChatModerationEngine.shouldSendAwayNotice(convKey)) {
+                    registerSentReply(record.packageName, record.senderName, namedAwayReply)
+                    lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                    if (deliverReply(settings.autoReplyDelivery, record, replyAction, namedAwayReply)) {
+                        appendConversationHistory(convKey, "Me: $namedAwayReply")
+                    }
+                }
+                PilotStateHub.markMessageSensitiveEscalated(
+                    recordId = record.id,
+                    deferralReply = namedAwayReply,
+                    reason = sensitivityReason,
+                    ownerQuestion = resolvedQuestion
+                )
+                if (controller != null) {
+                    val voiceEscalation = buildString {
+                        append("[SENSITIVE MESSAGE ESCALATION: On ${record.app.displayName}, ${record.senderName} asked: \"${combinedIncomingText.take(180)}\"")
+                        if (!sensitivityReason.isNullOrBlank()) append(" ($sensitivityReason)")
+                        append(". I replied \"$namedAwayReply\" once. Ask the user briefly in Bengali if they want to send a reply via answer_sensitive_message(sender_or_app=\"${record.senderName}\", owner_answer=\"...\").]")
+                    }
+                    controller.pushIncomingMessageAlert(voiceEscalation)
+                }
+            }
+
+            // Quietly post 1 actionable notification so when owner returns to phone they can reply anytime
+            val updatedRecord = PilotStateHub.incomingMessages.value.firstOrNull { it.id == record.id }
+                ?: record.copy(autoRepliedText = namedAwayReply, isSensitive = true, needsOwnerAnswer = true)
+            SensitiveMessageGuard.postSensitiveOwnerAlertNotification(
+                context = applicationContext,
+                record = updatedRecord,
+                ownerQuestion = resolvedQuestion,
+                sensitivityReason = sensitivityReason
+            )
+            return
+        }
+
+        // Step 5: Normal / Creative / Personal-Data Reply -> Send ONCE cleanly!
+        if (finalReplyText.isBlank()) return
         registerSentReply(record.packageName, record.senderName, finalReplyText)
         lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
 
@@ -303,63 +460,12 @@ class IncomingMessageListener : NotificationListenerService() {
         }
 
         appendConversationHistory(convKey, "Me: $finalReplyText")
-
-        if (isSensitive) {
-            val resolvedQuestion = ownerQuestion.ifBlank {
-                "${record.senderName} (${record.app.displayName}) জিজ্ঞেস করেছে: \"${combinedIncomingText.take(140)}\" — এর উত্তর কী পাঠাবো?"
-            }
-            PilotStateHub.markMessageSensitiveEscalated(
-                recordId = record.id,
-                deferralReply = finalReplyText,
-                reason = sensitivityReason,
-                ownerQuestion = resolvedQuestion
-            )
-            PilotStateHub.log(
-                LogLevel.SAFETY,
-                "SensitiveGuard",
-                "Deferred sensitive message from ${record.senderName} (${sensitivityReason ?: "Sensitive"}) with \"$finalReplyText\" and escalated to owner."
-            )
-
-            // Automatic Escalation 1: Ask the owner over active Live Voice Call (if running)
-            // OR launch Screen-Off Loud Speaker Voice Ask + Distant Mic Listener!
-            val controller = PilotStateHub.activeController
-            if (controller != null) {
-                val voiceEscalation = buildString {
-                    append("[URGENT SENSITIVE MESSAGE ESCALATION: On ${record.app.displayName}, ${record.senderName} asked a sensitive question: \"${combinedIncomingText.take(180)}\"")
-                    if (!sensitivityReason.isNullOrBlank()) append(" (Category: $sensitivityReason)")
-                    append(". I did NOT answer it; I already replied \"$finalReplyText\" automatically. ")
-                    append("Immediately ask the user clearly in Bengali what answer they want to send back to ${record.senderName}. ")
-                    append("When the user gives you the answer, call answer_sensitive_message(sender_or_app=\"${record.senderName}\", owner_answer=\"...\") to forward it automatically!]")
-                }
-                controller.pushIncomingMessageAlert(voiceEscalation)
-            } else if (settings.handsFreeVoiceEscalationEnabled) {
-                HandsFreeVoiceAskService.startEscalation(
-                    context = applicationContext,
-                    recordId = record.id,
-                    senderName = record.senderName,
-                    appName = record.app.displayName,
-                    packageName = record.packageName,
-                    messageText = combinedIncomingText
-                )
-            }
-
-            // Automatic Escalation 2: ALWAYS post a high-priority owner notification with Direct Inline Reply
-            val updatedRecord = PilotStateHub.incomingMessages.value.firstOrNull { it.id == record.id }
-                ?: record.copy(autoRepliedText = finalReplyText, isSensitive = true, needsOwnerAnswer = true)
-            SensitiveMessageGuard.postSensitiveOwnerAlertNotification(
-                context = applicationContext,
-                record = updatedRecord,
-                ownerQuestion = resolvedQuestion,
-                sensitivityReason = sensitivityReason
-            )
-        } else {
-            PilotStateHub.markMessageAutoReplied(record.id, finalReplyText)
-            PilotStateHub.log(
-                LogLevel.INFO,
-                "AutoReply",
-                "Replied cleanly once to ${record.senderName} (${record.app.displayName}): \"$finalReplyText\""
-            )
-        }
+        PilotStateHub.markMessageAutoReplied(record.id, finalReplyText)
+        PilotStateHub.log(
+            LogLevel.INFO,
+            "AutoReply",
+            "Replied cleanly once to ${record.senderName} (${record.app.displayName}): \"${finalReplyText.take(80)}\""
+        )
     }
 
     private suspend fun deliverReply(

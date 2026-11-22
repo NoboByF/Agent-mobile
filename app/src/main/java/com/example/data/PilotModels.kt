@@ -302,6 +302,7 @@ data class LiveSessionState(
 )
 
 data class PilotSettings(
+    val ownerDisplayName: String = "",
     val apiKey: String = "",
     val apiKeys: List<GeminiApiKeyEntry> = emptyList(),
     val activeApiKeyId: String? = null,

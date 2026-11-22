@@ -9,8 +9,6 @@ const {
 const PROJECT_ID = 'demo-livepilot-rules-test';
 const ALICE_UID = 'alice_uid_001';
 const BOB_UID = 'bob_uid_002';
-const DEVICE_A = 'samsung_sm_s918b_a1b2c3d4';
-const DEVICE_B = 'xiaomi_redmi_note13_e5f6g7h8';
 
 let testEnv;
 
@@ -18,12 +16,12 @@ function nowTs() {
   return new Date(Date.now() - 1000);
 }
 
-function validDeviceConfig(deviceId = DEVICE_A) {
+function validAccountConfig() {
   const ts = nowTs();
   return {
-    deviceId,
-    deviceModel: 'SM-S918B',
-    deviceManufacturer: 'Samsung',
+    ownerDisplayName: 'Fahim',
+    ownerEmail: 'fahim@gmail.com',
+    lastDeviceModel: 'Samsung SM-S918B',
     apiKeysJson: '[{"id":"k1","label":"Key 1","key":"AIzaTest123","enabled":true}]',
     activeApiKeyId: 'k1',
     autoRotateApiKeys: true,
@@ -57,7 +55,7 @@ function validPersonalData() {
   return {
     title: 'আমার পেশা',
     content: 'আমি একজন সফটওয়্যার ইঞ্জিনিয়ার, ঢাকায় কাজ করি।',
-    category: 'কাজ/পেশা',
+    category: 'কাজ / পেশা',
     shareInAutoReply: true,
     createdAt: ts,
     updatedAt: ts,
@@ -90,7 +88,7 @@ function validAskAiMessage(clientId = 1) {
   };
 }
 
-describe('LivePilot Per-Device Isolated Firestore Rules', () => {
+describe('LivePilot Account-Level Cross-Device Firestore Rules', () => {
   before(async () => {
     testEnv = await initializeTestEnvironment({
       projectId: PROJECT_ID,
@@ -112,85 +110,76 @@ describe('LivePilot Per-Device Isolated Firestore Rules', () => {
 
   it('denies all unauthenticated reads and writes', async () => {
     const unauthDb = testEnv.unauthenticatedContext().firestore();
-    await assertFails(unauthDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}`).get());
-    await assertFails(unauthDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}`).set(validDeviceConfig()));
-    await assertFails(unauthDb.collection(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData`).get());
+    await assertFails(unauthDb.doc(`users/${ALICE_UID}/account/config`).get());
+    await assertFails(unauthDb.doc(`users/${ALICE_UID}/account/config`).set(validAccountConfig()));
+    await assertFails(unauthDb.collection(`users/${ALICE_UID}/personalData`).get());
   });
 
-  it('allows owner to create, read, list, update, and delete device config (API keys & deletedModels isolated per device)', async () => {
+  it('allows account owner to create, read, update, and delete account config synced across phones', async () => {
     const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
-    const deviceARef = aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}`);
-    const deviceBRef = aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_B}`);
+    const configRef = aliceDb.doc(`users/${ALICE_UID}/account/config`);
 
-    await assertSucceeds(deviceARef.set(validDeviceConfig(DEVICE_A)));
-    await assertSucceeds(deviceBRef.set(validDeviceConfig(DEVICE_B)));
-    await assertSucceeds(deviceARef.get());
-    await assertSucceeds(aliceDb.collection(`users/${ALICE_UID}/devices`).get());
+    await assertSucceeds(configRef.set(validAccountConfig()));
+    await assertSucceeds(configRef.get());
 
-    // Partial update of deletedModels, API keys, and handsFreeVoiceEscalationEnabled
+    // Partial update of ownerDisplayName, deletedModels, and API keys
     await assertSucceeds(
-      deviceARef.update({
+      configRef.update({
+        ownerDisplayName: 'ফাহিম মিয়া',
         deletedModels: ['gemini-1.5-pro', 'gemini-2.0-flash'],
-        handsFreeVoiceEscalationEnabled: false,
+        lastDeviceModel: 'Xiaomi Redmi Note 13',
         updatedAt: nowTs(),
       })
     );
 
-    // Reject immutable createdAt or deviceId tampering
+    // Reject arbitrary docId under /account/
     await assertFails(
-      deviceARef.update({
-        deviceId: DEVICE_B,
-        updatedAt: nowTs(),
-      })
+      aliceDb.doc(`users/${ALICE_UID}/account/other`).set(validAccountConfig())
     );
+    // Reject immutable createdAt tampering
     await assertFails(
-      deviceARef.update({
+      configRef.update({
         createdAt: new Date(1000),
         updatedAt: nowTs(),
       })
     );
     // Reject shadow field injection
     await assertFails(
-      deviceARef.update({
+      configRef.update({
         isAdmin: true,
         updatedAt: nowTs(),
       })
     );
 
-    await assertSucceeds(deviceBRef.delete());
+    await assertSucceeds(configRef.delete());
   });
 
-  it('blocks cross-user access to device config and subcollections', async () => {
+  it('blocks cross-user access to account config and subcollections', async () => {
     const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
     const bobDb = testEnv.authenticatedContext(BOB_UID).firestore();
 
-    await assertSucceeds(aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}`).set(validDeviceConfig()));
-    await assertSucceeds(
-      aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData/entry_1`).set(validPersonalData())
-    );
+    await assertSucceeds(aliceDb.doc(`users/${ALICE_UID}/account/config`).set(validAccountConfig()));
+    await assertSucceeds(aliceDb.doc(`users/${ALICE_UID}/personalData/entry_1`).set(validPersonalData()));
 
-    await assertFails(bobDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}`).get());
-    await assertFails(bobDb.collection(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData`).get());
+    await assertFails(bobDb.doc(`users/${ALICE_UID}/account/config`).get());
+    await assertFails(bobDb.collection(`users/${ALICE_UID}/personalData`).get());
     await assertFails(
-      bobDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData/entry_1`).update({
+      bobDb.doc(`users/${ALICE_UID}/personalData/entry_1`).update({
         content: 'hacked',
         updatedAt: nowTs(),
       })
     );
-    await assertFails(bobDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData/entry_1`).delete());
+    await assertFails(bobDb.doc(`users/${ALICE_UID}/personalData/entry_1`).delete());
   });
 
-  it('validates CRUD on personalData (আমার ডাটা) subcollection', async () => {
+  it('validates CRUD on account-level personalData (আমার ডাটা)', async () => {
     const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
-    const entryRef = aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData/fact_01`);
+    const entryRef = aliceDb.doc(`users/${ALICE_UID}/personalData/fact_01`);
 
     await assertSucceeds(entryRef.set(validPersonalData()));
     await assertSucceeds(entryRef.get());
     await assertSucceeds(
-      aliceDb
-        .collection(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData`)
-        .orderBy('createdAt', 'desc')
-        .get()
+      aliceDb.collection(`users/${ALICE_UID}/personalData`).orderBy('createdAt', 'desc').get()
     );
     await assertSucceeds(
       entryRef.update({
@@ -200,16 +189,14 @@ describe('LivePilot Per-Device Isolated Firestore Rules', () => {
       })
     );
 
-    // Invalid empty title rejected
     await assertFails(
-      aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData/fact_bad`).set({
+      aliceDb.doc(`users/${ALICE_UID}/personalData/fact_bad`).set({
         ...validPersonalData(),
         title: '',
       })
     );
-    // Shadow field rejected
     await assertFails(
-      aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/personalData/fact_shadow`).set({
+      aliceDb.doc(`users/${ALICE_UID}/personalData/fact_shadow`).set({
         ...validPersonalData(),
         extraHackField: 'nope',
       })
@@ -217,26 +204,22 @@ describe('LivePilot Per-Device Isolated Firestore Rules', () => {
     await assertSucceeds(entryRef.delete());
   });
 
-  it('validates CRUD on routines and askAiMessages subcollections', async () => {
+  it('validates CRUD on account-level routines and askAiMessages', async () => {
     const aliceDb = testEnv.authenticatedContext(ALICE_UID).firestore();
-    const routineRef = aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/routines/custom_r1`);
-    const msgRef = aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/askAiMessages/msg_1`);
+    const routineRef = aliceDb.doc(`users/${ALICE_UID}/routines/custom_r1`);
+    const msgRef = aliceDb.doc(`users/${ALICE_UID}/askAiMessages/msg_1`);
 
     await assertSucceeds(routineRef.set(validRoutine()));
-    await assertSucceeds(aliceDb.collection(`users/${ALICE_UID}/devices/${DEVICE_A}/routines`).get());
+    await assertSucceeds(aliceDb.collection(`users/${ALICE_UID}/routines`).get());
     await assertSucceeds(routineRef.update({ title: 'Updated Brief', updatedAt: nowTs() }));
     await assertSucceeds(routineRef.delete());
 
     await assertSucceeds(msgRef.set(validAskAiMessage(1)));
     await assertSucceeds(
-      aliceDb
-        .collection(`users/${ALICE_UID}/devices/${DEVICE_A}/askAiMessages`)
-        .orderBy('clientId', 'asc')
-        .get()
+      aliceDb.collection(`users/${ALICE_UID}/askAiMessages`).orderBy('clientId', 'asc').get()
     );
-    // Invalid senderRole rejected
     await assertFails(
-      aliceDb.doc(`users/${ALICE_UID}/devices/${DEVICE_A}/askAiMessages/msg_bad`).set({
+      aliceDb.doc(`users/${ALICE_UID}/askAiMessages/msg_bad`).set({
         ...validAskAiMessage(2),
         senderRole: 'system_hack',
       })

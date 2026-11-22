@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.RemoveRedEye
@@ -39,6 +40,8 @@ import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.UploadFile
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -53,6 +56,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -130,6 +134,7 @@ fun SettingsLogsScreen(
     onSyncNow: () -> Unit,
     onSignOut: () -> Unit,
     onOpenGoogleSignIn: () -> Unit,
+    onUpdateOwnerDisplayName: (String) -> Unit,
     onExportBackupFile: () -> Unit,
     onImportBackupFile: () -> Unit,
     onAddApiKeys: (String, String) -> Unit,
@@ -268,8 +273,17 @@ fun SettingsLogsScreen(
 
         when (activeSubTab) {
             SettingsSubTab.API_MODELS -> {
-                // 0. Per-Device Firebase Cloud Profile & Isolation Card
+                // 0. Account-Level Cross-Device Firebase Cloud Profile & Owner Name Card
                 item {
+                    var ownerNameDraft by rememberSaveable { mutableStateOf(settings.ownerDisplayName) }
+                    LaunchedEffect(settings.ownerDisplayName) {
+                        if (ownerNameDraft != settings.ownerDisplayName) {
+                            ownerNameDraft = settings.ownerDisplayName
+                        }
+                    }
+                    val previewName = ownerNameDraft.trim()
+                        .ifBlank { userEmail?.substringBefore('@') ?: "আপনার নাম" }
+
                     StudioCardContainer {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -282,7 +296,7 @@ fun SettingsLogsScreen(
                             ) {
                                 Icon(
                                     imageVector = Icons.Filled.CloudDone,
-                                    contentDescription = "Firebase Cloud Backup",
+                                    contentDescription = "Account Cloud Sync",
                                     tint = palette.emeraldAccent,
                                     modifier = Modifier.size(22.dp)
                                 )
@@ -290,18 +304,18 @@ fun SettingsLogsScreen(
                                 Column {
                                     Text(
                                         text = if (isCloudSignedIn) {
-                                            "Firebase ডিভাইস ক্লাউড প্রোফাইল"
+                                            "অ্যাকাউন্ট ক্লাউড প্রোফাইল (সব মোবাইলে সিঙ্ক)"
                                         } else {
-                                            "অটো ডিভাইস প্রোফাইল ও ব্যাকআপ"
+                                            "লোকাল প্রোফাইল ও অ্যাকাউন্ট ব্যাকআপ"
                                         },
                                         style = MaterialTheme.typography.titleMedium,
                                         color = palette.inkPrimary
                                     )
                                     Text(
                                         text = if (isCloudSignedIn) {
-                                            userEmail ?: "Google Signed In"
+                                            userEmail ?: "Account Signed In"
                                         } else {
-                                            "লগইন ছাড়াই অটো চালু • শুধু এই মোবাইলের ডাটা"
+                                            "লগইন ছাড়া লোকাল মোড • নতুন মোবাইলে অটো সিঙ্কের জন্য অ্যাকাউন্ট যুক্ত করুন"
                                         },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = palette.inkSecondary
@@ -309,7 +323,7 @@ fun SettingsLogsScreen(
                                 }
                             }
                             StatusPillBadge(
-                                label = if (isCloudSignedIn) "CLOUD" else "AUTO LOCAL",
+                                label = if (isCloudSignedIn) "ACCOUNT SYNC" else "LOCAL",
                                 accentColor = if (isCloudSignedIn) palette.emeraldAccent else palette.cobaltAccent,
                                 containerColor = if (isCloudSignedIn) palette.emeraldSoft else palette.cobaltSoft
                             )
@@ -326,35 +340,93 @@ fun SettingsLogsScreen(
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     Icon(
                                         imageVector = Icons.Filled.PhoneAndroid,
-                                        contentDescription = "Device model",
+                                        contentDescription = "Current device",
                                         tint = palette.cobaltAccent,
                                         modifier = Modifier.size(16.dp)
                                     )
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "মডেল: ${deviceProfile.displayLabel}",
+                                        text = "বর্তমান ডিভাইস: ${deviceProfile.displayLabel}",
                                         style = MaterialTheme.typography.labelLarge,
                                         color = palette.inkPrimary,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                 }
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = "Device ID: ${deviceProfile.deviceId}",
-                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
-                                    color = palette.inkMuted
-                                )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "$cloudSyncStatus • এই মোবাইলের API Key, ডিলিট করা মডেল ও আমার ডাটা আলাদাভাবে সংরক্ষিত আছে।",
+                                    text = if (isCloudSignedIn) {
+                                        "$cloudSyncStatus • যেকোনো নতুন মোবাইলে এই অ্যাকাউন্ট দিয়ে লগইন করলেই আপনার API Key, মডেল, ডিলিট করা মডেল, \"আমার ডাটা\" ও সেটিংস অটোমেটিক চলে আসবে।"
+                                    } else {
+                                        "$cloudSyncStatus • নিচের Google/Gmail অ্যাকাউন্ট সিঙ্ক চালু করলে যেকোনো মোবাইলে সব ডাটা অটো রিস্টোর হবে।"
+                                    },
                                     style = MaterialTheme.typography.bodySmall,
                                     color = palette.inkSecondary
                                 )
                             }
                         }
 
-                        Spacer(modifier = Modifier.height(10.dp))
-                        // 1-Tap Backup Export & Restore (works without Google Sign-In!)
+                        Spacer(modifier = Modifier.height(12.dp))
+                        // Editable Owner Account Name (announced automatically when away from phone)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Filled.Person,
+                                contentDescription = "Owner account name",
+                                tint = palette.violetAccent,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "অ্যাকাউন্টের নাম (Away রিপ্লাইতে ব্যবহার হবে)",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = palette.inkPrimary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = ownerNameDraft,
+                                onValueChange = { ownerNameDraft = it },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("settings_owner_name_input"),
+                                singleLine = true,
+                                placeholder = { Text("যেমন: ফাহিম / আপনার নাম") },
+                                shape = RoundedCornerShape(12.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedContainerColor = palette.surfaceSubtle,
+                                    unfocusedContainerColor = palette.surfaceSubtle,
+                                    focusedBorderColor = palette.violetAccent,
+                                    unfocusedBorderColor = palette.outline
+                                )
+                            )
+                            Button(
+                                onClick = { onUpdateOwnerDisplayName(ownerNameDraft) },
+                                modifier = Modifier
+                                    .height(52.dp)
+                                    .testTag("settings_owner_name_save_button"),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = palette.violetAccent,
+                                    contentColor = Color.White
+                                )
+                            ) {
+                                Text("সেভ", fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "মোবাইলের কাছে না থাকলে প্রিভিউ: \"উত্তরের জন্য অপেক্ষা করুন, $previewName আসলেই উত্তর দেবেন।\"",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = palette.inkMuted
+                        )
+
+                        Spacer(modifier = Modifier.height(12.dp))
+                        // 1-Tap Backup Export & Restore (works offline too)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -445,17 +517,17 @@ fun SettingsLogsScreen(
                                     .height(48.dp)
                                     .testTag("settings_connect_google_button"),
                                 shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, palette.cobaltAccent.copy(alpha = 0.45f))
+                                border = BorderStroke(1.dp, palette.cobaltAccent.copy(alpha = 0.5f))
                             ) {
                                 Icon(
                                     imageVector = Icons.AutoMirrored.Filled.Login,
-                                    contentDescription = "Connect Google Firebase sync",
+                                    contentDescription = "Connect Gmail account cloud sync",
                                     tint = palette.cobaltAccent,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
                                 Text(
-                                    text = "Google দিয়ে Firebase সিঙ্ক (ঐচ্ছিক)",
+                                    text = "Gmail অ্যাকাউন্ট দিয়ে ক্লাউড সিঙ্ক চালু করুন",
                                     color = palette.cobaltAccent
                                 )
                             }
