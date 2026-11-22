@@ -111,6 +111,8 @@ fun SettingsLogsScreen(
     onToggleAutoRotateKeys: (Boolean) -> Unit,
     onResetApiKeyHealth: () -> Unit,
     onUpdateLiveModel: (String) -> Unit,
+    onUpdateAgentModel: (String) -> Unit,
+    onUpdateVerifyTaskCompletion: (Boolean) -> Unit,
     onUpdateTextModel: (String) -> Unit,
     onFetchModels: () -> Unit,
     onUpdateVoice: (String) -> Unit,
@@ -312,6 +314,118 @@ fun SettingsLogsScreen(
                                 focusedBorderColor = palette.cobaltAccent,
                                 unfocusedBorderColor = palette.outline
                             )
+                        )
+                    }
+                }
+
+                // 2B. Dual-Brain: Dedicated Non-Live Action / Task Agent Model Selector
+                item {
+                    val agentDiscovered = textDiscovered.filterNot {
+                        it.id.contains("native-audio", ignoreCase = true) ||
+                            it.id.contains("live", ignoreCase = true)
+                    }
+                    StudioCardContainer {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Task Agent Brain (Non-Live Action Model)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = palette.inkPrimary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            StatusPillBadge(
+                                label = "DUAL-BRAIN",
+                                accentColor = palette.emeraldAccent,
+                                containerColor = palette.emeraldSoft,
+                                leadingDot = false
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "Voice model talks in real time while THIS stronger non-Live Reasoning+Vision model executes multi-step tasks, searches, draws & audits completion. Pick gemini-2.5-pro for hardest tasks or gemini-2.5-flash for fast accuracy.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            PilotSettings.AGENT_MODEL_PRESETS.forEach { preset ->
+                                val badge = when (preset) {
+                                    "gemini-2.5-pro" -> "$preset (Smartest)"
+                                    "gemini-2.5-flash" -> "$preset (Fast)"
+                                    else -> preset
+                                }
+                                FilterChip(
+                                    selected = settings.agentModel.equals(preset, ignoreCase = true),
+                                    onClick = { onUpdateAgentModel(preset) },
+                                    modifier = Modifier.testTag("agent_model_chip_${preset.lowercase()}"),
+                                    label = { Text(badge, style = MaterialTheme.typography.labelMedium) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = palette.emeraldSoft,
+                                        selectedLabelColor = palette.emeraldAccent
+                                    )
+                                )
+                            }
+                        }
+
+                        if (agentDiscovered.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(
+                                text = "Discovered Non-Live Reasoning Models:",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = palette.emeraldAccent
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                agentDiscovered.take(12).forEach { model ->
+                                    FilterChip(
+                                        selected = settings.agentModel.equals(model.id, ignoreCase = true),
+                                        onClick = { onUpdateAgentModel(model.id) },
+                                        label = { Text(model.id, style = MaterialTheme.typography.labelMedium) },
+                                        colors = FilterChipDefaults.filterChipColors(
+                                            selectedContainerColor = palette.emeraldSoft,
+                                            selectedLabelColor = palette.emeraldAccent
+                                        )
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = settings.agentModel,
+                            onValueChange = onUpdateAgentModel,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_agent_model_input"),
+                            singleLine = true,
+                            label = { Text("Custom Action Brain Model ID") },
+                            shape = RoundedCornerShape(14.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedContainerColor = palette.surfaceSubtle,
+                                unfocusedContainerColor = palette.surfaceSubtle,
+                                focusedBorderColor = palette.emeraldAccent,
+                                unfocusedBorderColor = palette.outline
+                            )
+                        )
+
+                        Spacer(modifier = Modifier.height(10.dp))
+                        ToggleSettingRow(
+                            title = "Strict Visual Completion Audit (কাজ শেষ যাচাই)",
+                            subtitle = "Re-inspects the real screen with an independent auditor before ever announcing 'Done'",
+                            checked = settings.verifyTaskCompletion,
+                            tag = "verify_task_completion_switch",
+                            trackColor = EmeraldGreen,
+                            onCheckedChange = onUpdateVerifyTaskCompletion
                         )
                     }
                 }

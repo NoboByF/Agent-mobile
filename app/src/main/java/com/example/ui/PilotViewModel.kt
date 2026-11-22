@@ -310,6 +310,15 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         PilotStateHub.updateSettings { it.copy(liveModel = clean) }
     }
 
+    fun updateAgentModel(modelId: String) {
+        val clean = modelId.trim().removePrefix("models/")
+        PilotStateHub.updateSettings { it.copy(agentModel = clean) }
+    }
+
+    fun updateVerifyTaskCompletion(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(verifyTaskCompletion = enabled) }
+    }
+
     fun updateTextModel(modelId: String) {
         val clean = modelId.trim().removePrefix("models/")
         PilotStateHub.updateSettings { it.copy(textModel = clean) }

@@ -344,6 +344,8 @@ private fun LivePilotAppRoot(
                             onToggleAutoRotateKeys = { viewModel.updateAutoRotateApiKeys(it) },
                             onResetApiKeyHealth = { viewModel.resetApiKeyHealth() },
                             onUpdateLiveModel = { viewModel.updateLiveModel(it) },
+                            onUpdateAgentModel = { viewModel.updateAgentModel(it) },
+                            onUpdateVerifyTaskCompletion = { viewModel.updateVerifyTaskCompletion(it) },
                             onUpdateTextModel = { viewModel.updateTextModel(it) },
                             onFetchModels = { viewModel.fetchModels() },
                             onUpdateVoice = { viewModel.updateVoiceName(it) },

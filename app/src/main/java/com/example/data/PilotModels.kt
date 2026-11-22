@@ -263,7 +263,9 @@ data class PilotSettings(
     val activeApiKeyId: String? = null,
     val autoRotateApiKeys: Boolean = true,
     val liveModel: String = DEFAULT_LIVE_MODEL,
+    val agentModel: String = DEFAULT_AGENT_MODEL,
     val textModel: String = DEFAULT_TEXT_MODEL,
+    val verifyTaskCompletion: Boolean = true,
     val voiceName: String = DEFAULT_VOICE,
     val voiceLanguage: VoiceLanguage = VoiceLanguage.BENGALI_BD,
     val speakerphoneOn: Boolean = true,
@@ -303,23 +305,30 @@ data class PilotSettings(
     }
 
     companion object {
-        const val DEFAULT_LIVE_MODEL = "gemini-3.8-live"
-        const val DEFAULT_TEXT_MODEL = "gemini-4-hydrogen"
+        const val DEFAULT_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
+        const val DEFAULT_AGENT_MODEL = "gemini-2.5-flash"
+        const val DEFAULT_TEXT_MODEL = "gemini-2.5-flash"
         const val DEFAULT_VOICE = "Kore"
         const val DEFAULT_AUTO_REPLY_PERSONA =
             "Reply politely, naturally, and concisely in Bengali or English matching the sender's language as my personal assistant."
 
         val LIVE_MODEL_PRESETS = listOf(
-            "gemini-3.8-live",
             "gemini-2.5-flash-native-audio-preview-12-2025",
-            "gemini-3.1-flash-live-preview"
+            "gemini-3.1-flash-live-preview",
+            "gemini-2.0-flash-live-001"
+        )
+
+        val AGENT_MODEL_PRESETS = listOf(
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash"
         )
 
         val TEXT_MODEL_PRESETS = listOf(
-            "gemini-4-hydrogen",
-            "gemini-4-carbon",
-            "gemini-3.1-flash-lite",
-            "gemini-2.5-flash"
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2.0-flash",
+            "gemini-2.5-flash-lite"
         )
 
         val VOICE_PRESETS = listOf(

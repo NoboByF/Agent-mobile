@@ -154,7 +154,7 @@ class AutonomousTaskEngine(
         goal: String,
         startedAtMs: Long
     ) {
-        val modelId = PilotStateHub.settings.value.textModel
+        val modelId = PilotStateHub.settings.value.agentModel
         var totalStrokesDrawn = 0
 
         // Phase 1: Inspect screen, detect canvas bounds, prepare zoom/brush/color
@@ -367,33 +367,44 @@ class AutonomousTaskEngine(
         }
 
         val elapsedSec = ((System.currentTimeMillis() - startedAtMs) / 1000L).coerceAtLeast(1L)
+        if (totalStrokesDrawn == 0) {
+            PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Drawing ended with 0 strokes drawn.")
+            notifyLiveVoice(
+                "[SYSTEM EVENT: Autonomous drawing FAILED (0 strokes were drawn on canvas). Do NOT say it is finished. Honestly tell the user the canvas could not be drawn on and ask them to open the drawing canvas clearly.]"
+            )
+            return
+        }
         PilotStateHub.log(
             LogLevel.INFO,
             "AutoPilot",
             "Drawing finished: $totalStrokesDrawn total strokes in ${elapsedSec}s."
         )
         notifyLiveVoice(
-            "[SYSTEM EVENT: Autonomous drawing task COMPLETED! Goal='$goal', drew $totalStrokesDrawn smooth strokes in ${elapsedSec} seconds. Warmly inform the user in 1-2 short sentences in their language and ask if they want any tweaks or more details.]"
+            "[SYSTEM EVENT: Autonomous drawing task VERIFIED COMPLETED! Goal='$goal', drew $totalStrokesDrawn smooth strokes in ${elapsedSec} seconds. Warmly inform the user in 1-2 short sentences in their language and ask if they want any tweaks or more details.]"
         )
     }
 
-    // --- GENERAL AUTONOMOUS MULTI-STEP UI / BROWSER WORKFLOW LOOP ---
+    // --- GENERAL AUTONOMOUS MULTI-STEP UI / BROWSER WORKFLOW LOOP (DUAL-BRAIN + VISUAL AUDITOR) ---
 
     private suspend fun runAutonomousWorkflowLoop(
         service: PilotAccessibilityService,
         goal: String,
         startedAtMs: Long
     ) {
-        val modelId = PilotStateHub.settings.value.textModel
         val stepHistory = mutableListOf<String>()
         var consecutiveErrors = 0
         var lastActionSignature = ""
         var repeatCount = 0
+        var noChangeStreak = 0
+        var actionsExecuted = 0
+        var auditorRejections = 0
 
         for (step in 1..MAX_WORKFLOW_STEPS) {
             coroutineContext.ensureActive()
+            val settings = PilotStateHub.settings.value
+            val modelId = settings.agentModel
             if (System.currentTimeMillis() - startedAtMs > MAX_TASK_DURATION_MS) {
-                notifyLiveVoice("[SYSTEM EVENT: Autonomous task reached the 4-minute safety limit after ${step - 1} steps. Summarize progress to the user and ask if they want to continue.]")
+                notifyLiveVoice("[SYSTEM EVENT: Autonomous task reached the 4-minute safety limit after ${step - 1} steps (NOT fully verified complete). Honestly summarize what was done so far and ask if the user wants to continue.]")
                 return
             }
             if (service.isCurrentScreenBlocked()) {
@@ -406,35 +417,38 @@ class AutonomousTaskEngine(
                 stepHistory.add("USER LIVE UPDATE: ${liveUserNotes.joinToString("; ")}")
             }
 
-            updateHudProgress(true, "🤖 Step $step: Observing...")
+            updateHudProgress(true, "🧠 Step $step: Thinking...")
             val screenshot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896)
-            val uiDump = service.getScreenUiJson()
-            val compactUi = buildCompactUiSummary(uiDump)
+            val beforeUiDump = service.getScreenUiJson()
+            val beforePkg = beforeUiDump.optString("package", "unknown")
+            val beforeFingerprint = buildUiFingerprint(beforeUiDump)
+            val compactUi = buildCompactUiSummary(beforeUiDump)
 
             val plan = GeminiRestClient.generateVisionJson(
                 modelId = modelId,
                 systemPrompt = WORKFLOW_AGENT_SYSTEM_PROMPT,
                 userPrompt = buildString {
-                    append("Goal: ").append(goal).append('\n')
-                    append("Step: ").append(step).append(" / ").append(MAX_WORKFLOW_STEPS).append('\n')
+                    append("User Full Goal: ").append(goal).append('\n')
+                    append("Step: ").append(step).append(" / ").append(MAX_WORKFLOW_STEPS)
+                        .append(" | Real Actions Executed So Far: ").append(actionsExecuted).append('\n')
                     if (stepHistory.isNotEmpty()) {
-                        append("Recent Actions:\n")
-                        stepHistory.takeLast(12).forEach { append("- ").append(it).append('\n') }
+                        append("Action History & Observed Results:\n")
+                        stepHistory.takeLast(14).forEach { append("- ").append(it).append('\n') }
                     }
-                    if (repeatCount >= 2) {
-                        append("WARNING: Previous action repeated with little progress. Try a DIFFERENT approach (e.g., scroll, tap exact visual icon coordinates, or navigate).\n")
+                    if (repeatCount >= 2 || noChangeStreak >= 2) {
+                        append("CRITICAL RECOVERY WARNING: Your recent action repeated or did NOT change the screen! Do NOT tap the same spot again and do NOT claim done. Try a DIFFERENT strategy: use SEARCH, FIND_CLICK, SCROLL, NAVIGATE(BACK), or tap a visually distinct element.\n")
                     }
                     append("Visible UI Tree Summary:\n").append(compactUi).append('\n')
-                    append("Look at the 0..1000 gridded screenshot and decide the SINGLE best next action (or multi-stroke DRAW_STROKES batch if drawing on a canvas) to complete the goal.")
+                    append("CRITICAL RULE: Only set done=true if the CURRENT screenshot clearly shows EVERY part of the user's goal is ALREADY completely finished (and remaining_steps is empty). Otherwise set done=false and choose the SINGLE best next action.")
                 },
                 jpegBytes = screenshot,
-                temperature = 0.2,
-                maxOutputTokens = 4096
+                temperature = 0.15,
+                maxOutputTokens = 8192
             ).getOrElse { err ->
                 consecutiveErrors++
                 PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Step $step planner error: ${err.message}")
                 if (consecutiveErrors >= 3) {
-                    notifyLiveVoice("[SYSTEM EVENT: Autonomous task stopped after repeated API errors: ${err.message?.take(120)}. Inform the user.]")
+                    notifyLiveVoice("[SYSTEM EVENT: Autonomous task FAILED due to API error: ${err.message?.take(120)}. Do NOT say finished; honestly explain the error.]")
                     return
                 }
                 delay(1200L)
@@ -443,22 +457,58 @@ class AutonomousTaskEngine(
 
             consecutiveErrors = 0
             val statusLabel = plan.optString("status_label", "Working...").take(26)
-            val done = plan.optBoolean("done", false)
+            val claimedDone = plan.optBoolean("done", false)
             val needsHelp = plan.optBoolean("needs_user_help", false)
             val finalReport = plan.optString("final_report", "").trim()
-
-            if (done) {
-                PilotStateHub.log(LogLevel.INFO, "AutoPilot", "Workflow completed in $step steps: $finalReport")
-                notifyLiveVoice(
-                    "[SYSTEM EVENT: Autonomous task COMPLETED in $step steps! Goal='$goal'. Report: ${finalReport.ifBlank { "Task finished successfully." }}. Tell the user concisely in their language.]"
-                )
-                return
-            }
+            val remainingSteps = parseStringList(plan.optJSONArray("remaining_steps"))
 
             if (needsHelp) {
                 PilotStateHub.log(LogLevel.INFO, "AutoPilot", "Needs user input: $finalReport")
                 notifyLiveVoice(
                     "[SYSTEM EVENT: Autonomous task paused and needs user input (e.g. password/OTP/confirmation): ${finalReport.ifBlank { "Please check the screen." }}. Explain clearly to the user.]"
+                )
+                return
+            }
+
+            if (claimedDone) {
+                // Guard 1: Planner itself still listed remaining steps!
+                if (remainingSteps.isNotEmpty()) {
+                    PilotStateHub.log(
+                        LogLevel.INFO,
+                        "AutoPilot",
+                        "Blocked premature done at step $step; remaining=${remainingSteps.joinToString()}"
+                    )
+                    stepHistory.add("GUARD REJECTED done=true because remaining_steps is not empty: ${remainingSteps.joinToString(", ")}. Execute the next remaining step now.")
+                    continue
+                }
+
+                // Guard 2: Independent Strict Visual Auditor checks the real screen before allowing completion!
+                if (settings.verifyTaskCompletion && auditorRejections < MAX_AUDITOR_VETOES) {
+                    updateHudProgress(true, "🔍 Verifying completion...")
+                    val audit = verifyGoalCompleted(
+                        service = service,
+                        modelId = modelId,
+                        goal = goal,
+                        stepHistory = stepHistory,
+                        claimedReport = finalReport
+                    )
+                    if (!audit.verifiedDone) {
+                        auditorRejections++
+                        val missing = audit.missingWork.ifBlank { "Goal is not yet visibly completed on screen." }
+                        PilotStateHub.log(
+                            LogLevel.INFO,
+                            "AutoPilot",
+                            "Auditor VETO #$auditorRejections: $missing"
+                        )
+                        stepHistory.add("VISUAL AUDITOR REJECTED COMPLETION: $missing — Keep executing until this is actually complete on screen!")
+                        continue
+                    }
+                    PilotStateHub.log(LogLevel.INFO, "AutoPilot", "Auditor VERIFIED completion: ${audit.evidence}")
+                }
+
+                PilotStateHub.log(LogLevel.INFO, "AutoPilot", "Workflow VERIFIED COMPLETED in $step steps: $finalReport")
+                notifyLiveVoice(
+                    "[SYSTEM EVENT: Autonomous task VERIFIED COMPLETED in $step steps! Goal='$goal'. Report: ${finalReport.ifBlank { "Task finished and verified on screen." }}. Tell the user concisely in their language.]"
                 )
                 return
             }
@@ -473,30 +523,92 @@ class AutonomousTaskEngine(
             updateHudProgress(true, "🤖 $step: $statusLabel")
             val execResult = executeWorkflowAction(service, action, plan)
             val ok = execResult.optString("status") == "ok"
+            if (ok && action != "WAIT") actionsExecuted++
 
             if (execResult.optString("status") == "blocked") {
                 notifyLiveVoice("[SYSTEM EVENT: Action blocked by Safety Guardrails on a financial/security app. Inform user politely.]")
                 return
             }
 
-            stepHistory.add("Step $step [$action '$statusLabel'] -> ${execResult.optString("status", "unknown")} ${execResult.optString("message", "").take(70)}")
+            // Give browser/app UI time to settle before checking screen diff
+            val settleDelay = when (action) {
+                "OPEN_APP", "OPEN_URL", "SEARCH" -> 1400L
+                "FIND_CLICK" -> 900L
+                "WAIT" -> 0L
+                "DRAW_STROKES" -> 450L
+                else -> 700L
+            }
+            if (settleDelay > 0L) delay(settleDelay)
+
+            val afterUiDump = service.getScreenUiJson()
+            val afterPkg = afterUiDump.optString("package", "unknown")
+            val afterFingerprint = buildUiFingerprint(afterUiDump)
+            val screenChanged = action == "WAIT" || action == "DRAW_STROKES" ||
+                afterPkg != beforePkg || afterFingerprint != beforeFingerprint
+
+            if (screenChanged) {
+                noChangeStreak = 0
+            } else {
+                noChangeStreak++
+            }
+
+            val changeNote = if (screenChanged) {
+                if (afterPkg != beforePkg) "app=$beforePkg->$afterPkg" else "screen_changed=true"
+            } else {
+                "NO_SCREEN_CHANGE (action may have missed target)"
+            }
+            stepHistory.add(
+                "Step $step [$action '$statusLabel'] -> ${execResult.optString("status", "unknown")} ($changeNote) ${execResult.optString("message", "").take(60)}"
+            )
             PilotStateHub.recordToolExecuted(
                 toolName = "auto_${action.lowercase()}",
                 summary = statusLabel,
                 succeeded = ok
             )
-
-            // Give browser/app UI time to settle before next observation
-            val settleDelay = when (action) {
-                "OPEN_APP", "OPEN_URL" -> 1400L
-                "WAIT" -> 0L
-                "DRAW_STROKES" -> 450L
-                else -> 650L
-            }
-            if (settleDelay > 0L) delay(settleDelay)
         }
 
-        notifyLiveVoice("[SYSTEM EVENT: Autonomous task completed $MAX_WORKFLOW_STEPS steps on goal '$goal'. Summarize current progress to the user and ask if they want to continue further.]")
+        notifyLiveVoice("[SYSTEM EVENT: Autonomous task reached $MAX_WORKFLOW_STEPS steps on goal '$goal' without full verification. Honestly tell the user what progress was made and ask if they want to continue.]")
+    }
+
+    private data class AuditVerdict(
+        val verifiedDone: Boolean,
+        val missingWork: String,
+        val evidence: String
+    )
+
+    private suspend fun verifyGoalCompleted(
+        service: PilotAccessibilityService,
+        modelId: String,
+        goal: String,
+        stepHistory: List<String>,
+        claimedReport: String
+    ): AuditVerdict {
+        val shot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896)
+        val uiSummary = buildCompactUiSummary(service.getScreenUiJson())
+        val res = GeminiRestClient.generateVisionJson(
+            modelId = modelId,
+            systemPrompt = TASK_AUDITOR_SYSTEM_PROMPT,
+            userPrompt = buildString {
+                append("User Original Goal: ").append(goal).append('\n')
+                append("Agent Claimed Report: ").append(claimedReport.ifBlank { "(none)" }).append('\n')
+                append("Recent Steps Taken:\n")
+                stepHistory.takeLast(8).forEach { append("- ").append(it).append('\n') }
+                append("Current Screen UI Summary:\n").append(uiSummary).append('\n')
+                append("Look strictly at the CURRENT screenshot. Is EVERY part of the user's goal genuinely, visibly completed right now? Return strict JSON: {\"verified_done\": true/false, \"missing_work\": \"...\", \"evidence\": \"...\"}")
+            },
+            jpegBytes = shot,
+            temperature = 0.1,
+            maxOutputTokens = 2048
+        ).getOrNull()
+
+        if (res == null) {
+            return AuditVerdict(verifiedDone = true, missingWork = "", evidence = "Auditor skipped on API error")
+        }
+        return AuditVerdict(
+            verifiedDone = res.optBoolean("verified_done", false),
+            missingWork = res.optString("missing_work", "").trim(),
+            evidence = res.optString("evidence", "").trim()
+        )
     }
 
     private suspend fun executeWorkflowAction(
@@ -505,6 +617,18 @@ class AutonomousTaskEngine(
         plan: JSONObject
     ): JSONObject {
         return when (action) {
+            "SEARCH" -> SmartSearchAndFinder.searchOnScreen(
+                service = service,
+                appContext = appContext,
+                rawQuery = plan.optString("text", ""),
+                openInGoogleIfNeeded = plan.optBoolean("open_in_google", false)
+            )
+            "FIND_CLICK" -> SmartSearchAndFinder.findAndInteract(
+                service = service,
+                rawTarget = plan.optString("text", ""),
+                rawAction = "CLICK",
+                maxScrolls = plan.optInt("max_scrolls", 4)
+            )
             "CLICK" -> service.clickNormalized(
                 nx = plan.optInt("x", 500),
                 ny = plan.optInt("y", 500),
@@ -576,6 +700,31 @@ class AutonomousTaskEngine(
         }
     }
 
+    private fun buildUiFingerprint(uiDump: JSONObject): String {
+        val pkg = uiDump.optString("package", "")
+        val arr = uiDump.optJSONArray("elements") ?: return pkg
+        val sb = StringBuilder(pkg).append('#').append(arr.length()).append(':')
+        val limit = minOf(arr.length(), 28)
+        for (i in 0 until limit) {
+            val el = arr.optJSONObject(i) ?: continue
+            val t = el.optString("text", "").ifBlank { el.optString("desc", "") }
+            if (t.isNotBlank()) {
+                sb.append(t.take(18)).append('|')
+            }
+        }
+        return sb.toString()
+    }
+
+    private fun parseStringList(arr: JSONArray?): List<String> {
+        if (arr == null) return emptyList()
+        return buildList {
+            for (i in 0 until arr.length()) {
+                val item = arr.optString(i, "").trim()
+                if (item.isNotEmpty()) add(item)
+            }
+        }
+    }
+
     private fun buildCompactUiSummary(uiDump: JSONObject): String {
         val pkg = uiDump.optString("package", "unknown")
         val w = uiDump.optInt("screen_width", 1080).coerceAtLeast(1)
@@ -641,6 +790,7 @@ class AutonomousTaskEngine(
 
     companion object {
         private const val MAX_WORKFLOW_STEPS = 35
+        private const val MAX_AUDITOR_VETOES = 3
         private const val MAX_TASK_DURATION_MS = 240_000L // 4 minutes max per autonomous run
 
         fun resolveMode(goal: String, rawMode: String): AutonomousMode {
@@ -678,12 +828,14 @@ Rules:
 """
 
         private const val WORKFLOW_AGENT_SYSTEM_PROMPT = """
-You are LivePilot's Autonomous Android Vision Agent. You control any Android app or Chrome web browser step-by-step until the user's goal is completely accomplished.
+You are LivePilot's Dedicated Non-Live Reasoning & Vision Action Brain controlling an Android phone step-by-step until the user's goal is 100% VISIBLY ACCOMPLISHED on screen.
 Every screenshot has a 0..1000 coordinate ruler grid (0,0 = top-left, 1000,1000 = bottom-right).
 Available actions:
-- CLICK: tap normalized (x, y) in 0..1000
-- CLICK_TEXT: find & tap text (provide "text" plus backup visual "x", "y")
-- TYPE: tap input box at (x, y), enter "text", optionally "press_send": true
+- SEARCH: smart in-app or Google search! Provide "text" (query) and optional "open_in_google": true/false. Use this whenever you need to search inside YouTube, Chrome, Facebook, Play Store, Settings, Daraz, WhatsApp, etc.
+- FIND_CLICK: smart multi-scroll fuzzy Bengali+English item finder & clicker! Provide "text" (button/video/setting/contact name) and optional "max_scrolls": 4.
+- CLICK: tap exact normalized (x, y) in 0..1000
+- CLICK_TEXT: tap visible text ("text" plus backup visual "x", "y")
+- TYPE: tap input box at (x, y), type "text", optionally "press_send": true
 - DRAG: drag from (x, y) to (end_x, end_y) over "duration_ms"
 - LONG_PRESS: hold at (x, y) for "duration_ms"
 - SCROLL: swipe "direction" (DOWN/UP/LEFT/RIGHT), "distance_percent" (25-80)
@@ -694,24 +846,45 @@ Available actions:
 - NAVIGATE: "text" = BACK | HOME | RECENTS
 - WAIT: wait "duration_ms" (400-3500) for page/app load
 
-Never touch passwords, OTPs, banking, or payments — set "needs_user_help": true instead.
+CRITICAL ANTI-PREMATURE-COMPLETION RULES:
+1. Break the goal into concrete sub-steps in "remaining_steps".
+2. NEVER set "done": true while ANY sub-step is still unexecuted or unverified on the screenshot!
+3. Opening an app or typing a search is NOT finishing if the user asked to play a video, open a specific item, toggle a setting, or send a message!
+4. Never touch passwords, OTPs, banking, or payments — set "needs_user_help": true instead.
+
 Always output strict JSON:
 {
-  "thought": "brief reasoning",
+  "thought": "brief honest reasoning based on what is actually visible right now",
+  "completed_steps": ["..."],
+  "remaining_steps": ["..."],
   "status_label": "short 2-4 word status",
   "done": false,
   "needs_user_help": false,
   "final_report": "",
-  "action": "CLICK",
+  "action": "SEARCH",
   "x": 500, "y": 500,
   "end_x": 500, "end_y": 500,
   "text": "",
+  "open_in_google": false,
+  "max_scrolls": 4,
   "press_send": false,
   "direction": "DOWN",
   "distance_percent": 55,
   "duration_ms": 420,
   "zoom_in": true
 }
+"""
+
+        private const val TASK_AUDITOR_SYSTEM_PROMPT = """
+You are LivePilot's STRICT Independent Visual Completion Auditor.
+An automation agent claims it has finished the user's goal. Your ONLY job is to inspect the ACTUAL current Android screenshot and UI tree like a skeptical QA engineer.
+Rules:
+- Be STRICT and HONEST. Do NOT rubber-stamp completion!
+- If the user asked to search AND open/play a specific video/item, merely showing search results is verified_done=false.
+- If the user asked to turn on/off a setting, verify the toggle state on screen actually matches.
+- If the user asked to send a message, verify the sent message bubble appears in the chat (not just typed in the box).
+- If the screen clearly shows the final requested result is achieved, set verified_done=true.
+- Output ONLY strict JSON: {"verified_done": true/false, "missing_work": "exact remaining step if false", "evidence": "what you visibly see on screen"}.
 """
     }
 }

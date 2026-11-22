@@ -13,6 +13,7 @@ import com.example.automation.DrawingGestureHelper
 import com.example.automation.SmartSearchAndFinder
 import com.example.data.AppThemeMode
 import com.example.data.AskAiMessage
+import com.example.data.DiscoveredModel
 import com.example.data.GeminiApiKeyEntry
 import com.example.data.PilotPreferences
 import com.example.data.PilotRoutine
@@ -330,5 +331,43 @@ class ExampleRobolectricTest {
         assertTrue(SmartSearchAndFinder.isFuzzyClose("youtube", "youtbe"))
         assertTrue(SmartSearchAndFinder.isFuzzyClose("settings", "setings"))
         assertFalse(SmartSearchAndFinder.isFuzzyClose("search", "camera"))
+    }
+
+    @Test
+    fun `dual brain migrates legacy placeholder models and resolves non-live vision fallbacks`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val rawPrefs = context.getSharedPreferences("livepilot_ai_secure_prefs", Context.MODE_PRIVATE)
+        rawPrefs.edit()
+            .clear()
+            .putString("live_model_id", "gemini-3.8-live")
+            .putString("text_model_id", "gemini-4-hydrogen")
+            .commit()
+
+        val prefs = PilotPreferences(context)
+        val migrated = prefs.loadSettings()
+        assertEquals(PilotSettings.DEFAULT_LIVE_MODEL, migrated.liveModel)
+        assertEquals(PilotSettings.DEFAULT_AGENT_MODEL, migrated.agentModel)
+        assertEquals(PilotSettings.DEFAULT_TEXT_MODEL, migrated.textModel)
+        assertTrue(migrated.verifyTaskCompletion)
+
+        prefs.saveSettings(migrated.copy(agentModel = "gemini-2.5-pro", verifyTaskCompletion = false))
+        val reloaded = prefs.loadSettings()
+        assertEquals("gemini-2.5-pro", reloaded.agentModel)
+        assertFalse(reloaded.verifyTaskCompletion)
+
+        val fallbacks = GeminiRestClient.resolveAgentFallbackModels(
+            primaryModel = "gemini-2.5-pro",
+            discovered = listOf(
+                DiscoveredModel("gemini-2.5-flash-native-audio-preview-12-2025", "Live", true, true),
+                DiscoveredModel("gemini-2.5-flash", "Flash", false, true),
+                DiscoveredModel("gemini-3.0-pro-exp", "Pro 3", false, true)
+            )
+        )
+        assertEquals("gemini-2.5-pro", fallbacks.first())
+        assertTrue(fallbacks.contains("gemini-2.5-flash"))
+        assertTrue(fallbacks.contains("gemini-3.0-pro-exp"))
+        assertFalse(fallbacks.any { it.contains("native-audio") })
+        assertTrue(GeminiToolSchemas.LIVE_SYSTEM_INSTRUCTION.contains("DUAL-BRAIN ARCHITECTURE"))
+        assertTrue(GeminiToolSchemas.LIVE_SYSTEM_INSTRUCTION.contains("VERIFIED COMPLETED"))
     }
 }

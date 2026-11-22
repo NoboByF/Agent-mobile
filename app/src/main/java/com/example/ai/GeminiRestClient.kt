@@ -205,7 +205,7 @@ object GeminiRestClient {
         enableGoogleSearch: Boolean
     ): Result<ChatGenerationResult> = withContext(Dispatchers.IO) {
         runCatching {
-            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-4-hydrogen" }
+            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
             val sanitizedTurns = buildSanitizedContents(history.takeLast(20))
             require(sanitizedTurns.length() > 0) { "Prompt cannot be empty." }
 
@@ -303,7 +303,7 @@ object GeminiRestClient {
         screenContext: String? = null
     ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-4-hydrogen" }
+            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
 
             val promptText = buildString {
                 append("Messaging App: ").append(appName).append('\n')
@@ -416,8 +416,30 @@ object GeminiRestClient {
     }
 
     /**
+     * Builds an ordered list of non-Live Vision+Reasoning models to try if the primary
+     * selected agentModel returns HTTP 404 (not found / unsupported on this API key).
+     */
+    internal fun resolveAgentFallbackModels(
+        primaryModel: String,
+        discovered: List<DiscoveredModel> = PilotStateHub.discoveredModels.value
+    ): List<String> {
+        val candidates = LinkedHashSet<String>()
+        val cleanPrimary = primaryModel.trim().removePrefix("models/")
+        if (cleanPrimary.isNotBlank()) candidates.add(cleanPrimary)
+        candidates.add("gemini-2.5-flash")
+        candidates.add("gemini-2.5-pro")
+        candidates.add("gemini-2.0-flash")
+        discovered
+            .filter { it.supportsGenerateContent && !it.id.contains("native-audio", ignoreCase = true) }
+            .forEach { candidates.add(it.id) }
+        return candidates.toList()
+    }
+
+    /**
      * Multimodal Vision + Structured JSON call for AutonomousTaskEngine (screen understanding,
-     * multi-step UI planning, and multi-stroke vector drawing) with automatic Multi-Key failover.
+     * multi-step UI planning, visual completion auditing, and vector drawing) with both:
+     * 1) Automatic Multi-API-Key failover (429/quota/invalid key)
+     * 2) Automatic Non-Live Reasoning Model fallback (if a model ID returns HTTP 404)
      */
     suspend fun generateVisionJson(
         apiKey: String = "",
@@ -425,11 +447,10 @@ object GeminiRestClient {
         systemPrompt: String,
         userPrompt: String,
         jpegBytes: ByteArray?,
-        temperature: Double = 0.25,
-        maxOutputTokens: Int = 4096
+        temperature: Double = 0.2,
+        maxOutputTokens: Int = 8192
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
         runCatching {
-            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-4-hydrogen" }
             val userParts = JSONArray()
             if (jpegBytes != null && jpegBytes.isNotEmpty()) {
                 val b64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
@@ -469,47 +490,70 @@ object GeminiRestClient {
                 )
 
             val bodyJson = payload.toString()
+            val modelCandidates = resolveAgentFallbackModels(modelId)
+            var lastModelError: Throwable? = null
 
-            executeWithPoolFailover(apiKey, "AutoPilot") { entry, activeKey ->
-                val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
-                val url = "$REST_BASE/models/$cleanModel:generateContent?key=$encodedKey"
-                val request = Request.Builder()
-                    .url(url)
-                    .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
-                    .build()
+            for ((idx, candidateModel) in modelCandidates.withIndex()) {
+                try {
+                    return@runCatching executeWithPoolFailover(apiKey, "AutoPilot") { entry, activeKey ->
+                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                        val url = "$REST_BASE/models/$candidateModel:generateContent?key=$encodedKey"
+                        val request = Request.Builder()
+                            .url(url)
+                            .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+                            .build()
 
-                val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
-                PilotStateHub.log(
-                    LogLevel.INFO,
-                    "AutoPilot",
-                    "Vision plan request via $cleanModel$labelSuffix (${(jpegBytes?.size ?: 0) / 1024}KB)"
-                )
+                        val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
+                        PilotStateHub.log(
+                            LogLevel.INFO,
+                            "AutoPilot",
+                            "Action Brain -> $candidateModel$labelSuffix (${(jpegBytes?.size ?: 0) / 1024}KB)"
+                        )
 
-                client.newCall(request).execute().use { response ->
-                    val bodyStr = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        val errMsg = extractApiError(bodyStr, response.code)
-                        PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Vision error$labelSuffix: $errMsg")
-                        throw GeminiHttpException(response.code, errMsg)
-                    }
-
-                    val root = JSONObject(bodyStr)
-                    val parts = root.optJSONArray("candidates")
-                        ?.optJSONObject(0)
-                        ?.optJSONObject("content")
-                        ?.optJSONArray("parts")
-                    val rawText = buildString {
-                        if (parts != null) {
-                            for (i in 0 until parts.length()) {
-                                val t = parts.optJSONObject(i)?.optString("text", "").orEmpty()
-                                if (t.isNotBlank()) append(t)
+                        client.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                val errMsg = extractApiError(bodyStr, response.code)
+                                PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Vision error ($candidateModel)$labelSuffix: $errMsg")
+                                throw GeminiHttpException(response.code, errMsg)
                             }
-                        }
-                    }.trim()
 
-                    extractCleanJsonObject(rawText)
+                            val root = JSONObject(bodyStr)
+                            val parts = root.optJSONArray("candidates")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("content")
+                                ?.optJSONArray("parts")
+                            val rawText = buildString {
+                                if (parts != null) {
+                                    for (i in 0 until parts.length()) {
+                                        val partObj = parts.optJSONObject(i) ?: continue
+                                        // Skip internal reasoning thought parts if returned by Gemini 2.5 thinking models
+                                        if (partObj.optBoolean("thought", false)) continue
+                                        val t = partObj.optString("text", "").orEmpty()
+                                        if (t.isNotBlank()) append(t)
+                                    }
+                                }
+                            }.trim()
+
+                            extractCleanJsonObject(rawText)
+                        }
+                    }
+                } catch (e: GeminiHttpException) {
+                    lastModelError = e
+                    val isModelUnsupported = e.httpCode == 404 ||
+                        (e.httpCode == 400 && e.message.contains("not supported", ignoreCase = true))
+                    if (isModelUnsupported && idx < modelCandidates.lastIndex) {
+                        PilotStateHub.log(
+                            LogLevel.INFO,
+                            "AutoPilot",
+                            "Model '$candidateModel' unavailable (HTTP ${e.httpCode}); switching Action Brain to '${modelCandidates[idx + 1]}'"
+                        )
+                        continue
+                    }
+                    throw e
                 }
             }
+            throw lastModelError ?: IllegalStateException("No available Action Brain model could handle the request.")
         }
     }
 

@@ -71,17 +71,42 @@ class PilotPreferences(context: Context) {
             ?: migratedKeys.firstOrNull { it.enabled }?.key
             ?: legacySingleKey
 
+        val rawLiveModel = prefs.getString(KEY_LIVE_MODEL, PilotSettings.DEFAULT_LIVE_MODEL)
+            .orEmpty()
+            .ifBlank { PilotSettings.DEFAULT_LIVE_MODEL }
+        val migratedLiveModel = if (rawLiveModel in LEGACY_PLACEHOLDER_LIVE_MODELS) {
+            PilotSettings.DEFAULT_LIVE_MODEL
+        } else {
+            rawLiveModel
+        }
+
+        val rawTextModel = prefs.getString(KEY_TEXT_MODEL, PilotSettings.DEFAULT_TEXT_MODEL)
+            .orEmpty()
+            .ifBlank { PilotSettings.DEFAULT_TEXT_MODEL }
+        val migratedTextModel = if (rawTextModel in LEGACY_PLACEHOLDER_TEXT_MODELS) {
+            PilotSettings.DEFAULT_TEXT_MODEL
+        } else {
+            rawTextModel
+        }
+
+        val rawAgentModel = prefs.getString(KEY_AGENT_MODEL, null)
+            .orEmpty()
+            .ifBlank { migratedTextModel }
+        val migratedAgentModel = if (rawAgentModel in LEGACY_PLACEHOLDER_TEXT_MODELS) {
+            PilotSettings.DEFAULT_AGENT_MODEL
+        } else {
+            rawAgentModel
+        }
+
         return PilotSettings(
             apiKey = effectiveKey,
             apiKeys = migratedKeys,
             activeApiKeyId = resolvedActiveId,
             autoRotateApiKeys = prefs.getBoolean(KEY_AUTO_ROTATE_API_KEYS, true),
-            liveModel = prefs.getString(KEY_LIVE_MODEL, PilotSettings.DEFAULT_LIVE_MODEL)
-                .orEmpty()
-                .ifBlank { PilotSettings.DEFAULT_LIVE_MODEL },
-            textModel = prefs.getString(KEY_TEXT_MODEL, PilotSettings.DEFAULT_TEXT_MODEL)
-                .orEmpty()
-                .ifBlank { PilotSettings.DEFAULT_TEXT_MODEL },
+            liveModel = migratedLiveModel,
+            agentModel = migratedAgentModel,
+            textModel = migratedTextModel,
+            verifyTaskCompletion = prefs.getBoolean(KEY_VERIFY_TASK_COMPLETION, true),
             voiceName = prefs.getString(KEY_VOICE_NAME, PilotSettings.DEFAULT_VOICE)
                 .orEmpty()
                 .ifBlank { PilotSettings.DEFAULT_VOICE },
@@ -129,7 +154,9 @@ class PilotPreferences(context: Context) {
             .putString(KEY_ACTIVE_API_KEY_ID, activeId)
             .putBoolean(KEY_AUTO_ROTATE_API_KEYS, settings.autoRotateApiKeys)
             .putString(KEY_LIVE_MODEL, settings.liveModel.trim().removePrefix("models/"))
+            .putString(KEY_AGENT_MODEL, settings.agentModel.trim().removePrefix("models/"))
             .putString(KEY_TEXT_MODEL, settings.textModel.trim().removePrefix("models/"))
+            .putBoolean(KEY_VERIFY_TASK_COMPLETION, settings.verifyTaskCompletion)
             .putString(KEY_VOICE_NAME, settings.voiceName.trim())
             .putString(KEY_VOICE_LANGUAGE, settings.voiceLanguage.name)
             .putBoolean(KEY_SPEAKERPHONE, settings.speakerphoneOn)
@@ -299,7 +326,9 @@ class PilotPreferences(context: Context) {
         private const val KEY_ACTIVE_API_KEY_ID = "gemini_active_api_key_id"
         private const val KEY_AUTO_ROTATE_API_KEYS = "gemini_auto_rotate_api_keys"
         private const val KEY_LIVE_MODEL = "live_model_id"
+        private const val KEY_AGENT_MODEL = "agent_model_id"
         private const val KEY_TEXT_MODEL = "text_model_id"
+        private const val KEY_VERIFY_TASK_COMPLETION = "verify_task_completion"
         private const val KEY_VOICE_NAME = "live_voice_name"
         private const val KEY_VOICE_LANGUAGE = "live_voice_language"
         private const val KEY_SPEAKERPHONE = "speakerphone_on"
@@ -315,5 +344,12 @@ class PilotPreferences(context: Context) {
         private const val KEY_ENABLED_APPS = "enabled_messaging_apps"
         private const val KEY_ASK_AI_HISTORY = "ask_ai_history_json"
         private const val KEY_CUSTOM_ROUTINES = "custom_routines_json"
+
+        private val LEGACY_PLACEHOLDER_LIVE_MODELS = setOf("gemini-3.8-live")
+        private val LEGACY_PLACEHOLDER_TEXT_MODELS = setOf(
+            "gemini-4-hydrogen",
+            "gemini-4-carbon",
+            "gemini-3.1-flash-lite"
+        )
     }
 }

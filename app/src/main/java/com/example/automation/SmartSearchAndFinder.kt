@@ -566,14 +566,14 @@ object SmartSearchAndFinder {
         targetDescription: String
     ): Pair<Int, Int>? {
         val shot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896) ?: return null
-        val modelId = PilotStateHub.settings.value.textModel
+        val modelId = PilotStateHub.settings.value.agentModel
         val json = GeminiRestClient.generateVisionJson(
             modelId = modelId,
             systemPrompt = "You locate exact UI elements on Android screenshots with a 0..1000 coordinate ruler grid. Return strict JSON only.",
             userPrompt = "Find this element on screen: \"$targetDescription\". Return JSON: {\"found\": true/false, \"x\": 0..1000, \"y\": 0..1000}.",
             jpegBytes = shot,
             temperature = 0.1,
-            maxOutputTokens = 256
+            maxOutputTokens = 1024
         ).getOrNull() ?: return null
 
         if (!json.optBoolean("found", false)) return null
