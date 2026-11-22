@@ -66,6 +66,12 @@ class GeminiLiveClient(
     private var currentApiKey: String = ""
 
     @Volatile
+    private var currentKeyEntryId: String? = null
+
+    @Volatile
+    private var currentKeyLabel: String? = null
+
+    @Volatile
     private var currentModel: String = ""
 
     @Volatile
@@ -80,7 +86,7 @@ class GeminiLiveClient(
     fun isReadyForRealtimeInput(): Boolean = setupCompleted.get() && webSocket != null
 
     fun connect(
-        apiKey: String,
+        apiKey: String = "",
         modelId: String,
         voiceName: String,
         customInstructions: String = ""
@@ -90,10 +96,27 @@ class GeminiLiveClient(
         reconnectAttempt = 0
         reconnectJob?.cancel()
 
-        currentApiKey = apiKey.trim()
         currentModel = normalizeModelPath(modelId)
         currentVoice = voiceName.trim().ifBlank { "Kore" }
         currentCustomInstructions = customInstructions.trim()
+
+        val selection = ApiKeyPoolManager.selectBestKey()
+        if (selection.entry != null) {
+            currentApiKey = selection.entry.key.trim()
+            currentKeyEntryId = selection.entry.id
+            currentKeyLabel = selection.entry.label
+            PilotStateHub.updateSession { it.copy(activeKeyLabel = selection.entry.label) }
+        } else if (apiKey.isNotBlank() && selection.totalEnabledKeys == 0) {
+            currentApiKey = apiKey.trim()
+            currentKeyEntryId = null
+            currentKeyLabel = "Key 1"
+            PilotStateHub.updateSession { it.copy(activeKeyLabel = "Key 1") }
+        } else {
+            val msg = ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
+            callbacks.onConnectionPhaseChanged(LiveConnectionPhase.ERROR, msg)
+            PilotStateHub.log(LogLevel.ERROR, "LiveClient", msg)
+            return
+        }
 
         openSocketInternal(isReconnect = false)
     }
@@ -118,14 +141,16 @@ class GeminiLiveClient(
         }
 
         setupCompleted.set(false)
-        webSocket?.cancel()
+        val previousWs = webSocket
         webSocket = null
+        previousWs?.cancel()
 
+        val keyTag = currentKeyLabel?.let { " [$it]" }.orEmpty()
         val phase = if (isReconnect) LiveConnectionPhase.RECONNECTING else LiveConnectionPhase.CONNECTING
         val detail = if (isReconnect) {
-            "Reconnecting with session memory..."
+            "Reconnecting$keyTag..."
         } else {
-            "Connecting to $currentModel..."
+            "Connecting to ${currentModel.removePrefix("models/")}$keyTag..."
         }
         callbacks.onConnectionPhaseChanged(phase, detail)
 
@@ -136,14 +161,15 @@ class GeminiLiveClient(
         PilotStateHub.log(
             LogLevel.WS,
             "LiveClient",
-            if (isReconnect) "Opening reconnect WebSocket (handle=${savedResumptionHandle != null})"
-            else "Opening WebSocket for $currentModel (voice=$currentVoice)"
+            if (isReconnect) "Opening reconnect WebSocket$keyTag (handle=${savedResumptionHandle != null})"
+            else "Opening WebSocket$keyTag for $currentModel (voice=$currentVoice)"
         )
 
-        webSocket = okHttpClient.newWebSocket(request, object : WebSocketListener() {
+        val activeWs = okHttpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                PilotStateHub.log(LogLevel.WS, "onOpen", "HTTP ${response.code} connected. Sending setup handshake...")
-                callbacks.onConnectionPhaseChanged(LiveConnectionPhase.WAITING_SETUP, "Sending setup handshake...")
+                if (webSocket !== this@GeminiLiveClient.webSocket) return
+                PilotStateHub.log(LogLevel.WS, "onOpen", "HTTP ${response.code} connected$keyTag. Sending setup handshake...")
+                callbacks.onConnectionPhaseChanged(LiveConnectionPhase.WAITING_SETUP, "Syncing setup$keyTag...")
                 val setupPayload = buildSetupPayload(
                     modelPath = currentModel,
                     voiceName = currentVoice,
@@ -157,37 +183,103 @@ class GeminiLiveClient(
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (webSocket !== this@GeminiLiveClient.webSocket) return
                 handleIncomingMessage(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (webSocket !== this@GeminiLiveClient.webSocket) return
                 handleIncomingMessage(bytes.utf8())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (webSocket !== this@GeminiLiveClient.webSocket) return
                 PilotStateHub.log(LogLevel.WS, "onClosing", "code=$code reason=${reason.ifBlank { "(none)" }}")
                 setupCompleted.set(false)
                 webSocket.close(code, reason)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (webSocket !== this@GeminiLiveClient.webSocket) return
                 PilotStateHub.log(LogLevel.WS, "onClosed", "code=$code reason=${reason.ifBlank { "(none)" }}")
                 setupCompleted.set(false)
                 if (!manuallyClosed.get()) {
-                    scheduleReconnect("Closed ($code: $reason)")
+                    handleDisconnectWithKeyFailover(
+                        httpCode = null,
+                        wsCloseCode = code,
+                        reason = reason.ifBlank { "Closed ($code)" }
+                    )
                 }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val httpCode = response?.code?.let { " HTTP $it" } ?: ""
-                val msg = "${t.javaClass.simpleName}: ${t.message ?: "Unknown error"}$httpCode"
+                if (webSocket !== this@GeminiLiveClient.webSocket) return
+                val httpCode = response?.code
+                val httpTag = httpCode?.let { " HTTP $it" } ?: ""
+                val msg = "${t.javaClass.simpleName}: ${t.message ?: "Unknown error"}$httpTag"
                 PilotStateHub.log(LogLevel.ERROR, "onFailure", msg)
                 setupCompleted.set(false)
                 if (!manuallyClosed.get()) {
-                    scheduleReconnect(msg)
+                    handleDisconnectWithKeyFailover(
+                        httpCode = httpCode,
+                        wsCloseCode = null,
+                        reason = msg
+                    )
                 }
             }
         })
+        webSocket = activeWs
+    }
+
+    /**
+     * Checks if the disconnect was caused by quota exhaustion, rate-limiting, or an invalid key.
+     * If so, rotates seamlessly to the next healthy backup key in ApiKeyPoolManager and reconnects.
+     */
+    private fun handleDisconnectWithKeyFailover(
+        httpCode: Int?,
+        wsCloseCode: Int?,
+        reason: String
+    ) {
+        val classification = ApiKeyPoolManager.classifyFailure(
+            httpCode = httpCode,
+            wsCloseCode = wsCloseCode,
+            message = reason
+        )
+        val keyId = currentKeyEntryId
+
+        if (classification.kind != ApiFailureKind.TRANSIENT && keyId != null) {
+            val failedLabel = currentKeyLabel ?: "Active Key"
+            val nextKey = ApiKeyPoolManager.reportFailureAndRotate(
+                failedKeyId = keyId,
+                classification = classification
+            )
+            if (nextKey != null) {
+                // Resumption handles are scoped per API key/project, so clear before switching
+                savedResumptionHandle = null
+                currentApiKey = nextKey.key.trim()
+                currentKeyEntryId = nextKey.id
+                currentKeyLabel = nextKey.label
+                reconnectAttempt = 0
+                PilotStateHub.updateSession {
+                    it.copy(
+                        activeKeyLabel = nextKey.label,
+                        sessionHandle = null,
+                        statusTicker = "Switched to ${nextKey.label} ($failedLabel full)"
+                    )
+                }
+                scheduleReconnect("Failover to ${nextKey.label}", immediate = true)
+                return
+            } else {
+                val selection = ApiKeyPoolManager.selectBestKey()
+                val exhaustedMsg = ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
+                callbacks.onConnectionPhaseChanged(LiveConnectionPhase.ERROR, exhaustedMsg)
+                PilotStateHub.log(LogLevel.ERROR, "KeyPool", exhaustedMsg)
+                return
+            }
+        }
+
+        // Transient network hiccup or non-quota close: retry with backoff
+        scheduleReconnect(reason, immediate = false)
     }
 
     private fun handleIncomingMessage(rawJson: String) {
@@ -199,8 +291,10 @@ class GeminiLiveClient(
         if (json.has("setupComplete")) {
             reconnectAttempt = 0
             setupCompleted.set(true)
-            PilotStateHub.log(LogLevel.WS, "setupComplete", "Handshake verified! Starting full-duplex audio.")
-            callbacks.onConnectionPhaseChanged(LiveConnectionPhase.READY, "Connected • Listening")
+            currentKeyEntryId?.let { ApiKeyPoolManager.reportSuccess(it) }
+            val keyTag = currentKeyLabel?.let { " [$it]" }.orEmpty()
+            PilotStateHub.log(LogLevel.WS, "setupComplete", "Handshake verified$keyTag! Starting full-duplex audio.")
+            callbacks.onConnectionPhaseChanged(LiveConnectionPhase.READY, "Connected$keyTag • Listening")
             callbacks.onSetupComplete()
             return
         }
@@ -305,10 +399,10 @@ class GeminiLiveClient(
             PilotStateHub.log(LogLevel.ERROR, "Reconnect", "Max reconnect attempts reached ($reason).")
             return
         }
-        val backoffMs = if (immediate) 400L else minOf(1200L * reconnectAttempt, 8000L)
+        val backoffMs = if (immediate) 350L else minOf(1200L * reconnectAttempt, 8000L)
         callbacks.onConnectionPhaseChanged(
             LiveConnectionPhase.RECONNECTING,
-            "Reconnecting (#$reconnectAttempt)..."
+            if (immediate) reason else "Reconnecting (#$reconnectAttempt)..."
         )
         reconnectJob = scope.launch {
             delay(backoffMs)
@@ -425,6 +519,13 @@ class GeminiLiveClient(
         private const val WS_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
+        private val sharedTestClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(12, TimeUnit.SECONDS)
+                .readTimeout(15, TimeUnit.SECONDS)
+                .build()
+        }
+
         fun normalizeModelPath(modelId: String): String {
             val cleaned = modelId.trim().removePrefix("models/")
             return "models/${cleaned.ifBlank { "gemini-3.8-live" }}"
@@ -472,31 +573,102 @@ class GeminiLiveClient(
             return JSONObject().put("setup", setup)
         }
 
+        /**
+         * Tests Live API WebSocket handshake with automatic multi-key failover if active key is quota-limited.
+         */
         suspend fun testLiveHandshake(
-            apiKey: String,
+            apiKey: String = "",
             modelId: String,
             voiceName: String
         ): Triple<Boolean, String, Long> {
-            val trimmedKey = apiKey.trim()
-            if (trimmedKey.isBlank()) {
-                return Triple(false, "Enter your Gemini API Key in Settings first.", 0L)
+            val settings = PilotStateHub.settings.value
+            val pool = ApiKeyPoolManager.effectivePool(settings)
+            val triedIds = mutableSetOf<String>()
+            val maxAttempts = if (pool.isNotEmpty() && settings.autoRotateApiKeys) {
+                pool.count { it.enabled }.coerceIn(1, 8)
+            } else {
+                1
             }
 
-            val startMs = System.currentTimeMillis()
             val normalizedModel = normalizeModelPath(modelId)
-            val resultDeferred = CompletableDeferred<Pair<Boolean, String>>()
+            var lastMessage = "Connection failed"
+            var lastElapsed = 0L
 
-            val client = OkHttpClient.Builder()
-                .connectTimeout(12, TimeUnit.SECONDS)
-                .readTimeout(15, TimeUnit.SECONDS)
-                .build()
+            for (attempt in 1..maxAttempts) {
+                val selection = if (pool.isNotEmpty()) {
+                    ApiKeyPoolManager.selectBestKey(
+                        settings = PilotStateHub.settings.value,
+                        excludeIds = triedIds
+                    )
+                } else {
+                    null
+                }
+                val entry = selection?.entry
+                val keyToUse = entry?.key?.trim() ?: apiKey.trim()
+                if (keyToUse.isBlank()) {
+                    val msg = if (selection != null) {
+                        ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
+                    } else {
+                        "Add at least one Gemini API Key in Settings first."
+                    }
+                    return Triple(false, msg, 0L)
+                }
+                entry?.let { triedIds.add(it.id) }
 
-            val encodedKey = URLEncoder.encode(trimmedKey, "UTF-8")
+                val labelTag = entry?.let { " [${it.label}]" }.orEmpty()
+                val startMs = System.currentTimeMillis()
+                val outcome = runSingleHandshakeTest(keyToUse, normalizedModel, voiceName, labelTag)
+                lastElapsed = System.currentTimeMillis() - startMs
+
+                if (outcome.success) {
+                    entry?.let { ApiKeyPoolManager.reportSuccess(it.id) }
+                    val msg = "Handshake OK ($normalizedModel$labelTag)"
+                    PilotStateHub.log(LogLevel.INFO, "TestConnect", "$msg (${lastElapsed}ms)")
+                    return Triple(true, msg, lastElapsed)
+                }
+
+                lastMessage = outcome.message
+                PilotStateHub.log(LogLevel.ERROR, "TestConnect", "${outcome.message}$labelTag (${lastElapsed}ms)")
+
+                if (entry != null) {
+                    val classification = ApiKeyPoolManager.classifyFailure(
+                        httpCode = outcome.httpCode,
+                        wsCloseCode = outcome.wsCloseCode,
+                        message = outcome.message
+                    )
+                    if (classification.kind != ApiFailureKind.TRANSIENT) {
+                        val next = ApiKeyPoolManager.reportFailureAndRotate(entry.id, classification)
+                        if (next != null && attempt < maxAttempts) {
+                            continue
+                        }
+                    }
+                }
+                break
+            }
+
+            return Triple(false, lastMessage, lastElapsed)
+        }
+
+        private data class HandshakeAttemptOutcome(
+            val success: Boolean,
+            val message: String,
+            val httpCode: Int? = null,
+            val wsCloseCode: Int? = null
+        )
+
+        private suspend fun runSingleHandshakeTest(
+            rawKey: String,
+            normalizedModel: String,
+            voiceName: String,
+            labelTag: String
+        ): HandshakeAttemptOutcome {
+            val resultDeferred = CompletableDeferred<HandshakeAttemptOutcome>()
+            val encodedKey = URLEncoder.encode(rawKey, "UTF-8")
             val request = Request.Builder().url("$WS_BASE_URL?key=$encodedKey").build()
 
-            PilotStateHub.log(LogLevel.WS, "TestConnect", "Testing handshake with $normalizedModel...")
+            PilotStateHub.log(LogLevel.WS, "TestConnect", "Testing handshake with $normalizedModel$labelTag...")
 
-            val ws = client.newWebSocket(request, object : WebSocketListener() {
+            val ws = sharedTestClient.newWebSocket(request, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     val payload = buildSetupPayload(normalizedModel, voiceName, null)
                     webSocket.send(payload.toString())
@@ -513,7 +685,7 @@ class GeminiLiveClient(
                 private fun handleTestMsg(webSocket: WebSocket, raw: String) {
                     val json = runCatching { JSONObject(raw) }.getOrNull()
                     if (json != null && json.has("setupComplete")) {
-                        resultDeferred.complete(true to "Handshake OK ($normalizedModel)")
+                        resultDeferred.complete(HandshakeAttemptOutcome(true, "OK"))
                         webSocket.close(1000, "Diagnostic complete")
                     }
                 }
@@ -521,7 +693,11 @@ class GeminiLiveClient(
                 override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                     if (!resultDeferred.isCompleted) {
                         resultDeferred.complete(
-                            false to "Server closed ($code): ${reason.ifBlank { "Check model ID or API key" }}"
+                            HandshakeAttemptOutcome(
+                                success = false,
+                                message = "Server closed ($code): ${reason.ifBlank { "Check model ID or API key" }}",
+                                wsCloseCode = code
+                            )
                         )
                     }
                 }
@@ -529,22 +705,21 @@ class GeminiLiveClient(
                 override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                     if (!resultDeferred.isCompleted) {
                         val codePart = response?.code?.let { "HTTP $it - " } ?: ""
-                        resultDeferred.complete(false to "$codePart${t.message ?: "Connection failed"}")
+                        resultDeferred.complete(
+                            HandshakeAttemptOutcome(
+                                success = false,
+                                message = "$codePart${t.message ?: "Connection failed"}",
+                                httpCode = response?.code
+                            )
+                        )
                     }
                 }
             })
 
             val outcome = withTimeoutOrNull(14_000L) { resultDeferred.await() }
-                ?: (false to "Timed out waiting for setupComplete")
+                ?: HandshakeAttemptOutcome(false, "Timed out waiting for setupComplete")
             ws.close(1000, "Test done")
-
-            val elapsed = System.currentTimeMillis() - startMs
-            PilotStateHub.log(
-                if (outcome.first) LogLevel.INFO else LogLevel.ERROR,
-                "TestConnect",
-                "${outcome.second} (${elapsed}ms)"
-            )
-            return Triple(outcome.first, outcome.second, elapsed)
+            return outcome
         }
     }
 }

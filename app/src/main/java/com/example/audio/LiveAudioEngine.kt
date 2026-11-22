@@ -21,6 +21,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.sqrt
 
@@ -261,6 +262,12 @@ class LiveAudioEngine(
             .setTransferMode(AudioTrack.MODE_STREAM)
             .build()
 
+        if (track.state != AudioTrack.STATE_INITIALIZED) {
+            PilotStateHub.log(LogLevel.ERROR, "AudioEngine", "AudioTrack failed to initialize.")
+            runCatching { track.release() }
+            return
+        }
+
         track.play()
         audioTrack = track
     }
@@ -283,6 +290,9 @@ class LiveAudioEngine(
                     } else {
                         PilotStateHub.updateAudioLevels(mic = 0f)
                     }
+                } else if (read < 0) {
+                    PilotStateHub.log(LogLevel.ERROR, "AudioEngine", "AudioRecord read error code=$read")
+                    break
                 }
             }
         }
@@ -291,7 +301,9 @@ class LiveAudioEngine(
     private fun startPlaybackLoop() {
         playbackJob = scope.launch {
             while (isActive && isRunning.get()) {
-                val chunk = runCatching { playbackQueue.take() }.getOrNull() ?: break
+                val chunk = runCatching {
+                    playbackQueue.poll(200L, TimeUnit.MILLISECONDS)
+                }.getOrNull() ?: continue
                 val track = audioTrack ?: continue
                 if (isRunning.get() && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                     val now = System.currentTimeMillis()

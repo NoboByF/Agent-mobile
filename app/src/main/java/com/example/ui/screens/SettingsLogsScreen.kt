@@ -21,19 +21,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
-import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
-import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
@@ -58,8 +51,6 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.data.AppThemeMode
 import com.example.data.DiagnosticLogEntry
@@ -67,6 +58,7 @@ import com.example.data.DiscoveredModel
 import com.example.data.LogLevel
 import com.example.data.PilotSettings
 import com.example.data.SafetyGuardrails
+import com.example.ui.components.ApiKeyPoolCard
 import com.example.ui.components.StatusPillBadge
 import com.example.ui.components.StudioCardContainer
 import com.example.ui.theme.CobaltBlue
@@ -111,7 +103,12 @@ fun SettingsLogsScreen(
     isFetchingModels: Boolean,
     modelFetchStatus: String?,
     logs: List<DiagnosticLogEntry>,
-    onUpdateApiKey: (String) -> Unit,
+    onAddApiKeys: (String, String) -> Unit,
+    onSetActiveApiKey: (String) -> Unit,
+    onToggleApiKeyEnabled: (String) -> Unit,
+    onRemoveApiKey: (String) -> Unit,
+    onToggleAutoRotateKeys: (Boolean) -> Unit,
+    onResetApiKeyHealth: () -> Unit,
     onUpdateLiveModel: (String) -> Unit,
     onUpdateTextModel: (String) -> Unit,
     onFetchModels: () -> Unit,
@@ -127,7 +124,6 @@ fun SettingsLogsScreen(
     onExportLogsText: () -> String
 ) {
     val palette = StudioTheme.colors
-    var apiKeyVisible by rememberSaveable { mutableStateOf(false) }
     var activeSubTab by rememberSaveable { mutableStateOf(SettingsSubTab.API_MODELS) }
     var logFilter by rememberSaveable { mutableStateOf(LogFilter.ALL) }
     val clipboard = LocalClipboardManager.current
@@ -147,6 +143,7 @@ fun SettingsLogsScreen(
     ) {
         // Header
         item {
+            val keyCount = settings.apiKeys.size.takeIf { it > 0 } ?: if (settings.apiKey.isNotBlank()) 1 else 0
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -159,15 +156,19 @@ fun SettingsLogsScreen(
                         color = palette.inkPrimary
                     )
                     Text(
-                        text = "API Key, Models, Theme, HUD & Diagnostics",
+                        text = "Multi-API Pool, Models, Theme, HUD & Diagnostics",
                         style = MaterialTheme.typography.bodySmall,
                         color = palette.inkSecondary
                     )
                 }
                 StatusPillBadge(
-                    label = if (settings.apiKey.isNotBlank()) "KEY SAVED" else "NO KEY",
-                    accentColor = if (settings.apiKey.isNotBlank()) palette.emeraldAccent else palette.amberAccent,
-                    containerColor = if (settings.apiKey.isNotBlank()) palette.emeraldSoft else palette.amberSoft
+                    label = when {
+                        keyCount > 1 -> "$keyCount KEYS POOL"
+                        keyCount == 1 -> "1 KEY SAVED"
+                        else -> "NO KEY"
+                    },
+                    accentColor = if (settings.hasAnyApiKey) palette.emeraldAccent else palette.amberAccent,
+                    containerColor = if (settings.hasAnyApiKey) palette.emeraldSoft else palette.amberSoft
                 )
             }
         }
@@ -225,104 +226,20 @@ fun SettingsLogsScreen(
 
         when (activeSubTab) {
             SettingsSubTab.API_MODELS -> {
-                // 1. Secure API Key Card
+                // 1. Multi-Gemini API Key Pool & Auto-Failover Card
                 item {
-                    StudioCardContainer {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Filled.Key,
-                                contentDescription = "Gemini API Key",
-                                tint = palette.cobaltAccent,
-                                modifier = Modifier.size(20.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text(
-                                text = "Gemini API Key",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = palette.inkPrimary
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Stored locally in SharedPreferences on this device. Never hardcoded.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = palette.inkSecondary
-                        )
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        OutlinedTextField(
-                            value = settings.apiKey,
-                            onValueChange = onUpdateApiKey,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("settings_api_key_input"),
-                            singleLine = true,
-                            shape = RoundedCornerShape(14.dp),
-                            placeholder = { Text("Paste AIza... Gemini API key", color = palette.inkMuted) },
-                            visualTransformation = if (apiKeyVisible) VisualTransformation.None else PasswordVisualTransformation(),
-                            trailingIcon = {
-                                IconButton(
-                                    onClick = { apiKeyVisible = !apiKeyVisible },
-                                    modifier = Modifier.testTag("toggle_api_key_visibility")
-                                ) {
-                                    Icon(
-                                        imageVector = if (apiKeyVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                        contentDescription = if (apiKeyVisible) "Hide key" else "Show key",
-                                        tint = palette.inkSecondary
-                                    )
-                                }
-                            },
-                            colors = OutlinedTextFieldDefaults.colors(
-                                focusedContainerColor = palette.surfaceSubtle,
-                                unfocusedContainerColor = palette.surfaceSubtle,
-                                focusedBorderColor = palette.cobaltAccent,
-                                unfocusedBorderColor = palette.outline
-                            )
-                        )
-
-                        Spacer(modifier = Modifier.height(12.dp))
-
-                        Button(
-                            onClick = onFetchModels,
-                            enabled = !isFetchingModels,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(48.dp)
-                                .testTag("fetch_models_button"),
-                            shape = RoundedCornerShape(14.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = CobaltBlue,
-                                contentColor = Color.White
-                            )
-                        ) {
-                            if (isFetchingModels) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    strokeWidth = 2.dp,
-                                    color = Color.White
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Fetching v1beta Models...")
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Filled.CloudDownload,
-                                    contentDescription = "Fetch available models",
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Fetch Models from Gemini API")
-                            }
-                        }
-
-                        if (!modelFetchStatus.isNullOrBlank()) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = modelFetchStatus,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = palette.cobaltAccent
-                            )
-                        }
-                    }
+                    ApiKeyPoolCard(
+                        settings = settings,
+                        isFetchingModels = isFetchingModels,
+                        modelFetchStatus = modelFetchStatus,
+                        onAddKeys = onAddApiKeys,
+                        onSetActiveKey = onSetActiveApiKey,
+                        onToggleKeyEnabled = onToggleApiKeyEnabled,
+                        onRemoveKey = onRemoveApiKey,
+                        onToggleAutoRotate = onToggleAutoRotateKeys,
+                        onResetKeyHealth = onResetApiKeyHealth,
+                        onFetchModels = onFetchModels
+                    )
                 }
 
                 // 2. Live Voice Model Selector

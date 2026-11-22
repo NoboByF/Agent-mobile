@@ -33,6 +33,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -50,7 +51,9 @@ class PilotAccessibilityService : AccessibilityService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     private var continuousScrollJob: Job? = null
-    private val lastIndexedNodes = mutableListOf<AccessibilityNodeInfo>()
+
+    @Volatile
+    private var lastIndexedNodes: List<AccessibilityNodeInfo> = emptyList()
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -69,6 +72,7 @@ class PilotAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         stopContinuousScroll()
         clearCachedNodes()
+        serviceScope.cancel()
         if (instance === this) {
             instance = null
         }
@@ -173,40 +177,8 @@ class PilotAccessibilityService : AccessibilityService() {
         }
     }
 
-    fun setAlarmOrTimer(mode: String, hours: Int, minutes: Int, label: String): JSONObject {
-        val m = mode.trim().uppercase()
-        val cleanLabel = label.trim().ifBlank { "LivePilot AI" }
-        return runCatching {
-            val intent = if (m == "ALARM") {
-                Intent(AlarmClock.ACTION_SET_ALARM).apply {
-                    putExtra(AlarmClock.EXTRA_HOUR, hours.coerceIn(0, 23))
-                    putExtra(AlarmClock.EXTRA_MINUTES, minutes.coerceIn(0, 59))
-                    putExtra(AlarmClock.EXTRA_MESSAGE, cleanLabel)
-                    putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            } else {
-                val totalSeconds = ((hours.coerceAtLeast(0) * 3600) + (minutes.coerceAtLeast(0) * 60))
-                    .coerceAtLeast(10)
-                Intent(AlarmClock.ACTION_SET_TIMER).apply {
-                    putExtra(AlarmClock.EXTRA_LENGTH, totalSeconds)
-                    putExtra(AlarmClock.EXTRA_MESSAGE, cleanLabel)
-                    putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            }
-            startActivity(intent)
-            PilotStateHub.log(LogLevel.TOOL, "Clock", "Set $m ${hours}h ${minutes}m ($cleanLabel)")
-            JSONObject()
-                .put("status", "ok")
-                .put("mode", m)
-                .put("hours", hours)
-                .put("minutes", minutes)
-                .put("label", cleanLabel)
-        }.getOrElse { err ->
-            JSONObject().put("status", "error").put("message", err.message ?: "Could not set $m")
-        }
-    }
+    fun setAlarmOrTimer(mode: String, hours: Int, minutes: Int, label: String): JSONObject =
+        setAlarmOrTimerWithContext(this, mode, hours, minutes, label)
 
     fun clipboardAction(action: String, text: String): JSONObject {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -481,13 +453,13 @@ class PilotAccessibilityService : AccessibilityService() {
         val dm = resources.displayMetrics
         val pkg = root.packageName?.toString().orEmpty()
 
-        clearCachedNodes()
+        val newNodes = mutableListOf<AccessibilityNodeInfo>()
         val elements = JSONArray()
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
 
         val maxNodes = 95
-        while (queue.isNotEmpty() && lastIndexedNodes.size < maxNodes) {
+        while (queue.isNotEmpty() && newNodes.size < maxNodes) {
             val node = queue.removeFirst()
             for (i in 0 until node.childCount) {
                 node.getChild(i)?.let { queue.add(it) }
@@ -506,8 +478,8 @@ class PilotAccessibilityService : AccessibilityService() {
             node.getBoundsInScreen(rect)
             if (rect.width() <= 2 || rect.height() <= 2) continue
 
-            val idx = lastIndexedNodes.size
-            lastIndexedNodes.add(node)
+            val idx = newNodes.size
+            newNodes.add(node)
 
             val item = JSONObject()
                 .put("index", idx)
@@ -523,6 +495,7 @@ class PilotAccessibilityService : AccessibilityService() {
             if (desc.isNotEmpty()) item.put("desc", desc.take(100))
             elements.put(item)
         }
+        lastIndexedNodes = newNodes.toList()
 
         return JSONObject()
             .put("status", "ok")
@@ -540,54 +513,57 @@ class PilotAccessibilityService : AccessibilityService() {
         val controller = PilotStateHub.activeController
 
         controller?.setOverlayTemporarilyHidden(true)
-        delay(110)
+        val jpegBytes = try {
+            delay(110)
 
-        val jpegResult = CompletableDeferred<ByteArray?>()
-        try {
-            takeScreenshot(
-                Display.DEFAULT_DISPLAY,
-                mainExecutor,
-                object : TakeScreenshotCallback {
-                    override fun onSuccess(screenshot: ScreenshotResult) {
-                        val hwBuffer = screenshot.hardwareBuffer
-                        val colorSpace = screenshot.colorSpace
-                        try {
-                            val rawBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
-                            if (rawBitmap == null) {
+            val jpegResult = CompletableDeferred<ByteArray?>()
+            try {
+                takeScreenshot(
+                    Display.DEFAULT_DISPLAY,
+                    mainExecutor,
+                    object : TakeScreenshotCallback {
+                        override fun onSuccess(screenshot: ScreenshotResult) {
+                            val hwBuffer = screenshot.hardwareBuffer
+                            val colorSpace = screenshot.colorSpace
+                            try {
+                                val rawBitmap = Bitmap.wrapHardwareBuffer(hwBuffer, colorSpace)
+                                if (rawBitmap == null) {
+                                    jpegResult.complete(null)
+                                    return
+                                }
+                                val softBitmap = rawBitmap.copy(Bitmap.Config.ARGB_8888, false)
+                                rawBitmap.recycle()
+
+                                val scaled = scaleBitmapToMaxWidth(softBitmap, 768)
+                                if (scaled !== softBitmap) softBitmap.recycle()
+
+                                val baos = ByteArrayOutputStream()
+                                scaled.compress(Bitmap.CompressFormat.JPEG, 70, baos)
+                                scaled.recycle()
+                                jpegResult.complete(baos.toByteArray())
+                            } catch (t: Throwable) {
+                                PilotStateHub.log(LogLevel.ERROR, "Vision", "Bitmap encode error: ${t.message}")
                                 jpegResult.complete(null)
-                                return
+                            } finally {
+                                hwBuffer.close()
                             }
-                            val softBitmap = rawBitmap.copy(Bitmap.Config.ARGB_8888, false)
-                            rawBitmap.recycle()
+                        }
 
-                            val scaled = scaleBitmapToMaxWidth(softBitmap, 768)
-                            if (scaled !== softBitmap) softBitmap.recycle()
-
-                            val baos = ByteArrayOutputStream()
-                            scaled.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-                            scaled.recycle()
-                            jpegResult.complete(baos.toByteArray())
-                        } catch (t: Throwable) {
-                            PilotStateHub.log(LogLevel.ERROR, "Vision", "Bitmap encode error: ${t.message}")
+                        override fun onFailure(errorCode: Int) {
+                            PilotStateHub.log(LogLevel.ERROR, "Vision", "takeScreenshot failed code=$errorCode")
                             jpegResult.complete(null)
-                        } finally {
-                            hwBuffer.close()
                         }
                     }
+                )
+            } catch (t: Throwable) {
+                PilotStateHub.log(LogLevel.ERROR, "Vision", "takeScreenshot threw: ${t.message}")
+                jpegResult.complete(null)
+            }
 
-                    override fun onFailure(errorCode: Int) {
-                        PilotStateHub.log(LogLevel.ERROR, "Vision", "takeScreenshot failed code=$errorCode")
-                        jpegResult.complete(null)
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            PilotStateHub.log(LogLevel.ERROR, "Vision", "takeScreenshot threw: ${t.message}")
-            jpegResult.complete(null)
+            withTimeoutOrNull(4500L) { jpegResult.await() }
+        } finally {
+            controller?.setOverlayTemporarilyHidden(false)
         }
-
-        val jpegBytes = withTimeoutOrNull(4500L) { jpegResult.await() }
-        controller?.setOverlayTemporarilyHidden(false)
 
         if (jpegBytes == null) {
             return JSONObject()
@@ -1018,7 +994,7 @@ class PilotAccessibilityService : AccessibilityService() {
     }
 
     private fun clearCachedNodes() {
-        lastIndexedNodes.clear()
+        lastIndexedNodes = emptyList()
     }
 
     private fun resolveAlias(raw: String): String {
@@ -1032,6 +1008,227 @@ class PilotAccessibilityService : AccessibilityService() {
     companion object {
         @Volatile
         var instance: PilotAccessibilityService? = null
+
+        fun setAlarmOrTimerWithContext(
+            context: Context,
+            mode: String,
+            hours: Int,
+            minutes: Int,
+            label: String
+        ): JSONObject {
+            val m = mode.trim().uppercase()
+            val cleanLabel = label.trim().ifBlank { "LivePilot AI" }
+            fun buildIntent(skipUi: Boolean): Intent = if (m == "ALARM") {
+                Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                    putExtra(AlarmClock.EXTRA_HOUR, hours.coerceIn(0, 23))
+                    putExtra(AlarmClock.EXTRA_MINUTES, minutes.coerceIn(0, 59))
+                    putExtra(AlarmClock.EXTRA_MESSAGE, cleanLabel)
+                    putExtra(AlarmClock.EXTRA_SKIP_UI, skipUi)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            } else {
+                val totalSeconds = ((hours.coerceAtLeast(0) * 3600) + (minutes.coerceAtLeast(0) * 60))
+                    .coerceAtLeast(10)
+                Intent(AlarmClock.ACTION_SET_TIMER).apply {
+                    putExtra(AlarmClock.EXTRA_LENGTH, totalSeconds)
+                    putExtra(AlarmClock.EXTRA_MESSAGE, cleanLabel)
+                    putExtra(AlarmClock.EXTRA_SKIP_UI, skipUi)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
+            return runCatching {
+                runCatching { context.startActivity(buildIntent(skipUi = true)) }
+                    .getOrElse { context.startActivity(buildIntent(skipUi = false)) }
+                PilotStateHub.log(LogLevel.TOOL, "Clock", "Set $m ${hours}h ${minutes}m ($cleanLabel)")
+                JSONObject()
+                    .put("status", "ok")
+                    .put("mode", m)
+                    .put("hours", hours)
+                    .put("minutes", minutes)
+                    .put("label", cleanLabel)
+            }.getOrElse { err ->
+                JSONObject().put("status", "error").put("message", err.message ?: "Could not set $m")
+            }
+        }
+
+        fun getDeviceStatusWithContext(context: Context, foregroundPkg: String = ""): JSONObject {
+            val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+            val batteryPct = if (level >= 0 && scale > 0) (level * 100) / scale else -1
+            val status = batteryIntent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+            val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val curVol = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val maxVol = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC).coerceAtLeast(1)
+            val volPct = (curVol * 100) / maxVol
+            val ringer = when (audioManager.ringerMode) {
+                AudioManager.RINGER_MODE_SILENT -> "SILENT"
+                AudioManager.RINGER_MODE_VIBRATE -> "VIBRATE"
+                else -> "NORMAL"
+            }
+
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            val networkType = when {
+                caps == null -> "OFFLINE"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "MOBILE_DATA"
+                else -> "CONNECTED"
+            }
+
+            val now = Date()
+            val timeFmt = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(now)
+            val dateFmt = SimpleDateFormat("EEEE, dd MMM yyyy", Locale.getDefault()).format(now)
+            val dm = context.resources.displayMetrics
+
+            return JSONObject()
+                .put("status", "ok")
+                .put("battery_percent", batteryPct)
+                .put("is_charging", isCharging)
+                .put("local_time", timeFmt)
+                .put("local_date", dateFmt)
+                .put("network", networkType)
+                .put("media_volume_percent", volPct)
+                .put("ringer_mode", ringer)
+                .put("foreground_package", foregroundPkg)
+                .put("screen_width", dm.widthPixels)
+                .put("screen_height", dm.heightPixels)
+        }
+
+        fun toggleFlashlightWithContext(context: Context, enabled: Boolean): JSONObject {
+            return runCatching {
+                val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val rearWithFlash = cameraManager.cameraIdList.firstOrNull { id ->
+                    val chars = cameraManager.getCameraCharacteristics(id)
+                    val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                    val facingBack = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                    hasFlash && facingBack
+                } ?: cameraManager.cameraIdList.firstOrNull { id ->
+                    cameraManager.getCameraCharacteristics(id)
+                        .get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                }
+                if (rearWithFlash == null) {
+                    return JSONObject().put("status", "error").put("message", "No flashlight hardware found.")
+                }
+                cameraManager.setTorchMode(rearWithFlash, enabled)
+                PilotStateHub.log(LogLevel.TOOL, "Flashlight", "Torch set to $enabled")
+                JSONObject().put("status", "ok").put("flashlight_on", enabled)
+            }.getOrElse { err ->
+                PilotStateHub.log(LogLevel.ERROR, "Flashlight", "Torch error: ${err.message}")
+                JSONObject().put("status", "error").put("message", err.message ?: "Failed to toggle flashlight")
+            }
+        }
+
+        fun clipboardActionWithContext(context: Context, action: String, text: String): JSONObject {
+            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            return when (action.trim().uppercase()) {
+                "WRITE" -> {
+                    clipboard.setPrimaryClip(ClipData.newPlainText("LivePilot", text))
+                    PilotStateHub.log(LogLevel.TOOL, "Clipboard", "Copied ${text.length} chars to clipboard")
+                    JSONObject().put("status", "ok").put("action", "WRITE").put("copied_length", text.length)
+                }
+                "READ" -> {
+                    val clipText = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString().orEmpty()
+                    JSONObject().put("status", "ok").put("action", "READ").put("text", clipText.take(600))
+                }
+                else -> JSONObject().put("status", "error").put("message", "Unknown clipboard action: $action")
+            }
+        }
+
+        fun searchYouTubeWithContext(context: Context, rawQuery: String): JSONObject {
+            val query = rawQuery.trim()
+            if (query.isBlank()) {
+                return JSONObject().put("status", "error").put("message", "Search query was empty.")
+            }
+            val encoded = URLEncoder.encode(query, "UTF-8")
+            val ytUri = Uri.parse("https://www.youtube.com/results?search_query=$encoded")
+            val ytIntent = Intent(Intent.ACTION_VIEW, ytUri).apply {
+                setPackage("com.google.android.youtube")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            val launchedYt = runCatching {
+                context.startActivity(ytIntent)
+                true
+            }.getOrDefault(false)
+
+            if (!launchedYt) {
+                val fallbackIntent = Intent(Intent.ACTION_VIEW, ytUri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                runCatching { context.startActivity(fallbackIntent) }
+                    .onFailure { err ->
+                        return JSONObject().put("status", "error").put("message", err.message ?: "Could not open YouTube")
+                    }
+            }
+            PilotStateHub.log(LogLevel.TOOL, "search_youtube", "Opened YouTube search for '$query'")
+            return JSONObject().put("status", "ok").put("query", query).put("in_youtube_app", launchedYt)
+        }
+
+        fun deviceControlWithContext(context: Context, action: String, value: String): JSONObject {
+            val act = action.trim().uppercase()
+            val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            return when (act) {
+                "VOLUME_UP" -> {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                    JSONObject().put("status", "ok").put("action", act)
+                }
+                "VOLUME_DOWN" -> {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+                    JSONObject().put("status", "ok").put("action", act)
+                }
+                "VOLUME_MUTE" -> {
+                    audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_TOGGLE_MUTE, AudioManager.FLAG_SHOW_UI)
+                    JSONObject().put("status", "ok").put("action", act)
+                }
+                "MEDIA_PLAY_PAUSE" -> {
+                    audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE))
+                    audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE))
+                    JSONObject().put("status", "ok").put("action", act)
+                }
+                "MEDIA_NEXT" -> {
+                    audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_NEXT))
+                    audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_NEXT))
+                    JSONObject().put("status", "ok").put("action", act)
+                }
+                "MEDIA_PREVIOUS" -> {
+                    audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PREVIOUS))
+                    audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PREVIOUS))
+                    JSONObject().put("status", "ok").put("action", act)
+                }
+                "OPEN_URL" -> {
+                    val url = value.trim().let {
+                        if (it.startsWith("http://") || it.startsWith("https://")) it else "https://$it"
+                    }
+                    val ok = runCatching {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        true
+                    }.getOrDefault(false)
+                    JSONObject().put("status", if (ok) "ok" else "error").put("url", url)
+                }
+                "DIAL_NUMBER" -> {
+                    val cleanNum = value.filter { it.isDigit() || it == '+' || it == '*' || it == '#' }
+                    if (cleanNum.isBlank()) return JSONObject().put("status", "error").put("message", "No valid phone number provided.")
+                    val ok = runCatching {
+                        context.startActivity(Intent(Intent.ACTION_DIAL, Uri.parse("tel:$cleanNum")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        true
+                    }.getOrDefault(false)
+                    JSONObject().put("status", if (ok) "ok" else "error").put("number", cleanNum)
+                }
+                "WHATSAPP_CHAT" -> {
+                    val digits = value.filter { it.isDigit() }
+                    if (digits.isBlank()) return JSONObject().put("status", "error").put("message", "Provide phone digits with country code.")
+                    val ok = runCatching {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://wa.me/$digits")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                        true
+                    }.getOrDefault(false)
+                    JSONObject().put("status", if (ok) "ok" else "error").put("number", digits)
+                }
+                else -> JSONObject().put("status", "error").put("message", "Unknown device_control action: $action")
+            }
+        }
 
         private val UI_SYNONYMS: List<List<String>> = listOf(
             listOf("send", "পাঠান", "reply", "post"),

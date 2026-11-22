@@ -1,5 +1,6 @@
 package com.example.automation
 
+import android.content.Context
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.ai.LiveToolCall
@@ -7,10 +8,12 @@ import com.example.data.AgentActivity
 import com.example.data.AskAiMessage
 import com.example.data.LogLevel
 import com.example.data.PilotStateHub
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -18,6 +21,7 @@ import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 
 class ToolDispatcher(
+    private val appContext: Context,
     private val liveClientProvider: () -> GeminiLiveClient?
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -26,7 +30,12 @@ class ToolDispatcher(
     fun dispatchCalls(calls: List<LiveToolCall>) {
         for (call in calls) {
             val job = scope.launch {
-                val result = executeSingleTool(call)
+                val result = try {
+                    executeSingleTool(call)
+                } catch (ce: CancellationException) {
+                    activeJobs.remove(call.id)
+                    throw ce
+                }
                 activeJobs.remove(call.id)
                 val ok = result.optString("status") == "ok"
                 PilotStateHub.recordToolExecuted(
@@ -53,6 +62,11 @@ class ToolDispatcher(
         PilotAccessibilityService.instance?.stopContinuousScroll()
     }
 
+    fun shutdown() {
+        cancelAllActiveActions()
+        scope.cancel()
+    }
+
     private suspend fun executeSingleTool(call: LiveToolCall): JSONObject {
         val tickerLabel = friendlyTickerForTool(call)
         PilotStateHub.updateSession {
@@ -62,24 +76,24 @@ class ToolDispatcher(
             )
         }
 
+        val args = call.args
+        val service = PilotAccessibilityService.instance
+
         // Tools that work even without AccessibilityService enabled
-        when (call.name) {
+        val contextOnlyResult: JSONObject? = when (call.name) {
             "wait_ms" -> {
-                val ms = call.args.optInt("milliseconds", 700).coerceIn(200, 5000)
+                val ms = args.optInt("milliseconds", 700).coerceIn(200, 5000)
                 delay(ms.toLong())
-                restoreListeningState()
-                return JSONObject().put("status", "ok").put("waited_ms", ms)
+                JSONObject().put("status", "ok").put("waited_ms", ms)
             }
 
             "web_search_and_answer" -> {
-                val query = call.args.optString("query", "").trim()
-                val res = executeWebSearchBridge(query)
-                restoreListeningState()
-                return res
+                val query = args.optString("query", "").trim()
+                executeWebSearchBridge(query)
             }
 
             "read_recent_notifications" -> {
-                val limit = call.args.optInt("limit", 5).coerceIn(1, 10)
+                val limit = args.optInt("limit", 5).coerceIn(1, 10)
                 val msgs = PilotStateHub.incomingMessages.value.take(limit)
                 val arr = JSONArray()
                 msgs.forEach { m ->
@@ -92,15 +106,65 @@ class ToolDispatcher(
                             .put("already_replied", !m.autoRepliedText.isNullOrBlank())
                     )
                 }
-                restoreListeningState()
-                return JSONObject()
+                JSONObject()
                     .put("status", "ok")
                     .put("count", arr.length())
                     .put("messages", arr)
             }
+
+            "get_device_status" -> {
+                service?.getDeviceStatusJson()
+                    ?: PilotAccessibilityService.getDeviceStatusWithContext(appContext)
+            }
+
+            "toggle_flashlight" -> {
+                PilotAccessibilityService.toggleFlashlightWithContext(
+                    appContext,
+                    args.optBoolean("enabled", true)
+                )
+            }
+
+            "set_alarm_or_timer" -> {
+                PilotAccessibilityService.setAlarmOrTimerWithContext(
+                    context = appContext,
+                    mode = args.optString("mode", "TIMER"),
+                    hours = args.optInt("hours", 0),
+                    minutes = args.optInt("minutes", 5),
+                    label = args.optString("label", "LivePilot AI")
+                )
+            }
+
+            "clipboard_action" -> {
+                PilotAccessibilityService.clipboardActionWithContext(
+                    context = appContext,
+                    action = args.optString("action", "READ"),
+                    text = args.optString("text", "")
+                )
+            }
+
+            "search_youtube" -> {
+                PilotAccessibilityService.searchYouTubeWithContext(
+                    context = appContext,
+                    rawQuery = args.optString("query", "")
+                )
+            }
+
+            "device_control" -> {
+                PilotAccessibilityService.deviceControlWithContext(
+                    context = appContext,
+                    action = args.optString("action", ""),
+                    value = args.optString("value", "")
+                )
+            }
+
+            else -> null
         }
 
-        val service = PilotAccessibilityService.instance
+        if (contextOnlyResult != null) {
+            restoreListeningState()
+            return contextOnlyResult
+        }
+
         if (service == null) {
             PilotStateHub.log(
                 LogLevel.ERROR,
@@ -116,23 +180,9 @@ class ToolDispatcher(
                 )
         }
 
-        val result = runCatching {
-            val args = call.args
+        val result = try {
             when (call.name) {
                 "open_app" -> service.openAppByName(args.optString("app_name", ""))
-                "search_youtube" -> service.searchYouTube(args.optString("query", ""))
-                "get_device_status" -> service.getDeviceStatusJson()
-                "toggle_flashlight" -> service.toggleFlashlight(args.optBoolean("enabled", true))
-                "set_alarm_or_timer" -> service.setAlarmOrTimer(
-                    mode = args.optString("mode", "TIMER"),
-                    hours = args.optInt("hours", 0),
-                    minutes = args.optInt("minutes", 5),
-                    label = args.optString("label", "LivePilot AI")
-                )
-                "clipboard_action" -> service.clipboardAction(
-                    action = args.optString("action", "READ"),
-                    text = args.optString("text", "")
-                )
                 "click_by_text" -> service.clickByText(
                     rawQuery = args.optString("query", ""),
                     exact = args.optBoolean("exact", false)
@@ -173,16 +223,14 @@ class ToolDispatcher(
                     pressSend = args.optBoolean("press_send", false)
                 )
                 "navigate" -> service.navigateGlobal(args.optString("action", "BACK"))
-                "device_control" -> service.deviceControl(
-                    action = args.optString("action", ""),
-                    value = args.optString("value", "")
-                )
                 "open_notification_chat" -> service.openNotificationChat(args.optString("sender_or_app", ""))
                 else -> JSONObject()
                     .put("status", "error")
                     .put("message", "Unknown tool: ${call.name}")
             }
-        }.getOrElse { err ->
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (err: Throwable) {
             PilotStateHub.log(LogLevel.ERROR, "ToolDispatcher", "${call.name} threw: ${err.message}")
             JSONObject().put("status", "error").put("message", err.message ?: "Tool execution failed")
         }
@@ -198,8 +246,8 @@ class ToolDispatcher(
             return JSONObject().put("status", "error").put("message", "Search query was empty.")
         }
         val settings = PilotStateHub.settings.value
-        if (settings.apiKey.isBlank()) {
-            return JSONObject().put("status", "error").put("message", "API key missing.")
+        if (!settings.hasAnyApiKey) {
+            return JSONObject().put("status", "error").put("message", "No Gemini API key configured.")
         }
         PilotStateHub.log(LogLevel.TOOL, "WebSearch", "Live Google Search: $query")
         val promptHistory = listOf(
@@ -211,7 +259,7 @@ class ToolDispatcher(
             )
         )
         val result = GeminiRestClient.generateChatTurn(
-            apiKey = settings.apiKey,
+            apiKey = settings.effectiveApiKey,
             modelId = settings.textModel,
             history = promptHistory,
             enableGoogleSearch = true

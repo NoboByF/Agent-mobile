@@ -102,14 +102,26 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 return START_NOT_STICKY
             }
             ACTION_TOGGLE_MUTE -> {
+                if (liveClient == null) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 toggleMute()
                 return START_STICKY
             }
             ACTION_SNAP_VISION -> {
+                if (liveClient == null) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 triggerManualVisionCapture()
                 return START_STICKY
             }
             ACTION_UPDATE_SPEAKER -> {
+                if (liveClient == null) {
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 val speaker = intent.getBooleanExtra(EXTRA_SPEAKER, true)
                 audioEngine?.setSpeakerphone(speaker)
                 PilotStateHub.updateSession { it.copy(isSpeakerOn = speaker) }
@@ -176,7 +188,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
 
         val client = GeminiLiveClient(callbacks = this)
         liveClient = client
-        toolDispatcher = ToolDispatcher { liveClient }
+        toolDispatcher = ToolDispatcher(applicationContext) { liveClient }
 
         if (Settings.canDrawOverlays(this)) {
             attachFloatingPillOverlay()
@@ -186,7 +198,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
 
         observeSessionStateForOverlay()
         client.connect(
-            apiKey = settings.apiKey,
+            apiKey = settings.effectiveApiKey,
             modelId = settings.liveModel,
             voiceName = settings.voiceName,
             customInstructions = settings.customVoiceInstructions
@@ -198,11 +210,13 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     override fun onSetupComplete() {
         val settings = PilotStateHub.settings.value
         audioEngine?.start(speakerphone = settings.speakerphoneOn)
+        val currentlyMuted = PilotStateHub.sessionState.value.isMuted
+        audioEngine?.setMuted(currentlyMuted)
         PilotStateHub.updateSession {
             it.copy(
                 phase = LiveConnectionPhase.READY,
-                activity = AgentActivity.LISTENING,
-                statusTicker = "Listening..."
+                activity = if (currentlyMuted) AgentActivity.MUTED else AgentActivity.LISTENING,
+                statusTicker = if (currentlyMuted) "Mic muted" else "Listening..."
             )
         }
         if (PilotStateHub.sessionState.value.isAutoVisionActive) {
@@ -371,12 +385,20 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     override fun endCallSession() {
+        cleanupSessionResources()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun cleanupSessionResources() {
         PilotStateHub.activeController = null
         PilotStateHub.pendingStartupCommand = null
         autoVisionJob?.cancel()
         autoVisionJob = null
         stateObserverJob?.cancel()
-        toolDispatcher?.cancelAllActiveActions()
+        stateObserverJob = null
+        toolDispatcher?.shutdown()
+        toolDispatcher = null
         audioEngine?.stop()
         audioEngine = null
         liveClient?.disconnect()
@@ -395,11 +417,10 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 aiAudioLevel = 0f,
                 callStartedAtMs = null,
                 lastCaptionPreview = "",
+                activeKeyLabel = null,
                 statusTicker = "Ready to pilot your phone"
             )
         }
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
     }
 
     override fun setOverlayTemporarilyHidden(hidden: Boolean) {
@@ -718,14 +739,17 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                     val dy = (event.rawY - initialTouchY).toInt()
                     if (abs(dx) > 6 || abs(dy) > 6) {
                         moved = true
+                        val maxY = (resources.displayMetrics.heightPixels - dp(84)).coerceAtLeast(dp(48))
                         params.x = initialX + dx
-                        params.y = initialY + dy
-                        runCatching { wm.updateViewLayout(view, params) }
+                        params.y = (initialY + dy).coerceIn(dp(20), maxY)
+                        if (view.isAttachedToWindow) {
+                            runCatching { wm.updateViewLayout(view, params) }
+                        }
                     }
                     true
                 }
-                MotionEvent.ACTION_UP -> {
-                    if (!moved && isCompactMode) {
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (!moved && event.action == MotionEvent.ACTION_UP && isCompactMode) {
                         toggleCompactMode()
                     } else if (moved) {
                         // Snap smoothly to nearest horizontal screen edge
@@ -743,7 +767,9 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                             interpolator = OvershootInterpolator(0.8f)
                             addUpdateListener { anim ->
                                 params.x = anim.animatedValue as Int
-                                runCatching { wm.updateViewLayout(view, params) }
+                                if (view.isAttachedToWindow) {
+                                    runCatching { wm.updateViewLayout(view, params) }
+                                }
                             }
                             start()
                         }
@@ -901,9 +927,8 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         ).toInt()
 
     override fun onDestroy() {
-        autoVisionJob?.cancel()
+        cleanupSessionResources()
         serviceScope.cancel()
-        removeFloatingOverlay()
         super.onDestroy()
     }
 

@@ -32,24 +32,118 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Generate personal release upload keystore
+      - name: Check signing secrets configuration
+        id: detect-secret
+        env:
+          SECRET_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
         run: |
-          keytool -genkeypair -noprompt \
-            -keystore "$GITHUB_WORKSPACE/my-upload-key.jks" \
-            -alias upload \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -storepass "livepilot1234" \
-            -keypass "livepilot1234" \
-            -dname "CN=LivePilot AI, OU=Personal, O=LivePilot, L=Dhaka, ST=Dhaka, C=BD"
+          if [ -n "$SECRET_KEYSTORE_B64" ]; then
+            echo "has_secret=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_secret=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore cached release keystore (fallback when Secrets not yet set)
+        id: cache-keystore
+        if: ${{ steps.detect-secret.outputs.has_secret != 'true' }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.livepilot-signing
+          key: livepilot-release-keystore-v1
+
+      - name: Prepare persistent release upload keystore
+        id: prepare-keystore
+        env:
+          SECRET_KEYSTORE_B64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          SECRET_STORE_PASS: ${{ secrets.RELEASE_STORE_PASSWORD }}
+          SECRET_KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          SIGN_DIR="$HOME/.livepilot-signing"
+          TARGET_JKS="$GITHUB_WORKSPACE/my-upload-key.jks"
+          mkdir -p "$SIGN_DIR"
+
+          if [ -n "$SECRET_KEYSTORE_B64" ]; then
+            echo "Using permanent release keystore from GitHub Secrets."
+            printf '%s' "$SECRET_KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$TARGET_JKS"
+            STORE_PASS="${SECRET_STORE_PASS:?Missing GitHub Secret RELEASE_STORE_PASSWORD}"
+            KEY_PASS="${SECRET_KEY_PASS:-$STORE_PASS}"
+            echo "source=GitHub Secrets (Permanent)" >> "$GITHUB_OUTPUT"
+            echo "newly_generated=false" >> "$GITHUB_OUTPUT"
+          elif [ -f "$SIGN_DIR/my-upload-key.jks" ] && [ -f "$SIGN_DIR/pass.txt" ]; then
+            echo "Restored persistent release keystore from GitHub Actions cache."
+            cp "$SIGN_DIR/my-upload-key.jks" "$TARGET_JKS"
+            STORE_PASS="$(cat "$SIGN_DIR/pass.txt")"
+            KEY_PASS="$STORE_PASS"
+            echo "::add-mask::$STORE_PASS"
+            echo "source=Actions Cache (Same Keystore)" >> "$GITHUB_OUTPUT"
+            echo "newly_generated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "First-time setup: generating new persistent release keystore (alias=upload)."
+            STORE_PASS="$(openssl rand -hex 12)"
+            KEY_PASS="$STORE_PASS"
+            echo "::add-mask::$STORE_PASS"
+
+            keytool -genkeypair -noprompt \
+              -keystore "$SIGN_DIR/my-upload-key.jks" \
+              -alias upload \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -storepass "$STORE_PASS" \
+              -keypass "$KEY_PASS" \
+              -dname "CN=LivePilot AI, OU=Release, O=LivePilot, L=Dhaka, ST=Dhaka, C=BD"
+
+            printf '%s' "$STORE_PASS" > "$SIGN_DIR/pass.txt"
+            chmod 600 "$SIGN_DIR/my-upload-key.jks" "$SIGN_DIR/pass.txt"
+            cp "$SIGN_DIR/my-upload-key.jks" "$TARGET_JKS"
+
+            mkdir -p "$GITHUB_WORKSPACE/keystore-setup"
+            base64 -w 0 "$SIGN_DIR/my-upload-key.jks" > "$GITHUB_WORKSPACE/keystore-setup/RELEASE_KEYSTORE_BASE64.txt"
+            cat > "$GITHUB_WORKSPACE/keystore-setup/SETUP_INSTRUCTIONS.txt" <<EOF
+          Add these 3 GitHub Repository Secrets (Settings -> Secrets and variables -> Actions -> New repository secret)
+          so this EXACT same keystore is preserved permanently (even beyond GitHub's 7-day cache window):
+
+          1) RELEASE_KEYSTORE_BASE64 : Copy entire contents of RELEASE_KEYSTORE_BASE64.txt
+          2) RELEASE_STORE_PASSWORD  : $STORE_PASS
+          3) RELEASE_KEY_PASSWORD    : $KEY_PASS
+
+          IMPORTANT: Keep this file private and delete the artifact from GitHub Actions after saving the secrets.
+          EOF
+
+            echo "source=Newly Generated & Cached" >> "$GITHUB_OUTPUT"
+            echo "newly_generated=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          FINGERPRINT=$(keytool -list -v -keystore "$TARGET_JKS" -alias upload -storepass "$STORE_PASS" | awk -F'SHA256: ' '/SHA256:/ && !found {print $2; found=1}')
+          NEXT_VERSION_CODE=$((100 + GITHUB_RUN_NUMBER))
+          NEXT_VERSION_NAME="2.0.${GITHUB_RUN_NUMBER}"
+
+          echo "sha256=$FINGERPRINT" >> "$GITHUB_OUTPUT"
+          echo "version_code=$NEXT_VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "version_name=$NEXT_VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "KEYSTORE_PATH=$TARGET_JKS" >> "$GITHUB_ENV"
+          echo "STORE_PASSWORD=$STORE_PASS" >> "$GITHUB_ENV"
+          echo "KEY_PASSWORD=$KEY_PASS" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$NEXT_VERSION_CODE" >> "$GITHUB_ENV"
+          echo "VERSION_NAME=$NEXT_VERSION_NAME" >> "$GITHUB_ENV"
 
       - name: Build Signed Release APK
-        env:
-          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
-          STORE_PASSWORD: livepilot1234
-          KEY_PASSWORD: livepilot1234
         run: gradle :app:assembleRelease --no-daemon
+
+      - name: Publish signing summary
+        run: |
+          {
+            echo "### LivePilot AI Release Build #${{ github.run_number }}"
+            echo "- **Version:** \`${{ steps.prepare-keystore.outputs.version_name }}\` (versionCode \`${{ steps.prepare-keystore.outputs.version_code }}\`)"
+            echo "- **Keystore Source:** ${{ steps.prepare-keystore.outputs.source }}"
+            echo "- **Certificate SHA-256:** \`${{ steps.prepare-keystore.outputs.sha256 }}\`"
+            if [ "${{ steps.prepare-keystore.outputs.newly_generated }}" = "true" ]; then
+              echo ""
+              echo "> **Action Recommended (One-Time):** Download \`LivePilot-Keystore-Setup-PRIVATE\` artifact once, save the 3 values in **Settings → Secrets and variables → Actions**, then delete that artifact so updates work forever."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload LivePilot AI Release APK
         uses: actions/upload-artifact@v4
@@ -57,3 +151,12 @@ jobs:
           name: LivePilot-AI-Release-APK
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
+
+      - name: Upload one-time keystore setup pack (only when Secrets not configured yet)
+        if: ${{ steps.prepare-keystore.outputs.newly_generated == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: LivePilot-Keystore-Setup-PRIVATE
+          path: keystore-setup/
+          retention-days: 1
+          if-no-files-found: ignore

@@ -239,7 +239,7 @@ fun HomeScreen(
         }
 
         // Missing API key callout
-        if (settings.apiKey.isBlank()) {
+        if (!settings.hasAnyApiKey) {
             item {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -423,6 +423,22 @@ fun HomeScreen(
                                     containerColor = if (isLive) Color(0xFF4C1D95).copy(alpha = 0.55f) else palette.violetSoft,
                                     leadingDot = false
                                 )
+                            }
+                            if (settings.apiKeys.size > 1 || !sessionState.activeKeyLabel.isNullOrBlank()) {
+                                val keyLabel = sessionState.activeKeyLabel
+                                    ?: settings.activeKeyDisplayLabel
+                                    ?: "Key 1"
+                                val poolSuffix = if (settings.apiKeys.size > 1) {
+                                    " (${settings.healthyKeyCount()}/${settings.apiKeys.size})"
+                                } else ""
+                                item {
+                                    StatusPillBadge(
+                                        label = "$keyLabel$poolSuffix",
+                                        accentColor = if (isLive) Color(0xFF67E8F9) else palette.cyanAccent,
+                                        containerColor = if (isLive) Color(0xFF164E63).copy(alpha = 0.65f) else palette.cyanSoft,
+                                        leadingDot = false
+                                    )
+                                }
                             }
                             if (isLive) {
                                 item {

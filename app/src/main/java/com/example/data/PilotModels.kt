@@ -179,6 +179,51 @@ data class ConnectionTestState(
     val latencyMs: Long? = null
 )
 
+enum class ApiKeyStatus {
+    ACTIVE,
+    READY,
+    COOLDOWN,
+    INVALID,
+    DISABLED
+}
+
+data class GeminiApiKeyEntry(
+    val id: String,
+    val label: String,
+    val key: String,
+    val enabled: Boolean = true,
+    val cooldownUntilMs: Long = 0L,
+    val isInvalid: Boolean = false,
+    val lastError: String? = null,
+    val totalRequests: Int = 0,
+    val lastUsedAtMs: Long = 0L
+) {
+    fun isCoolingDown(nowMs: Long = System.currentTimeMillis()): Boolean =
+        cooldownUntilMs > nowMs
+
+    fun remainingCooldownSec(nowMs: Long = System.currentTimeMillis()): Long =
+        ((cooldownUntilMs - nowMs) / 1000L).coerceAtLeast(0L)
+
+    fun isAvailable(nowMs: Long = System.currentTimeMillis()): Boolean =
+        enabled && key.isNotBlank() && !isInvalid && !isCoolingDown(nowMs)
+
+    fun status(activeId: String?, nowMs: Long = System.currentTimeMillis()): ApiKeyStatus = when {
+        !enabled -> ApiKeyStatus.DISABLED
+        isInvalid -> ApiKeyStatus.INVALID
+        isCoolingDown(nowMs) -> ApiKeyStatus.COOLDOWN
+        id == activeId -> ApiKeyStatus.ACTIVE
+        else -> ApiKeyStatus.READY
+    }
+
+    fun maskedKey(): String {
+        val clean = key.trim()
+        return when {
+            clean.length <= 8 -> "••••••••"
+            else -> "${clean.take(6)}••••${clean.takeLast(4)}"
+        }
+    }
+}
+
 data class LiveSessionState(
     val isServiceRunning: Boolean = false,
     val phase: LiveConnectionPhase = LiveConnectionPhase.IDLE,
@@ -194,12 +239,16 @@ data class LiveSessionState(
     val toolsExecutedCount: Int = 0,
     val lastToolSummary: String? = null,
     val lastCaptionPreview: String = "",
+    val activeKeyLabel: String? = null,
     val sessionHandle: String? = null,
     val lastError: String? = null
 )
 
 data class PilotSettings(
     val apiKey: String = "",
+    val apiKeys: List<GeminiApiKeyEntry> = emptyList(),
+    val activeApiKeyId: String? = null,
+    val autoRotateApiKeys: Boolean = true,
     val liveModel: String = DEFAULT_LIVE_MODEL,
     val textModel: String = DEFAULT_TEXT_MODEL,
     val voiceName: String = DEFAULT_VOICE,
@@ -220,6 +269,25 @@ data class PilotSettings(
         MessagingApp.TELEGRAM
     )
 ) {
+    val hasAnyApiKey: Boolean
+        get() = apiKeys.any { it.enabled && it.key.isNotBlank() } || apiKey.isNotBlank()
+
+    val effectiveApiKey: String
+        get() {
+            val active = apiKeys.firstOrNull { it.id == activeApiKeyId && it.enabled && it.key.isNotBlank() }
+                ?: apiKeys.firstOrNull { it.enabled && it.key.isNotBlank() }
+            return active?.key ?: apiKey
+        }
+
+    val activeKeyDisplayLabel: String?
+        get() = apiKeys.firstOrNull { it.id == activeApiKeyId }?.label
+            ?: apiKeys.firstOrNull { it.enabled && it.key.isNotBlank() }?.label
+
+    fun healthyKeyCount(nowMs: Long = System.currentTimeMillis()): Int {
+        if (apiKeys.isNotEmpty()) return apiKeys.count { it.isAvailable(nowMs) }
+        return if (apiKey.isNotBlank()) 1 else 0
+    }
+
     companion object {
         const val DEFAULT_LIVE_MODEL = "gemini-3.8-live"
         const val DEFAULT_TEXT_MODEL = "gemini-4-hydrogen"

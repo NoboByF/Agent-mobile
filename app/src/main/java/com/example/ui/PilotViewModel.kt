@@ -8,6 +8,7 @@ import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.ai.ApiKeyPoolManager
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.automation.PilotAccessibilityService
@@ -117,8 +118,13 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val currentSettings = settings.value
-        if (currentSettings.apiKey.isBlank()) {
-            _bannerMessage.value = "Add your Gemini API Key in Settings before starting a live call."
+        if (!currentSettings.hasAnyApiKey) {
+            _bannerMessage.value = "Add at least one Gemini API Key in Settings before starting a live call."
+            return
+        }
+        val selection = ApiKeyPoolManager.selectBestKey(currentSettings)
+        if (selection.entry == null) {
+            _bannerMessage.value = ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
             return
         }
         refreshPermissions()
@@ -141,8 +147,13 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         val currentSettings = settings.value
-        if (currentSettings.apiKey.isBlank()) {
-            _bannerMessage.value = "Add your Gemini API Key in Settings first to run '${routine.title}'."
+        if (!currentSettings.hasAnyApiKey) {
+            _bannerMessage.value = "Add at least one Gemini API Key in Settings first to run '${routine.title}'."
+            return
+        }
+        val selection = ApiKeyPoolManager.selectBestKey(currentSettings)
+        if (selection.entry == null) {
+            _bannerMessage.value = ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
             return
         }
         refreshPermissions()
@@ -220,7 +231,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _connectionTest.value = ConnectionTestState(isTesting = true, message = "Testing v1beta handshake...")
             val (ok, message, latency) = GeminiLiveClient.testLiveHandshake(
-                apiKey = current.apiKey,
+                apiKey = current.effectiveApiKey,
                 modelId = current.liveModel,
                 voiceName = current.voiceName
             )
@@ -235,7 +246,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
     fun fetchModels() {
         if (_isFetchingModels.value) return
-        val key = settings.value.apiKey
+        val key = settings.value.effectiveApiKey
         viewModelScope.launch {
             _isFetchingModels.value = true
             _modelFetchStatus.value = "Querying v1beta/models..."
@@ -250,6 +261,41 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             }
             _isFetchingModels.value = false
         }
+    }
+
+    // --- Multi-Gemini API Key Pool Management ---
+
+    fun addApiKeys(rawInput: String, customLabel: String = "") {
+        val (added, duplicates) = ApiKeyPoolManager.addKeysFromInput(rawInput, customLabel)
+        _bannerMessage.value = when {
+            added > 0 && duplicates > 0 -> "Added $added API key(s) ($duplicates duplicate skipped)."
+            added > 0 -> "Added $added Gemini API key(s) to failover pool."
+            duplicates > 0 -> "This API key is already saved in your pool."
+            else -> "Paste a valid Gemini API key first."
+        }
+    }
+
+    fun removeApiKey(keyId: String) {
+        ApiKeyPoolManager.removeKey(keyId)
+    }
+
+    fun setActiveApiKey(keyId: String) {
+        ApiKeyPoolManager.setActiveKey(keyId)
+        val label = settings.value.activeKeyDisplayLabel ?: "Selected key"
+        _bannerMessage.value = "Active API key switched to $label."
+    }
+
+    fun toggleApiKeyEnabled(keyId: String) {
+        ApiKeyPoolManager.toggleKeyEnabled(keyId)
+    }
+
+    fun updateAutoRotateApiKeys(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(autoRotateApiKeys = enabled) }
+    }
+
+    fun resetApiKeyHealth() {
+        ApiKeyPoolManager.resetAllKeyHealth()
+        _bannerMessage.value = "Cleared cooldown & error flags for all saved API keys."
     }
 
     // --- Settings Updates ---
@@ -341,6 +387,14 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         val clean = promptText.trim()
         if (clean.isEmpty() || _askAiState.value.isGenerating) return
 
+        val currentSettings = settings.value
+        if (!currentSettings.hasAnyApiKey) {
+            _askAiState.update {
+                it.copy(errorText = "Add at least one Gemini API Key in Settings to use Ask AI.")
+            }
+            return
+        }
+
         val userMsg = AskAiMessage(
             id = chatIdCounter.getAndIncrement(),
             isUser = true,
@@ -357,22 +411,26 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        val currentSettings = settings.value
         val searchEnabled = _askAiState.value.searchGroundingEnabled
         viewModelScope.launch {
             val result = GeminiRestClient.generateChatTurn(
-                apiKey = currentSettings.apiKey,
+                apiKey = currentSettings.effectiveApiKey,
                 modelId = currentSettings.textModel,
                 history = updatedHistory,
                 enableGoogleSearch = searchEnabled
             )
             result.onSuccess { gen ->
+                val modelBadge = if (!gen.keyLabelUsed.isNullOrBlank() && settings.value.apiKeys.size > 1) {
+                    "${gen.modelUsed} • ${gen.keyLabelUsed}"
+                } else {
+                    gen.modelUsed
+                }
                 val aiMsg = AskAiMessage(
                     id = chatIdCounter.getAndIncrement(),
                     isUser = false,
                     text = gen.text,
                     citations = gen.citations,
-                    modelUsed = gen.modelUsed,
+                    modelUsed = modelBadge,
                     timestamp = PilotStateHub.formatNow()
                 )
                 val finalHistory = _askAiState.value.messages + aiMsg
@@ -388,7 +446,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 _askAiState.update {
                     it.copy(
                         isGenerating = false,
-                        errorText = err.message ?: "Request failed. Check API key or select another text model in Settings."
+                        errorText = err.message ?: "Request failed. Check API keys or select another text model in Settings."
                     )
                 }
             }
@@ -442,14 +500,14 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     fun sendQuickAiReplyFromFeed(record: IncomingMessageRecord) {
         val handle = PilotStateHub.getNotificationHandleById(record.id)
         val currentSettings = settings.value
-        if (currentSettings.apiKey.isBlank()) {
-            _bannerMessage.value = "Configure your Gemini API Key in Settings first."
+        if (!currentSettings.hasAnyApiKey) {
+            _bannerMessage.value = "Configure at least one Gemini API Key in Settings first."
             return
         }
 
         viewModelScope.launch {
             val replyResult = GeminiRestClient.generateAutoReply(
-                apiKey = currentSettings.apiKey,
+                apiKey = currentSettings.effectiveApiKey,
                 modelId = currentSettings.textModel,
                 personaPrompt = currentSettings.autoReplyPersona,
                 appName = record.app.displayName,

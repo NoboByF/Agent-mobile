@@ -23,8 +23,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -42,12 +45,14 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.core.view.WindowCompat
@@ -56,6 +61,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.data.PilotRoutine
 import com.example.ui.PilotViewModel
 import com.example.ui.components.FloatingPilotBottomBar
 import com.example.ui.components.PilotTab
@@ -123,11 +129,31 @@ private fun LivePilotAppRoot(
     val askAiState by viewModel.askAiState.collectAsStateWithLifecycle()
     val bannerMessage by viewModel.bannerMessage.collectAsStateWithLifecycle()
 
+    var pendingStartCallAfterPerm by remember { mutableStateOf(false) }
+    var pendingRoutineAfterPerm by remember { mutableStateOf<PilotRoutine?>(null) }
+
     val runtimePermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) {
+    ) { result ->
         viewModel.refreshPermissions()
+        val micNowGranted = result[Manifest.permission.RECORD_AUDIO] == true
+        if (micNowGranted) {
+            val routine = pendingRoutineAfterPerm
+            pendingRoutineAfterPerm = null
+            if (routine != null) {
+                pendingStartCallAfterPerm = false
+                viewModel.launchRoutine(routine)
+            } else if (pendingStartCallAfterPerm) {
+                pendingStartCallAfterPerm = false
+                viewModel.startOrStopLiveCall()
+            }
+        } else {
+            pendingStartCallAfterPerm = false
+            pendingRoutineAfterPerm = null
+        }
     }
+
+    val isKeyboardVisible = WindowInsets.ime.getBottom(LocalDensity.current) > 0
 
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
@@ -148,6 +174,7 @@ private fun LivePilotAppRoot(
             .fillMaxSize()
             .background(palette.background)
             .statusBarsPadding()
+            .imePadding()
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             AnimatedVisibility(
@@ -205,13 +232,16 @@ private fun LivePilotAppRoot(
                             recentToolEvents = recentToolEvents,
                             routines = routines,
                             onStartOrStopCall = {
-                                val needed = buildList {
-                                    add(Manifest.permission.RECORD_AUDIO)
-                                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                        add(Manifest.permission.POST_NOTIFICATIONS)
+                                if (sessionState.isServiceRunning) {
+                                    viewModel.startOrStopLiveCall()
+                                } else if (!permissions.micGranted) {
+                                    val needed = buildList {
+                                        add(Manifest.permission.RECORD_AUDIO)
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                            add(Manifest.permission.POST_NOTIFICATIONS)
+                                        }
                                     }
-                                }
-                                if (!permissions.micGranted) {
+                                    pendingStartCallAfterPerm = true
                                     runtimePermLauncher.launch(needed.toTypedArray())
                                 } else {
                                     viewModel.startOrStopLiveCall()
@@ -231,6 +261,7 @@ private fun LivePilotAppRoot(
                                             add(Manifest.permission.POST_NOTIFICATIONS)
                                         }
                                     }
+                                    pendingRoutineAfterPerm = routine
                                     runtimePermLauncher.launch(needed.toTypedArray())
                                 } else {
                                     viewModel.launchRoutine(routine)
@@ -306,7 +337,12 @@ private fun LivePilotAppRoot(
                             isFetchingModels = isFetchingModels,
                             modelFetchStatus = modelFetchStatus,
                             logs = logs,
-                            onUpdateApiKey = { viewModel.updateApiKey(it) },
+                            onAddApiKeys = { raw, label -> viewModel.addApiKeys(raw, label) },
+                            onSetActiveApiKey = { viewModel.setActiveApiKey(it) },
+                            onToggleApiKeyEnabled = { viewModel.toggleApiKeyEnabled(it) },
+                            onRemoveApiKey = { viewModel.removeApiKey(it) },
+                            onToggleAutoRotateKeys = { viewModel.updateAutoRotateApiKeys(it) },
+                            onResetApiKeyHealth = { viewModel.resetApiKeyHealth() },
                             onUpdateLiveModel = { viewModel.updateLiveModel(it) },
                             onUpdateTextModel = { viewModel.updateTextModel(it) },
                             onFetchModels = { viewModel.fetchModels() },
@@ -326,11 +362,13 @@ private fun LivePilotAppRoot(
             }
         }
 
-        FloatingPilotBottomBar(
-            selectedTab = selectedTab,
-            onSelectTab = { selectedTab = it },
-            unreadMessageCount = incomingMessages.size,
-            modifier = Modifier.align(Alignment.BottomCenter)
-        )
+        if (!isKeyboardVisible) {
+            FloatingPilotBottomBar(
+                selectedTab = selectedTab,
+                onSelectTab = { selectedTab = it },
+                unreadMessageCount = incomingMessages.size,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        }
     }
 }

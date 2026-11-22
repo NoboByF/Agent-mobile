@@ -41,8 +41,34 @@ class PilotPreferences(context: Context) {
             )
         }.getOrDefault(AppThemeMode.SYSTEM)
 
+        val legacySingleKey = prefs.getString(KEY_API_KEY, "").orEmpty().trim()
+        val parsedKeys = loadApiKeysJson()
+        val migratedKeys = if (parsedKeys.isEmpty() && legacySingleKey.isNotBlank()) {
+            listOf(
+                GeminiApiKeyEntry(
+                    id = "key_primary",
+                    label = "Key 1",
+                    key = legacySingleKey,
+                    enabled = true
+                )
+            )
+        } else {
+            parsedKeys
+        }
+        val savedActiveId = prefs.getString(KEY_ACTIVE_API_KEY_ID, null)
+        val resolvedActiveId = when {
+            migratedKeys.any { it.id == savedActiveId } -> savedActiveId
+            else -> migratedKeys.firstOrNull { it.enabled }?.id ?: migratedKeys.firstOrNull()?.id
+        }
+        val effectiveKey = migratedKeys.firstOrNull { it.id == resolvedActiveId }?.key
+            ?: migratedKeys.firstOrNull { it.enabled }?.key
+            ?: legacySingleKey
+
         return PilotSettings(
-            apiKey = prefs.getString(KEY_API_KEY, "").orEmpty(),
+            apiKey = effectiveKey,
+            apiKeys = migratedKeys,
+            activeApiKeyId = resolvedActiveId,
+            autoRotateApiKeys = prefs.getBoolean(KEY_AUTO_ROTATE_API_KEYS, true),
             liveModel = prefs.getString(KEY_LIVE_MODEL, PilotSettings.DEFAULT_LIVE_MODEL)
                 .orEmpty()
                 .ifBlank { PilotSettings.DEFAULT_LIVE_MODEL },
@@ -70,8 +96,30 @@ class PilotPreferences(context: Context) {
     }
 
     fun saveSettings(settings: PilotSettings) {
+        val syncedKeys = if (settings.apiKeys.isEmpty() && settings.apiKey.isNotBlank()) {
+            listOf(
+                GeminiApiKeyEntry(
+                    id = "key_primary",
+                    label = "Key 1",
+                    key = settings.apiKey.trim(),
+                    enabled = true
+                )
+            )
+        } else {
+            settings.apiKeys
+        }
+        val activeId = settings.activeApiKeyId?.takeIf { id -> syncedKeys.any { it.id == id } }
+            ?: syncedKeys.firstOrNull { it.enabled }?.id
+            ?: syncedKeys.firstOrNull()?.id
+        val mirrorKey = syncedKeys.firstOrNull { it.id == activeId }?.key
+            ?: syncedKeys.firstOrNull { it.enabled }?.key
+            ?: settings.apiKey.trim()
+
         prefs.edit()
-            .putString(KEY_API_KEY, settings.apiKey.trim())
+            .putString(KEY_API_KEY, mirrorKey)
+            .putString(KEY_API_KEYS_JSON, serializeApiKeysJson(syncedKeys))
+            .putString(KEY_ACTIVE_API_KEY_ID, activeId)
+            .putBoolean(KEY_AUTO_ROTATE_API_KEYS, settings.autoRotateApiKeys)
             .putString(KEY_LIVE_MODEL, settings.liveModel.trim().removePrefix("models/"))
             .putString(KEY_TEXT_MODEL, settings.textModel.trim().removePrefix("models/"))
             .putString(KEY_VOICE_NAME, settings.voiceName.trim())
@@ -87,6 +135,53 @@ class PilotPreferences(context: Context) {
             .putString(KEY_AUTO_REPLY_PERSONA, settings.autoReplyPersona.trim())
             .putStringSet(KEY_ENABLED_APPS, settings.enabledMessagingApps.map { it.name }.toSet())
             .apply()
+    }
+
+    private fun loadApiKeysJson(): List<GeminiApiKeyEntry> {
+        val raw = prefs.getString(KEY_API_KEYS_JSON, null)
+        if (raw.isNullOrBlank()) return emptyList()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    if (key.isBlank()) continue
+                    add(
+                        GeminiApiKeyEntry(
+                            id = obj.optString("id", "key_$i").ifBlank { "key_$i" },
+                            label = obj.optString("label", "Key ${i + 1}").ifBlank { "Key ${i + 1}" },
+                            key = key,
+                            enabled = obj.optBoolean("enabled", true),
+                            cooldownUntilMs = obj.optLong("cooldownUntilMs", 0L),
+                            isInvalid = obj.optBoolean("isInvalid", false),
+                            lastError = obj.optString("lastError", "").ifBlank { null },
+                            totalRequests = obj.optInt("totalRequests", 0),
+                            lastUsedAtMs = obj.optLong("lastUsedAtMs", 0L)
+                        )
+                    )
+                }
+            }
+        }.getOrDefault(emptyList())
+    }
+
+    private fun serializeApiKeysJson(keys: List<GeminiApiKeyEntry>): String {
+        val arr = JSONArray()
+        keys.forEach { entry ->
+            arr.put(
+                JSONObject()
+                    .put("id", entry.id)
+                    .put("label", entry.label)
+                    .put("key", entry.key.trim())
+                    .put("enabled", entry.enabled)
+                    .put("cooldownUntilMs", entry.cooldownUntilMs)
+                    .put("isInvalid", entry.isInvalid)
+                    .put("lastError", entry.lastError.orEmpty())
+                    .put("totalRequests", entry.totalRequests)
+                    .put("lastUsedAtMs", entry.lastUsedAtMs)
+            )
+        }
+        return arr.toString()
     }
 
     fun loadRoutines(): List<PilotRoutine> {
@@ -191,6 +286,9 @@ class PilotPreferences(context: Context) {
     companion object {
         private const val PREFS_NAME = "livepilot_ai_secure_prefs"
         private const val KEY_API_KEY = "gemini_api_key"
+        private const val KEY_API_KEYS_JSON = "gemini_api_keys_json"
+        private const val KEY_ACTIVE_API_KEY_ID = "gemini_active_api_key_id"
+        private const val KEY_AUTO_ROTATE_API_KEYS = "gemini_auto_rotate_api_keys"
         private const val KEY_LIVE_MODEL = "live_model_id"
         private const val KEY_TEXT_MODEL = "text_model_id"
         private const val KEY_VOICE_NAME = "live_voice_name"

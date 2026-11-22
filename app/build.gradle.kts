@@ -16,8 +16,8 @@ android {
     applicationId = "com.aistudio.livepilotai.k7m2x9"
     minSdk = 30
     targetSdk = 34
-    versionCode = 1
-    versionName = "1.0"
+    versionCode = providers.environmentVariable("VERSION_CODE").orNull?.toIntOrNull() ?: 2
+    versionName = providers.environmentVariable("VERSION_NAME").orNull?.takeIf { it.isNotBlank() } ?: "2.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

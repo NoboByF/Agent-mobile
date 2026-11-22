@@ -18,6 +18,7 @@ import com.example.data.PilotStateHub
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.UUID
@@ -34,6 +35,11 @@ class IncomingMessageListener : NotificationListenerService() {
         PilotStateHub.log(LogLevel.INFO, "AutoChat", "IncomingMessageListener connected.")
     }
 
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
+    }
+
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
         PilotStateHub.ensureInitialized(applicationContext)
@@ -42,8 +48,9 @@ class IncomingMessageListener : NotificationListenerService() {
         val messagingApp = MessagingApp.fromPackage(pkg) ?: return
         val notification = sbn.notification ?: return
 
-        // Ignore ongoing call/group summary shell notifications
+        // Ignore ongoing call/status notifications and group summary shells
         if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+        if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
 
         val extras = notification.extras ?: return
         val sender = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
@@ -110,14 +117,14 @@ class IncomingMessageListener : NotificationListenerService() {
     ) {
         scope.launch {
             val settings = PilotStateHub.settings.value
-            if (settings.apiKey.isBlank()) {
+            if (!settings.hasAnyApiKey) {
                 PilotStateHub.log(LogLevel.ERROR, "AutoReply", "Skipped auto-reply: API key not set.")
                 return@launch
             }
 
             if (settings.autoReplyDelivery == AutoReplyDelivery.SILENT_DIRECT_REPLY && replyAction != null) {
                 val replyResult = GeminiRestClient.generateAutoReply(
-                    apiKey = settings.apiKey,
+                    apiKey = settings.effectiveApiKey,
                     modelId = settings.textModel,
                     personaPrompt = settings.autoReplyPersona,
                     appName = record.app.displayName,
@@ -155,7 +162,7 @@ class IncomingMessageListener : NotificationListenerService() {
                 delay(1400)
                 val screenJson = accessibility.getScreenUiJson().toString()
                 val replyResult = GeminiRestClient.generateAutoReply(
-                    apiKey = settings.apiKey,
+                    apiKey = settings.effectiveApiKey,
                     modelId = settings.textModel,
                     personaPrompt = settings.autoReplyPersona,
                     appName = record.app.displayName,

@@ -36,7 +36,7 @@ class PilotQuickTileService : TileService() {
             return
         }
 
-        val hasKey = PilotStateHub.settings.value.apiKey.isNotBlank()
+        val hasKey = PilotStateHub.settings.value.hasAnyApiKey
         val hasMic = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.RECORD_AUDIO
