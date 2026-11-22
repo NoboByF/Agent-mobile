@@ -117,7 +117,7 @@ object SmartSearchAndFinder {
                 val r = Rect()
                 searchTrigger.getBoundsInScreen(r)
                 PilotStateHub.activeController?.showTouchIndicator(r.centerX(), r.centerY(), "Search")
-                val clicked = tryClickNodeOrAncestors(searchTrigger)
+                val clicked = if (currentPkg !in BROWSER_PACKAGES) tryClickNodeOrAncestors(searchTrigger) else false
                 if (!clicked && r.width() > 0 && r.height() > 0) {
                     service.clickElement(index = -1, x = r.centerX(), y = r.centerY())
                 }
@@ -289,8 +289,9 @@ object SmartSearchAndFinder {
                     .put("scrolls_done", scrollsDone)
             }
 
+            val currentPkg = service.rootInActiveWindow?.packageName?.toString().orEmpty()
             PilotStateHub.activeController?.showTouchIndicator(rect.centerX(), rect.centerY(), matchedLabel.take(18))
-            val clicked = tryClickNodeOrAncestors(matchedNode)
+            val clicked = if (currentPkg !in BROWSER_PACKAGES) tryClickNodeOrAncestors(matchedNode) else false
             if (clicked) {
                 PilotStateHub.log(LogLevel.TOOL, "FindItem", "Clicked '$matchedLabel' after $scrollsDone scroll(s)")
                 return JSONObject()

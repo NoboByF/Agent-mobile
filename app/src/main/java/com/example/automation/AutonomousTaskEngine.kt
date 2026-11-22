@@ -653,11 +653,29 @@ class AutonomousTaskEngine(
                 rawAction = "CLICK",
                 maxScrolls = plan.optInt("max_scrolls", 4)
             )
-            "CLICK" -> service.clickNormalized(
-                nx = plan.optInt("x", 500),
-                ny = plan.optInt("y", 500),
+            "CLICK_NODE" -> service.clickNodeOrNormalized(
+                nodeIndex = plan.optInt("node_index", -1),
+                fallbackNx = plan.optInt("x", 500),
+                fallbackNy = plan.optInt("y", 500),
                 label = plan.optString("status_label", "Tap")
             )
+            "CLICK" -> {
+                val optIdx = plan.optInt("node_index", -1)
+                if (optIdx >= 0) {
+                    service.clickNodeOrNormalized(
+                        nodeIndex = optIdx,
+                        fallbackNx = plan.optInt("x", 500),
+                        fallbackNy = plan.optInt("y", 500),
+                        label = plan.optString("status_label", "Tap")
+                    )
+                } else {
+                    service.clickNormalized(
+                        nx = plan.optInt("x", 500),
+                        ny = plan.optInt("y", 500),
+                        label = plan.optString("status_label", "Tap")
+                    )
+                }
+            }
             "CLICK_TEXT" -> {
                 val query = plan.optString("text", "").trim()
                 val res = service.clickByText(query, exact = false)
@@ -758,6 +776,7 @@ class AutonomousTaskEngine(
         val limit = minOf(arr.length(), 45)
         for (i in 0 until limit) {
             val el = arr.optJSONObject(i) ?: continue
+            val nodeIdx = el.optInt("index", i)
             val nx = ((el.optInt("cx", 0) * 1000f) / w).toInt().coerceIn(0, 1000)
             val ny = ((el.optInt("cy", 0) * 1000f) / h).toInt().coerceIn(0, 1000)
             val text = el.optString("text", "")
@@ -768,7 +787,7 @@ class AutonomousTaskEngine(
                 if (el.optBoolean("scrollable")) append("S")
             }
             if (text.isBlank() && desc.isBlank() && flags.isEmpty()) continue
-            sb.append("($nx,$ny)[$flags] ")
+            sb.append("#").append(nodeIdx).append(" ($nx,$ny)[$flags] ")
             if (text.isNotBlank()) sb.append("\"").append(text.take(45)).append("\" ")
             if (desc.isNotBlank() && desc != text) sb.append("desc=\"").append(desc.take(35)).append("\"")
             sb.append('\n')
@@ -853,11 +872,13 @@ Rules:
 
         private const val WORKFLOW_AGENT_SYSTEM_PROMPT = """
 You are LivePilot's Dedicated Non-Live Reasoning & Vision Action Brain controlling an Android phone step-by-step until the user's goal is 100% VISIBLY ACCOMPLISHED on screen.
-Every screenshot has a 0..1000 coordinate ruler grid (0,0 = top-left, 1000,1000 = bottom-right).
+Every screenshot has a 0..1000 coordinate ruler grid (0,0 = top-left, 1000,1000 = bottom-right). The UI list shows `#index (nx,ny)[flags] "label"`.
+PREFER ACCURACY: When your target appears in the UI list (`#index`), ALWAYS use `CLICK_NODE` with `"node_index": index` AND backup `"x": nx, "y": ny`! Only use raw `CLICK` `(x, y)` for unlabeled visual icons or graphics.
 Available actions:
-- SEARCH: smart in-app or Google search! Provide "text" (query) and optional "open_in_google": true/false. Use this whenever you need to search inside YouTube, Chrome, Facebook, Play Store, Settings, Daraz, WhatsApp, etc.
+- CLICK_NODE: MOST ACCURATE! Tap exact UI element by "node_index" from the `#index` list, plus backup visual "x", "y".
+- SEARCH: smart in-app or Google search! Provide "text" (query) and optional "open_in_google": true/false.
 - FIND_CLICK: smart multi-scroll fuzzy Bengali+English item finder & clicker! Provide "text" (button/video/setting/contact name) and optional "max_scrolls": 4.
-- CLICK: tap exact normalized (x, y) in 0..1000
+- CLICK: tap exact normalized (x, y) in 0..1000 (use ONLY when target is not in `#index` list).
 - CLICK_TEXT: tap visible text ("text" plus backup visual "x", "y")
 - TYPE: tap input box at (x, y), type "text", optionally "press_send": true
 - DRAG: drag from (x, y) to (end_x, end_y) over "duration_ms"
@@ -885,7 +906,8 @@ Always output strict JSON:
   "done": false,
   "needs_user_help": false,
   "final_report": "",
-  "action": "SEARCH",
+  "action": "CLICK_NODE",
+  "node_index": -1,
   "x": 500, "y": 500,
   "end_x": 500, "end_y": 500,
   "text": "",

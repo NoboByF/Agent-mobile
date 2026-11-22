@@ -181,7 +181,7 @@ object DrawingGestureHelper {
         screenPoints: List<Pair<Float, Float>>,
         requestedMs: Long
     ): Long {
-        if (screenPoints.size <= 1) return 90L
+        if (screenPoints.size <= 1) return 110L
         var lengthPx = 0.0
         for (i in 1 until screenPoints.size) {
             lengthPx += hypot(
@@ -189,9 +189,9 @@ object DrawingGestureHelper {
                 (screenPoints[i].second - screenPoints[i - 1].second).toDouble()
             )
         }
-        val autoMs = (160.0 + lengthPx * 0.95).roundToLong().coerceIn(180L, 1800L)
-        return if (requestedMs in 120L..2500L) {
-            maxOf(requestedMs, autoMs / 2L).coerceIn(140L, 2200L)
+        val autoMs = (240.0 + lengthPx * 1.15).roundToLong().coerceIn(260L, 2000L)
+        return if (requestedMs in 140L..2500L) {
+            maxOf(requestedMs, autoMs / 2L).coerceIn(220L, 2200L)
         } else {
             autoMs
         }
@@ -208,12 +208,17 @@ object DrawingGestureHelper {
         val h = annotated.height.toFloat()
 
         val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(95, 0, 229, 255)
+            color = Color.argb(105, 0, 229, 255)
             strokeWidth = (w / 420f).coerceIn(1f, 2.2f)
             style = Paint.Style.STROKE
         }
+        val minorTickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(60, 0, 229, 255)
+            strokeWidth = 1f
+            style = Paint.Style.STROKE
+        }
         val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(185, 8, 15, 30)
+            color = Color.argb(195, 8, 15, 30)
             style = Paint.Style.FILL
         }
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -222,13 +227,21 @@ object DrawingGestureHelper {
             typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
         }
 
+        // Subtle 50-unit edge tick marks along top & left margins for exact button targeting
+        for (minor in 50..950 step 100) {
+            val mx = w * (minor / 1000f)
+            val my = h * (minor / 1000f)
+            canvas.drawLine(mx, 0f, mx, 14f, minorTickPaint)
+            canvas.drawLine(0f, my, 14f, my, minorTickPaint)
+        }
+
         val steps = listOf(100, 200, 300, 400, 500, 600, 700, 800, 900)
         for (s in steps) {
             val frac = s / 1000f
             val x = w * frac
             val y = h * frac
             val isMajor = s % 200 == 0
-            linePaint.alpha = if (isMajor) 105 else 48
+            linePaint.alpha = if (isMajor) 110 else 50
             canvas.drawLine(x, 0f, x, h, linePaint)
             canvas.drawLine(0f, y, w, y, linePaint)
 
@@ -236,15 +249,19 @@ object DrawingGestureHelper {
                 val label = s.toString()
                 val tw = textPaint.measureText(label)
                 val th = textPaint.textSize
-                // Top X ruler label
+                // Top & Bottom X ruler labels
                 val tx = (x - tw / 2f).coerceIn(4f, w - tw - 4f)
                 canvas.drawRect(tx - 3f, 2f, tx + tw + 3f, th + 6f, pillPaint)
                 canvas.drawText(label, tx, th + 2f, textPaint)
+                canvas.drawRect(tx - 3f, h - th - 6f, tx + tw + 3f, h - 2f, pillPaint)
+                canvas.drawText(label, tx, h - 5f, textPaint)
 
-                // Left Y ruler label
-                val ty = (y + th / 2f).coerceIn(th + 10f, h - 6f)
+                // Left & Right Y ruler labels
+                val ty = (y + th / 2f).coerceIn(th + 10f, h - 10f)
                 canvas.drawRect(2f, ty - th, tw + 8f, ty + 3f, pillPaint)
                 canvas.drawText(label, 5f, ty, textPaint)
+                canvas.drawRect(w - tw - 8f, ty - th, w - 2f, ty + 3f, pillPaint)
+                canvas.drawText(label, w - tw - 5f, ty, textPaint)
             }
         }
         return annotated

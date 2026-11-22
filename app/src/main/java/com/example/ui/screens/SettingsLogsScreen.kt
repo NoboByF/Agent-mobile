@@ -21,17 +21,22 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Palette
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -53,6 +58,7 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.data.AppThemeMode
+import com.example.data.ConnectionTestState
 import com.example.data.DiagnosticLogEntry
 import com.example.data.DiscoveredModel
 import com.example.data.LogLevel
@@ -103,6 +109,9 @@ fun SettingsLogsScreen(
     discoveredModels: List<DiscoveredModel>,
     isFetchingModels: Boolean,
     modelFetchStatus: String?,
+    liveModelTest: ConnectionTestState,
+    agentModelTest: ConnectionTestState,
+    textModelTest: ConnectionTestState,
     logs: List<DiagnosticLogEntry>,
     onAddApiKeys: (String, String) -> Unit,
     onSetActiveApiKey: (String) -> Unit,
@@ -111,9 +120,12 @@ fun SettingsLogsScreen(
     onToggleAutoRotateKeys: (Boolean) -> Unit,
     onResetApiKeyHealth: () -> Unit,
     onUpdateLiveModel: (String) -> Unit,
+    onTestLiveModel: () -> Unit,
     onUpdateAgentModel: (String) -> Unit,
+    onTestAgentModel: () -> Unit,
     onUpdateVerifyTaskCompletion: (Boolean) -> Unit,
     onUpdateTextModel: (String) -> Unit,
+    onTestTextModel: () -> Unit,
     onFetchModels: () -> Unit,
     onUpdateVoice: (String) -> Unit,
     onUpdateVoiceLanguage: (VoiceLanguage) -> Unit,
@@ -315,6 +327,14 @@ fun SettingsLogsScreen(
                                 unfocusedBorderColor = palette.outline
                             )
                         )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        ModelDiagnosticTestBar(
+                            buttonLabel = "Test Live Voice Model",
+                            testTag = "settings_test_live_button",
+                            accentColor = palette.cobaltAccent,
+                            state = liveModelTest,
+                            onTest = onTestLiveModel
+                        )
                     }
                 }
 
@@ -418,6 +438,15 @@ fun SettingsLogsScreen(
                             )
                         )
 
+                        Spacer(modifier = Modifier.height(8.dp))
+                        ModelDiagnosticTestBar(
+                            buttonLabel = "Test Drawing & Vision Brain",
+                            testTag = "settings_test_agent_button",
+                            accentColor = palette.emeraldAccent,
+                            state = agentModelTest,
+                            onTest = onTestAgentModel
+                        )
+
                         Spacer(modifier = Modifier.height(10.dp))
                         ToggleSettingRow(
                             title = "Strict Visual Completion Audit (কাজ শেষ যাচাই)",
@@ -504,6 +533,14 @@ fun SettingsLogsScreen(
                                 focusedBorderColor = palette.violetAccent,
                                 unfocusedBorderColor = palette.outline
                             )
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        ModelDiagnosticTestBar(
+                            buttonLabel = "Test Text & Search Model",
+                            testTag = "settings_test_text_button",
+                            accentColor = palette.violetAccent,
+                            state = textModelTest,
+                            onTest = onTestTextModel
                         )
                     }
                 }
@@ -1007,5 +1044,88 @@ private fun ToggleSettingRow(
                 checkedTrackColor = trackColor
             )
         )
+    }
+}
+
+@Composable
+private fun ModelDiagnosticTestBar(
+    buttonLabel: String,
+    testTag: String,
+    accentColor: Color,
+    state: ConnectionTestState,
+    onTest: () -> Unit
+) {
+    val palette = StudioTheme.colors
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        OutlinedButton(
+            onClick = onTest,
+            enabled = !state.isTesting,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(48.dp)
+                .testTag(testTag),
+            shape = RoundedCornerShape(14.dp),
+            border = BorderStroke(1.dp, accentColor.copy(alpha = 0.65f))
+        ) {
+            if (state.isTesting) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = accentColor
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.NetworkCheck,
+                    contentDescription = buttonLabel,
+                    tint = accentColor,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            }
+            Text(
+                text = if (state.isTesting) "Testing..." else buttonLabel,
+                style = MaterialTheme.typography.labelLarge,
+                color = accentColor
+            )
+        }
+
+        if (state.message.isNotBlank()) {
+            val container = when (state.success) {
+                true -> palette.emeraldSoft
+                false -> palette.redSoft
+                null -> palette.surfaceSubtle
+            }
+            val msgColor = when (state.success) {
+                true -> palette.emeraldAccent
+                false -> palette.redAccent
+                null -> palette.inkSecondary
+            }
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                color = container
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (state.success != null) {
+                        Icon(
+                            imageVector = if (state.success) Icons.Filled.CheckCircle else Icons.Filled.ErrorOutline,
+                            contentDescription = if (state.success) "Test passed" else "Test failed",
+                            tint = msgColor,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+                    Text(
+                        text = state.message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = msgColor
+                    )
+                }
+            }
+        }
     }
 }

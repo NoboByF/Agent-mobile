@@ -370,4 +370,26 @@ class ExampleRobolectricTest {
         assertTrue(GeminiToolSchemas.LIVE_SYSTEM_INSTRUCTION.contains("DUAL-BRAIN ARCHITECTURE"))
         assertTrue(GeminiToolSchemas.LIVE_SYSTEM_INSTRUCTION.contains("VERIFIED COMPLETED"))
     }
+
+    @Test
+    fun `high demand 503 classification and canvas grid timing behave reliably`() {
+        val transient = com.example.ai.ApiKeyPoolManager.classifyFailure(
+            httpCode = 503,
+            message = "HTTP 503: This model is currently experiencing high demand."
+        )
+        assertEquals(com.example.ai.ApiFailureKind.TRANSIENT, transient.kind)
+
+        val dur = DrawingGestureHelper.computeRecommendedDurationMs(
+            screenPoints = listOf(100f to 100f, 300f to 300f),
+            requestedMs = 0L
+        )
+        assertTrue(dur >= 260L)
+
+        val src = android.graphics.Bitmap.createBitmap(256, 512, android.graphics.Bitmap.Config.ARGB_8888)
+        val gridded = DrawingGestureHelper.drawCoordinateGridOverlay(src)
+        assertEquals(256, gridded.width)
+        assertEquals(512, gridded.height)
+        src.recycle()
+        gridded.recycle()
+    }
 }

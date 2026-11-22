@@ -18,10 +18,13 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.BatteryManager
+import android.os.Build
 import android.os.Bundle
 import android.provider.AlarmClock
+import android.util.DisplayMetrics
 import android.view.Display
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.example.data.AgentActivity
@@ -56,6 +59,9 @@ class PilotAccessibilityService : AccessibilityService() {
 
     @Volatile
     private var lastIndexedNodes: List<AccessibilityNodeInfo> = emptyList()
+
+    @Volatile
+    private var lastCapturedScreenSize: Pair<Int, Int>? = null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -106,6 +112,34 @@ class PilotAccessibilityService : AccessibilityService() {
         if (PilotStateHub.settings.value.showTouchVisualizer && x > 0 && y > 0) {
             PilotStateHub.activeController?.showTouchIndicator(x, y, label)
         }
+    }
+
+    /**
+     * Returns full physical screen pixel dimensions (including status & navigation bars),
+     * matching takeScreenshot(), AccessibilityNodeInfo.getBoundsInScreen(), and dispatchGesture().
+     */
+    @Suppress("DEPRECATION")
+    fun getPhysicalScreenSize(): Pair<Int, Int> {
+        val wm = getSystemService(Context.WINDOW_SERVICE) as? WindowManager
+        if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val bounds = wm.maximumWindowMetrics.bounds
+            if (bounds.width() > 0 && bounds.height() > 0) {
+                return bounds.width() to bounds.height()
+            }
+        }
+        lastCapturedScreenSize?.let { (w, h) ->
+            if (w > 0 && h > 0) return w to h
+        }
+        val realDm = DisplayMetrics()
+        val display = wm?.defaultDisplay
+        if (display != null) {
+            display.getRealMetrics(realDm)
+            if (realDm.widthPixels > 0 && realDm.heightPixels > 0) {
+                return realDm.widthPixels to realDm.heightPixels
+            }
+        }
+        val dm = resources.displayMetrics
+        return dm.widthPixels.coerceAtLeast(1) to dm.heightPixels.coerceAtLeast(1)
     }
 
     fun getDeviceStatusJson(): JSONObject {
@@ -451,7 +485,7 @@ class PilotAccessibilityService : AccessibilityService() {
         val root = rootInActiveWindow
             ?: return JSONObject().put("status", "error").put("message", "No active window root available.")
 
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val pkg = root.packageName?.toString().orEmpty()
 
         val newNodes = mutableListOf<AccessibilityNodeInfo>()
@@ -485,7 +519,7 @@ class PilotAccessibilityService : AccessibilityService() {
             node.getBoundsInScreen(rect)
             if (rect.width() <= 2 || rect.height() <= 2) continue
             // Skip elements completely outside the visible viewport
-            if (rect.bottom < 0 || rect.top > dm.heightPixels || rect.right < 0 || rect.left > dm.widthPixels) continue
+            if (rect.bottom < 0 || rect.top > screenH || rect.right < 0 || rect.left > screenW) continue
 
             val idx = newNodes.size
             newNodes.add(node)
@@ -513,8 +547,8 @@ class PilotAccessibilityService : AccessibilityService() {
         return JSONObject()
             .put("status", "ok")
             .put("package", pkg)
-            .put("screen_width", dm.widthPixels)
-            .put("screen_height", dm.heightPixels)
+            .put("screen_width", screenW)
+            .put("screen_height", screenH)
             .put("element_count", elements.length())
             .put("elements", elements)
     }
@@ -553,6 +587,9 @@ class PilotAccessibilityService : AccessibilityService() {
                                 val softBitmap = rawBitmap.copy(Bitmap.Config.ARGB_8888, false)
                                 rawBitmap.recycle()
 
+                                if (softBitmap.width > 0 && softBitmap.height > 0) {
+                                    lastCapturedScreenSize = softBitmap.width to softBitmap.height
+                                }
                                 val scaled = scaleBitmapToMaxWidth(softBitmap, maxWidth)
                                 if (scaled !== softBitmap) softBitmap.recycle()
 
@@ -596,7 +633,7 @@ class PilotAccessibilityService : AccessibilityService() {
     suspend fun captureScreenVisionAndStream(): JSONObject {
         checkSafetyGuardrail()?.let { return it }
 
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val controller = PilotStateHub.activeController
         val jpegBytes = captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 768)
 
@@ -610,10 +647,10 @@ class PilotAccessibilityService : AccessibilityService() {
         return JSONObject()
             .put("status", if (streamed) "ok" else "captured_not_streamed")
             .put("package", currentForegroundPackage().orEmpty())
-            .put("screen_width", dm.widthPixels)
-            .put("screen_height", dm.heightPixels)
+            .put("screen_width", screenW)
+            .put("screen_height", screenH)
             .put("jpeg_kb", jpegBytes.size / 1024)
-            .put("note", "Screenshot streamed with 0..1000 coordinate ruler overlay. For drawing or complex multi-step tasks, prefer start_autonomous_task or draw_strokes.")
+            .put("note", "Screenshot streamed with 0..1000 coordinate ruler overlay matching physical display ($screenW x $screenH).")
     }
 
     fun startContinuousScroll(direction: String, speed: String): JSONObject {
@@ -685,23 +722,61 @@ class PilotAccessibilityService : AccessibilityService() {
 
     suspend fun clickElement(index: Int, x: Int, y: Int): JSONObject {
         checkSafetyGuardrail()?.let { return it }
+        val controller = PilotStateHub.activeController
+        val currentPkg = currentForegroundPackage().orEmpty().lowercase()
+        val preferPhysicalTapForWeb = currentPkg.contains("chrome") ||
+            currentPkg.contains("browser") ||
+            currentPkg.contains("webview") ||
+            currentPkg.contains("firefox") ||
+            currentPkg.contains("opera")
 
         if (index in lastIndexedNodes.indices) {
             val node = lastIndexedNodes[index]
             val rect = Rect()
             node.getBoundsInScreen(rect)
+            val nodeCls = node.className?.toString().orEmpty()
+            val validBounds = rect.width() > 2 && rect.height() > 2
             emitTouchRipple(rect.centerX(), rect.centerY(), "Tap #$index")
-            val clicked = tryClickNodeOrParent(node)
-            if (clicked) {
-                PilotStateHub.log(LogLevel.TOOL, "Click", "Clicked node #$index via ACTION_CLICK")
-                return JSONObject().put("status", "ok").put("method", "accessibility_click").put("index", index)
+            if (!preferPhysicalTapForWeb && !nodeCls.contains("WebView", ignoreCase = true)) {
+                val clicked = tryClickNodeOrParent(node)
+                if (clicked) {
+                    PilotStateHub.log(LogLevel.TOOL, "Click", "Clicked node #$index (${rect.centerX()},${rect.centerY()}) via ACTION_CLICK")
+                    return JSONObject()
+                        .put("status", "ok")
+                        .put("method", "accessibility_click")
+                        .put("index", index)
+                        .put("x", rect.centerX())
+                        .put("y", rect.centerY())
+                }
+            }
+            if (validBounds) {
+                val ok = try {
+                    controller?.setOverlayPassThrough(true)
+                    delay(45L)
+                    dispatchTapGesture(rect.centerX().toFloat(), rect.centerY().toFloat(), durationMs = 65L)
+                } finally {
+                    controller?.setOverlayPassThrough(false)
+                }
+                PilotStateHub.log(LogLevel.TOOL, "Click", "Physical tap on node #$index at (${rect.centerX()},${rect.centerY()}) ok=$ok")
+                return JSONObject()
+                    .put("status", if (ok) "ok" else "error")
+                    .put("method", "node_bounds_tap")
+                    .put("index", index)
+                    .put("x", rect.centerX())
+                    .put("y", rect.centerY())
             }
         }
 
         if (x > 0 && y > 0) {
             emitTouchRipple(x, y, "Tap")
-            val ok = dispatchTapGesture(x.toFloat(), y.toFloat(), durationMs = 60L)
-            PilotStateHub.log(LogLevel.TOOL, "Click", "Dispatched 60ms tap at ($x, $y) ok=$ok")
+            val ok = try {
+                controller?.setOverlayPassThrough(true)
+                delay(45L)
+                dispatchTapGesture(x.toFloat(), y.toFloat(), durationMs = 65L)
+            } finally {
+                controller?.setOverlayPassThrough(false)
+            }
+            PilotStateHub.log(LogLevel.TOOL, "Click", "Dispatched 65ms tap at ($x, $y) ok=$ok")
             return JSONObject()
                 .put("status", if (ok) "ok" else "error")
                 .put("method", "gesture_tap")
@@ -712,11 +787,31 @@ class PilotAccessibilityService : AccessibilityService() {
         return JSONObject().put("status", "error").put("message", "Invalid node index and coordinates.")
     }
 
+    suspend fun clickNodeOrNormalized(
+        nodeIndex: Int,
+        fallbackNx: Int,
+        fallbackNy: Int,
+        label: String = "Tap"
+    ): JSONObject {
+        if (nodeIndex in lastIndexedNodes.indices) {
+            val res = clickElement(index = nodeIndex, x = -1, y = -1)
+            if (res.optString("status") == "ok") return res
+        }
+        return clickNormalized(nx = fallbackNx, ny = fallbackNy, label = label)
+    }
+
     suspend fun longPress(x: Int, y: Int, durationMs: Int): JSONObject {
         checkSafetyGuardrail()?.let { return it }
         val dur = durationMs.coerceIn(450, 2500).toLong()
+        val controller = PilotStateHub.activeController
         emitTouchRipple(x, y, "Hold")
-        val ok = dispatchTapGesture(x.toFloat(), y.toFloat(), durationMs = dur)
+        val ok = try {
+            controller?.setOverlayPassThrough(true)
+            delay(45L)
+            dispatchTapGesture(x.toFloat(), y.toFloat(), durationMs = dur)
+        } finally {
+            controller?.setOverlayPassThrough(false)
+        }
         return JSONObject()
             .put("status", if (ok) "ok" else "error")
             .put("x", x)
@@ -741,6 +836,7 @@ class PilotAccessibilityService : AccessibilityService() {
         }
         val ok = try {
             controller?.setOverlayPassThrough(true)
+            delay(45L)
             dispatchPathGesture(path, dur)
         } finally {
             controller?.setOverlayPassThrough(false)
@@ -769,7 +865,7 @@ class PilotAccessibilityService : AccessibilityService() {
             return JSONObject().put("status", "error").put("message", "No valid drawing strokes provided.")
         }
 
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val controller = PilotStateHub.activeController
         var completed = 0
         var failed = 0
@@ -789,8 +885,8 @@ class PilotAccessibilityService : AccessibilityService() {
                     DrawingGestureHelper.mapPointToScreen(
                         x = x,
                         y = y,
-                        screenWidth = dm.widthPixels,
-                        screenHeight = dm.heightPixels,
+                        screenWidth = screenW,
+                        screenHeight = screenH,
                         normalizedSpace = normalizedSpace,
                         canvasBoundsNorm = canvasBoundsNorm
                     )
@@ -814,7 +910,7 @@ class PilotAccessibilityService : AccessibilityService() {
         PilotStateHub.log(
             LogLevel.TOOL,
             "DrawStrokes",
-            "Completed $completed/$total strokes (failed=$failed)"
+            "Completed $completed/$total strokes on ${screenW}x${screenH} (failed=$failed)"
         )
         return JSONObject()
             .put("status", if (completed > 0) "ok" else "error")
@@ -825,23 +921,24 @@ class PilotAccessibilityService : AccessibilityService() {
 
     suspend fun clickNormalized(nx: Int, ny: Int, label: String = "Tap"): JSONObject {
         checkSafetyGuardrail()?.let { return it }
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val (px, py) = DrawingGestureHelper.mapPointToScreen(
             x = nx.toFloat(),
             y = ny.toFloat(),
-            screenWidth = dm.widthPixels,
-            screenHeight = dm.heightPixels,
+            screenWidth = screenW,
+            screenHeight = screenH,
             normalizedSpace = true
         )
         val controller = PilotStateHub.activeController
         emitTouchRipple(px.toInt(), py.toInt(), label)
         val ok = try {
             controller?.setOverlayPassThrough(true)
+            delay(45L)
             dispatchTapGesture(px, py, 65L)
         } finally {
             controller?.setOverlayPassThrough(false)
         }
-        PilotStateHub.log(LogLevel.TOOL, "ClickNorm", "($nx,$ny) -> (${px.toInt()},${py.toInt()}) ok=$ok")
+        PilotStateHub.log(LogLevel.TOOL, "ClickNorm", "($nx,$ny) on ${screenW}x${screenH} -> (${px.toInt()},${py.toInt()}) ok=$ok")
         return JSONObject()
             .put("status", if (ok) "ok" else "error")
             .put("x", px.toInt())
@@ -849,12 +946,12 @@ class PilotAccessibilityService : AccessibilityService() {
     }
 
     suspend fun longPressNormalized(nx: Int, ny: Int, durationMs: Int = 700): JSONObject {
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val (px, py) = DrawingGestureHelper.mapPointToScreen(
             x = nx.toFloat(),
             y = ny.toFloat(),
-            screenWidth = dm.widthPixels,
-            screenHeight = dm.heightPixels,
+            screenWidth = screenW,
+            screenHeight = screenH,
             normalizedSpace = true
         )
         return longPress(px.toInt(), py.toInt(), durationMs)
@@ -867,19 +964,19 @@ class PilotAccessibilityService : AccessibilityService() {
         endNy: Int,
         durationMs: Int = 420
     ): JSONObject {
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val (sx, sy) = DrawingGestureHelper.mapPointToScreen(
             x = startNx.toFloat(),
             y = startNy.toFloat(),
-            screenWidth = dm.widthPixels,
-            screenHeight = dm.heightPixels,
+            screenWidth = screenW,
+            screenHeight = screenH,
             normalizedSpace = true
         )
         val (ex, ey) = DrawingGestureHelper.mapPointToScreen(
             x = endNx.toFloat(),
             y = endNy.toFloat(),
-            screenWidth = dm.widthPixels,
-            screenHeight = dm.heightPixels,
+            screenWidth = screenW,
+            screenHeight = screenH,
             normalizedSpace = true
         )
         return dragGesture(sx.toInt(), sy.toInt(), ex.toInt(), ey.toInt(), durationMs)
@@ -891,12 +988,12 @@ class PilotAccessibilityService : AccessibilityService() {
         text: String,
         pressSend: Boolean
     ): JSONObject {
-        val dm = resources.displayMetrics
+        val (screenW, screenH) = getPhysicalScreenSize()
         val (px, py) = DrawingGestureHelper.mapPointToScreen(
             x = nx.toFloat(),
             y = ny.toFloat(),
-            screenWidth = dm.widthPixels,
-            screenHeight = dm.heightPixels,
+            screenWidth = screenW,
+            screenHeight = screenH,
             normalizedSpace = true
         )
         return typeText(index = -1, x = px.toInt(), y = py.toInt(), text = text, pressSend = pressSend)
@@ -910,28 +1007,29 @@ class PilotAccessibilityService : AccessibilityService() {
         durationMs: Int = 420
     ): JSONObject {
         checkSafetyGuardrail()?.let { return it }
-        val dm = resources.displayMetrics
-        val cx = (centerNx.coerceIn(150, 850) / 1000f) * dm.widthPixels
-        val cy = (centerNy.coerceIn(150, 850) / 1000f) * dm.heightPixels
-        val halfMin = (dm.widthPixels * 0.05f)
-        val halfMax = (dm.widthPixels * (spreadNorm.coerceIn(80, 360) / 1000f))
+        val (screenW, screenH) = getPhysicalScreenSize()
+        val cx = (centerNx.coerceIn(150, 850) / 1000f) * screenW
+        val cy = (centerNy.coerceIn(150, 850) / 1000f) * screenH
+        val halfMin = (screenW * 0.05f)
+        val halfMax = (screenW * (spreadNorm.coerceIn(80, 360) / 1000f))
         val dur = durationMs.coerceIn(220, 1200).toLong()
 
         val startOffset = if (zoomIn) halfMin else halfMax
         val endOffset = if (zoomIn) halfMax else halfMin
 
         val path1 = Path().apply {
-            moveTo((cx - startOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
-            lineTo((cx - endOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
+            moveTo((cx - startOffset).coerceIn(10f, screenW - 10f), cy)
+            lineTo((cx - endOffset).coerceIn(10f, screenW - 10f), cy)
         }
         val path2 = Path().apply {
-            moveTo((cx + startOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
-            lineTo((cx + endOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
+            moveTo((cx + startOffset).coerceIn(10f, screenW - 10f), cy)
+            lineTo((cx + endOffset).coerceIn(10f, screenW - 10f), cy)
         }
 
         val controller = PilotStateHub.activeController
         val ok = try {
             controller?.setOverlayPassThrough(true)
+            delay(45L)
             val gesture = GestureDescription.Builder()
                 .addStroke(GestureDescription.StrokeDescription(path1, 0L, dur))
                 .addStroke(GestureDescription.StrokeDescription(path2, 0L, dur))
@@ -966,6 +1064,7 @@ class PilotAccessibilityService : AccessibilityService() {
         pressSend: Boolean
     ): JSONObject {
         checkSafetyGuardrail()?.let { return it }
+        val controller = PilotStateHub.activeController
 
         val targetNode: AccessibilityNodeInfo? =
             if (index in lastIndexedNodes.indices) lastIndexedNodes[index] else null
@@ -978,7 +1077,13 @@ class PilotAccessibilityService : AccessibilityService() {
             targetNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
         } else if (x > 0 && y > 0) {
             emitTouchRipple(x, y, "Type")
-            dispatchTapGesture(x.toFloat(), y.toFloat(), 60L)
+            try {
+                controller?.setOverlayPassThrough(true)
+                delay(45L)
+                dispatchTapGesture(x.toFloat(), y.toFloat(), 65L)
+            } finally {
+                controller?.setOverlayPassThrough(false)
+            }
         }
 
         delay(220)
@@ -1132,9 +1237,9 @@ class PilotAccessibilityService : AccessibilityService() {
         distancePercent: Int,
         durationMs: Long
     ): Boolean {
-        val dm = resources.displayMetrics
-        val w = dm.widthPixels.toFloat()
-        val h = dm.heightPixels.toFloat()
+        val (screenW, screenH) = getPhysicalScreenSize()
+        val w = screenW.toFloat()
+        val h = screenH.toFloat()
         val deltaY = h * (distancePercent / 100f) * 0.5f
         val deltaX = w * (distancePercent / 100f) * 0.5f
         val cx = w * 0.5f

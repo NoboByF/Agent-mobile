@@ -1,5 +1,9 @@
 package com.example.ai
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.util.Base64
 import com.example.data.AskAiMessage
 import com.example.data.DiscoveredModel
@@ -15,6 +19,8 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
@@ -37,8 +43,8 @@ object GeminiRestClient {
 
     private val client: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .writeTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(65, TimeUnit.SECONDS)
+        .writeTimeout(25, TimeUnit.SECONDS)
         .build()
 
     /**
@@ -81,42 +87,56 @@ object GeminiRestClient {
             }
             triedIds.add(entry.id)
 
-            try {
-                val output = block(entry, entry.key)
-                ApiKeyPoolManager.reportSuccess(entry.id)
-                return output
-            } catch (e: GeminiHttpException) {
-                lastError = e
-                val classification = ApiKeyPoolManager.classifyFailure(
-                    httpCode = e.httpCode,
-                    message = e.message
-                )
-                if (classification.kind == ApiFailureKind.TRANSIENT) {
+            var didTransientRetry = false
+            while (true) {
+                try {
+                    val output = block(entry, entry.key)
+                    ApiKeyPoolManager.reportSuccess(entry.id)
+                    return output
+                } catch (e: GeminiHttpException) {
+                    lastError = e
+                    val classification = ApiKeyPoolManager.classifyFailure(
+                        httpCode = e.httpCode,
+                        message = e.message
+                    )
+                    if (classification.kind == ApiFailureKind.TRANSIENT) {
+                        if (!didTransientRetry) {
+                            didTransientRetry = true
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                tag,
+                                "Transient HTTP ${e.httpCode}; brief 550ms retry..."
+                            )
+                            Thread.sleep(550L)
+                            continue
+                        }
+                        throw e
+                    }
+                    val promoted = ApiKeyPoolManager.reportFailureAndRotate(
+                        failedKeyId = entry.id,
+                        classification = classification
+                    )
+                    if (promoted != null && attempt < maxAttempts) {
+                        PilotStateHub.log(
+                            LogLevel.INFO,
+                            tag,
+                            "Failover retry #$attempt using ${promoted.label} (${promoted.maskedKey()})"
+                        )
+                        break
+                    }
+                    val nextSelection = ApiKeyPoolManager.selectBestKey(
+                        settings = PilotStateHub.settings.value,
+                        excludeIds = triedIds
+                    )
+                    if (nextSelection.entry == null) {
+                        throw IllegalStateException(
+                            "${e.message} • ${ApiKeyPoolManager.buildNoKeyAvailableMessage(nextSelection)}"
+                        )
+                    }
                     throw e
                 }
-                val promoted = ApiKeyPoolManager.reportFailureAndRotate(
-                    failedKeyId = entry.id,
-                    classification = classification
-                )
-                if (promoted != null && attempt < maxAttempts) {
-                    PilotStateHub.log(
-                        LogLevel.INFO,
-                        tag,
-                        "Failover retry #$attempt using ${promoted.label} (${promoted.maskedKey()})"
-                    )
-                    continue
-                }
-                val nextSelection = ApiKeyPoolManager.selectBestKey(
-                    settings = PilotStateHub.settings.value,
-                    excludeIds = triedIds
-                )
-                if (nextSelection.entry == null) {
-                    throw IllegalStateException(
-                        "${e.message} • ${ApiKeyPoolManager.buildNoKeyAvailableMessage(nextSelection)}"
-                    )
-                }
-                throw e
             }
+            continue
         }
         throw lastError ?: IllegalStateException("Gemini API request failed across all configured keys.")
     }
@@ -450,7 +470,8 @@ object GeminiRestClient {
         jpegBytes: ByteArray?,
         temperature: Double = 0.2,
         maxOutputTokens: Int = 8192,
-        thinkingBudget: Int? = 512
+        thinkingBudget: Int? = 512,
+        allowModelFallback: Boolean = true
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
         runCatching {
             val userParts = JSONArray()
@@ -468,7 +489,11 @@ object GeminiRestClient {
             userParts.put(JSONObject().put("text", userPrompt))
 
             val safeMaxTokens = maxOutputTokens.coerceAtLeast(4096)
-            val modelCandidates = resolveAgentFallbackModels(modelId)
+            val modelCandidates = if (allowModelFallback) {
+                resolveAgentFallbackModels(modelId)
+            } else {
+                listOf(modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" })
+            }
             var lastModelError: Throwable? = null
 
             fun buildPayloadJson(candidateModel: String, includeThinking: Boolean): String {
@@ -563,22 +588,151 @@ object GeminiRestClient {
                             allowThinkingConfig = false
                             continue
                         }
-                        val isModelUnsupported = e.httpCode == 404 ||
-                            (e.httpCode == 400 && e.message.contains("not supported", ignoreCase = true))
-                        if (isModelUnsupported && idx < modelCandidates.lastIndex) {
+                        val canSwitchModel = allowModelFallback && idx < modelCandidates.lastIndex && (
+                            e.httpCode == 404 ||
+                                e.httpCode == 429 ||
+                                e.httpCode in 500..599 ||
+                                (e.httpCode == 400 && e.message.contains("not supported", ignoreCase = true)) ||
+                                e.message.contains("high demand", ignoreCase = true) ||
+                                e.message.contains("overloaded", ignoreCase = true)
+                            )
+                        if (canSwitchModel) {
                             PilotStateHub.log(
                                 LogLevel.INFO,
                                 "AutoPilot",
-                                "Model '$candidateModel' unavailable (HTTP ${e.httpCode}); switching Action Brain to '${modelCandidates[idx + 1]}'"
+                                "Model '$candidateModel' hit HTTP ${e.httpCode}; auto-switching to '${modelCandidates[idx + 1]}'"
                             )
                             break
                         }
                         throw e
+                    } catch (ioe: IOException) {
+                        lastModelError = ioe
+                        if (allowModelFallback && idx < modelCandidates.lastIndex) {
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                "AutoPilot",
+                                "Network/timeout on '$candidateModel' (${ioe.message}); trying '${modelCandidates[idx + 1]}'"
+                            )
+                            break
+                        }
+                        throw ioe
+                    } catch (other: Throwable) {
+                        lastModelError = other
+                        val msg = other.message.orEmpty()
+                        val shouldFallback = allowModelFallback && idx < modelCandidates.lastIndex && (
+                            msg.contains("HTTP 503", ignoreCase = true) ||
+                                msg.contains("HTTP 429", ignoreCase = true) ||
+                                msg.contains("HTTP 404", ignoreCase = true) ||
+                                msg.contains("high demand", ignoreCase = true) ||
+                                msg.contains("Empty JSON", ignoreCase = true)
+                            )
+                        if (shouldFallback) {
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                "AutoPilot",
+                                "Fallback from '$candidateModel' -> '${modelCandidates[idx + 1]}' (${msg.take(60)})"
+                            )
+                            break
+                        }
+                        throw other
                     }
                 }
             }
             throw lastModelError ?: IllegalStateException("No available Action Brain model could handle the request.")
         }
+    }
+
+    /**
+     * Real diagnostic test for the configured Action / Drawing Vision Brain model.
+     * Sends a lightweight synthetic canvas image and verifies Vision + JSON + vector stroke generation.
+     */
+    suspend fun testVisionAgentModel(
+        apiKey: String = "",
+        modelId: String
+    ): Triple<Boolean, String, Long> {
+        val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
+        val started = System.currentTimeMillis()
+        val testJpeg = runCatching {
+            val bmp = Bitmap.createBitmap(256, 256, Bitmap.Config.ARGB_8888)
+            val c = Canvas(bmp)
+            c.drawColor(Color.rgb(20, 24, 34))
+            val whitePaint = Paint().apply { color = Color.WHITE; style = Paint.Style.FILL }
+            c.drawRect(36f, 52f, 220f, 204f, whitePaint)
+            val baos = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 75, baos)
+            bmp.recycle()
+            baos.toByteArray()
+        }.getOrNull()
+
+        val result = generateVisionJson(
+            apiKey = apiKey,
+            modelId = cleanModel,
+            systemPrompt = "You are verifying Vision + Canvas Drawing JSON capability. Respond strictly in JSON.",
+            userPrompt = "Detect the white rectangle box and generate 3 simple curved strokes inside it. Return JSON: {\"canvas_box\": [140,200,860,800], \"strokes\": [{\"label\":\"Arc\",\"points\":[[200,500],[500,300],[800,500]]}]}",
+            jpegBytes = testJpeg,
+            temperature = 0.1,
+            maxOutputTokens = 4096,
+            thinkingBudget = if (cleanModel.contains("pro", ignoreCase = true)) 256 else 0,
+            allowModelFallback = false
+        )
+        val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
+
+        return result.fold(
+            onSuccess = { json ->
+                val strokesCount = json.optJSONArray("strokes")?.length() ?: 0
+                Triple(
+                    true,
+                    "Ready: $cleanModel responded (${latency}ms, Vision + $strokesCount test strokes OK).",
+                    latency
+                )
+            },
+            onFailure = { err ->
+                val msg = err.message ?: "Request failed"
+                val hint = if (msg.contains("503") || msg.contains("high demand", ignoreCase = true)) {
+                    " (Model is busy right now — tasks will auto-fallback to gemini-2.5-flash)"
+                } else {
+                    ""
+                }
+                Triple(false, "$cleanModel failed (${latency}ms): $msg$hint", latency)
+            }
+        )
+    }
+
+    /**
+     * Real diagnostic test for the configured Text / Ask AI / Search Grounding model.
+     */
+    suspend fun testTextModel(
+        apiKey: String = "",
+        modelId: String
+    ): Triple<Boolean, String, Long> {
+        val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
+        val started = System.currentTimeMillis()
+        val result = generateChatTurn(
+            apiKey = apiKey,
+            modelId = cleanModel,
+            history = listOf(
+                AskAiMessage(
+                    id = 1L,
+                    isUser = true,
+                    text = "Reply in 3 words only: Model is ready.",
+                    timestamp = PilotStateHub.formatNow()
+                )
+            ),
+            enableGoogleSearch = false
+        )
+        val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
+        return result.fold(
+            onSuccess = { gen ->
+                Triple(
+                    true,
+                    "Ready: ${gen.modelUsed} replied \"${gen.text.take(40)}\" (${latency}ms).",
+                    latency
+                )
+            },
+            onFailure = { err ->
+                Triple(false, "$cleanModel failed (${latency}ms): ${err.message}", latency)
+            }
+        )
     }
 
     internal fun extractCleanJsonObject(rawText: String): JSONObject {

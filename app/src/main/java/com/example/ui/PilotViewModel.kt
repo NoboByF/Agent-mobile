@@ -67,6 +67,12 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     private val _connectionTest = MutableStateFlow(ConnectionTestState())
     val connectionTest: StateFlow<ConnectionTestState> = _connectionTest.asStateFlow()
 
+    private val _agentModelTest = MutableStateFlow(ConnectionTestState())
+    val agentModelTest: StateFlow<ConnectionTestState> = _agentModelTest.asStateFlow()
+
+    private val _textModelTest = MutableStateFlow(ConnectionTestState())
+    val textModelTest: StateFlow<ConnectionTestState> = _textModelTest.asStateFlow()
+
     private val _isFetchingModels = MutableStateFlow(false)
     val isFetchingModels: StateFlow<Boolean> = _isFetchingModels.asStateFlow()
 
@@ -230,13 +236,71 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         if (_connectionTest.value.isTesting) return
         val current = settings.value
         viewModelScope.launch {
-            _connectionTest.value = ConnectionTestState(isTesting = true, message = "Testing v1beta handshake...")
+            _connectionTest.value = ConnectionTestState(isTesting = true, message = "Testing v1beta WebSocket handshake...")
             val (ok, message, latency) = GeminiLiveClient.testLiveHandshake(
                 apiKey = current.effectiveApiKey,
                 modelId = current.liveModel,
                 voiceName = current.voiceName
             )
             _connectionTest.value = ConnectionTestState(
+                isTesting = false,
+                success = ok,
+                message = message,
+                latencyMs = latency
+            )
+        }
+    }
+
+    fun testAgentModelConnection() {
+        if (_agentModelTest.value.isTesting) return
+        val current = settings.value
+        if (!current.hasAnyApiKey) {
+            _agentModelTest.value = ConnectionTestState(
+                isTesting = false,
+                success = false,
+                message = "Add at least one Gemini API Key first."
+            )
+            return
+        }
+        viewModelScope.launch {
+            _agentModelTest.value = ConnectionTestState(
+                isTesting = true,
+                message = "Testing Vision + Canvas JSON on ${current.agentModel}..."
+            )
+            val (ok, message, latency) = GeminiRestClient.testVisionAgentModel(
+                apiKey = current.effectiveApiKey,
+                modelId = current.agentModel
+            )
+            _agentModelTest.value = ConnectionTestState(
+                isTesting = false,
+                success = ok,
+                message = message,
+                latencyMs = latency
+            )
+        }
+    }
+
+    fun testTextModelConnection() {
+        if (_textModelTest.value.isTesting) return
+        val current = settings.value
+        if (!current.hasAnyApiKey) {
+            _textModelTest.value = ConnectionTestState(
+                isTesting = false,
+                success = false,
+                message = "Add at least one Gemini API Key first."
+            )
+            return
+        }
+        viewModelScope.launch {
+            _textModelTest.value = ConnectionTestState(
+                isTesting = true,
+                message = "Testing Ask AI & Search model ${current.textModel}..."
+            )
+            val (ok, message, latency) = GeminiRestClient.testTextModel(
+                apiKey = current.effectiveApiKey,
+                modelId = current.textModel
+            )
+            _textModelTest.value = ConnectionTestState(
                 isTesting = false,
                 success = ok,
                 message = message,

@@ -118,6 +118,8 @@ private fun LivePilotAppRoot(
     val sessionState by viewModel.sessionState.collectAsStateWithLifecycle()
     val permissions by viewModel.permissions.collectAsStateWithLifecycle()
     val connectionTest by viewModel.connectionTest.collectAsStateWithLifecycle()
+    val agentModelTest by viewModel.agentModelTest.collectAsStateWithLifecycle()
+    val textModelTest by viewModel.textModelTest.collectAsStateWithLifecycle()
     val logs by viewModel.logs.collectAsStateWithLifecycle()
     val captions by viewModel.captions.collectAsStateWithLifecycle()
     val recentToolEvents by viewModel.recentToolEvents.collectAsStateWithLifecycle()
@@ -336,6 +338,9 @@ private fun LivePilotAppRoot(
                             discoveredModels = discoveredModels,
                             isFetchingModels = isFetchingModels,
                             modelFetchStatus = modelFetchStatus,
+                            liveModelTest = connectionTest,
+                            agentModelTest = agentModelTest,
+                            textModelTest = textModelTest,
                             logs = logs,
                             onAddApiKeys = { raw, label -> viewModel.addApiKeys(raw, label) },
                             onSetActiveApiKey = { viewModel.setActiveApiKey(it) },
@@ -344,9 +349,12 @@ private fun LivePilotAppRoot(
                             onToggleAutoRotateKeys = { viewModel.updateAutoRotateApiKeys(it) },
                             onResetApiKeyHealth = { viewModel.resetApiKeyHealth() },
                             onUpdateLiveModel = { viewModel.updateLiveModel(it) },
+                            onTestLiveModel = { viewModel.testLiveConnection() },
                             onUpdateAgentModel = { viewModel.updateAgentModel(it) },
+                            onTestAgentModel = { viewModel.testAgentModelConnection() },
                             onUpdateVerifyTaskCompletion = { viewModel.updateVerifyTaskCompletion(it) },
                             onUpdateTextModel = { viewModel.updateTextModel(it) },
+                            onTestTextModel = { viewModel.testTextModelConnection() },
                             onFetchModels = { viewModel.fetchModels() },
                             onUpdateVoice = { viewModel.updateVoiceName(it) },
                             onUpdateVoiceLanguage = { viewModel.updateVoiceLanguage(it) },
