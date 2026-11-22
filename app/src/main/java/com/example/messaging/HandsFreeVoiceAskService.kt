@@ -28,6 +28,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.ai.GeminiRestClient
 import com.example.automation.PilotAccessibilityService
 import com.example.data.LogLevel
 import com.example.data.PilotStateHub
@@ -72,12 +73,21 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
     private var currentMessageText: String = ""
     private var currentOwnerName: String = ""
     private var awayNoticeAlreadySent: Boolean = false
+    private var ownerEngaged: Boolean = false
+    private var consultTurnCount: Int = 0
+    private var silentAfterEngageCount: Int = 0
+    private val consultationTranscript = mutableListOf<String>()
     private var isStopped: Boolean = false
 
     private val safetyTimeoutRunnable = Runnable {
         if (!isStopped) {
-            PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner did not respond in time; sending named away notice once.")
-            sendOwnerAwayNoticeAndStop()
+            if (!ownerEngaged) {
+                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner did not respond in time; sending named away notice once.")
+                sendOwnerAwayNoticeAndStop()
+            } else {
+                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Live voice consultation idle timeout; stopping cleanly.")
+                stopSelfSafely()
+            }
         }
     }
 
@@ -115,18 +125,26 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             )
         }
         awayNoticeAlreadySent = false
+        ownerEngaged = false
+        consultTurnCount = 0
+        silentAfterEngageCount = 0
+        consultationTranscript.clear()
 
         startAsForeground("🔊 $sender ($appName)-এর মেসেজ পড়ে শোনানো হচ্ছে...")
         acquireWakeLockAndAudio()
 
-        // Single clean safety cutoff (38s) — asks ONCE, never nags repeatedly
-        mainHandler.removeCallbacks(safetyTimeoutRunnable)
-        mainHandler.postDelayed(safetyTimeoutRunnable, 38_000L)
+        // Single clean safety cutoff (42s) — asks ONCE if away, extends smoothly if owner talks back
+        rescheduleSafetyTimeout(42_000L)
 
         // Initialize TTS to read the message loudly ONCE
         shutdownTts()
         tts = TextToSpeech(applicationContext, this)
         return START_NOT_STICKY
+    }
+
+    private fun rescheduleSafetyTimeout(delayMs: Long) {
+        mainHandler.removeCallbacks(safetyTimeoutRunnable)
+        mainHandler.postDelayed(safetyTimeoutRunnable, delayMs)
     }
 
     override fun onInit(status: Int) {
@@ -159,9 +177,8 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             override fun onDone(utteranceId: String?) {
                 if (isStopped) return
                 when (utteranceId) {
-                    UTTERANCE_READ_MESSAGE -> {
-                        mainHandler.post { startDistantVoiceListening() }
-                    }
+                    UTTERANCE_READ_MESSAGE,
+                    UTTERANCE_DISCUSS_CONTINUE,
                     UTTERANCE_RETRY_PROMPT -> {
                         mainHandler.post { startDistantVoiceListening() }
                     }
@@ -174,7 +191,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             @Deprecated("Deprecated in Java")
             override fun onError(utteranceId: String?) {
                 if (isStopped) return
-                if (utteranceId == UTTERANCE_READ_MESSAGE) {
+                if (utteranceId == UTTERANCE_READ_MESSAGE || utteranceId == UTTERANCE_DISCUSS_CONTINUE) {
                     mainHandler.post { startDistantVoiceListening() }
                 } else {
                     mainHandler.post { stopSelfSafely() }
@@ -189,7 +206,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             append(currentAppName).append(" এ বলেছে: ")
             append(currentMessageText.take(220)).append("। ")
             if (hasMic) {
-                append("আপনি কী উত্তর পাঠাতে চান? এখন জোরে বলুন।")
+                append("কী উত্তর পাঠাবো? চাইলে আগের মেসেজ বা আমার পরামর্শও জিজ্ঞেস করতে পারেন। এখন বলুন।")
             } else {
                 append("মাইক্রোফোন পারমিশন না থাকায় নোটিফিকেশন থেকে উত্তর লিখে দিন।")
             }
@@ -209,13 +226,26 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
     private fun startDistantVoiceListening() {
         if (isStopped) return
         if (!hasMicPermission() || !SpeechRecognizer.isRecognitionAvailable(applicationContext)) {
-            PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Mic unavailable; sending named owner-away waiting message.")
-            sendOwnerAwayNoticeAndStop()
+            if (!ownerEngaged) {
+                PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Mic unavailable; sending named owner-away waiting message.")
+                sendOwnerAwayNoticeAndStop()
+            } else {
+                stopSelfSafely()
+            }
             return
         }
 
-        updateForegroundNotification("🎤 একবার শুনছি... ($currentSenderName-কে উত্তর দিতে বলুন)")
-        PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Listening ONCE for owner voice reply...")
+        val notifLabel = if (ownerEngaged) {
+            "🎤 লাইভ কথা চলছে... ($currentSenderName-এর বিষয়ে বলুন)"
+        } else {
+            "🎤 শুনছি... ($currentSenderName-কে উত্তর দিতে বা পরামর্শ চাইতে বলুন)"
+        }
+        updateForegroundNotification(notifLabel)
+        PilotStateHub.log(
+            LogLevel.AUDIO,
+            "VoiceAsk",
+            if (ownerEngaged) "Listening for follow-up turn #${consultTurnCount + 1}..." else "Listening ONCE for owner voice reply..."
+        )
 
         destroyRecognizer()
         val recognizer = SpeechRecognizer.createSpeechRecognizer(applicationContext)
@@ -223,7 +253,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
 
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
-                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Mic open — listening once for owner...")
+                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Mic open — listening for owner...")
             }
 
             override fun onBeginningOfSpeech() {}
@@ -233,10 +263,14 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
 
             override fun onError(error: Int) {
                 if (isStopped) return
-                PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner away / no speech (code=$error); sending waiting notice once.")
                 destroyRecognizer()
-                // Do NOT nag or retry repeatedly — owner is away, send named waiting reply and finish!
-                sendOwnerAwayNoticeAndStop()
+                if (!ownerEngaged) {
+                    PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner away / no speech (code=$error); sending waiting notice once.")
+                    // Do NOT nag or retry repeatedly — owner is away, send named waiting reply and finish!
+                    sendOwnerAwayNoticeAndStop()
+                } else {
+                    handleSilenceDuringConsultation(error)
+                }
             }
 
             override fun onResults(results: Bundle?) {
@@ -246,7 +280,11 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                 destroyRecognizer()
 
                 if (spoken.isBlank()) {
-                    sendOwnerAwayNoticeAndStop()
+                    if (!ownerEngaged) {
+                        sendOwnerAwayNoticeAndStop()
+                    } else {
+                        handleSilenceDuringConsultation(-1)
+                    }
                     return
                 }
 
@@ -341,23 +379,136 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun handleSilenceDuringConsultation(errorCode: Int) {
+        if (isStopped) return
+        silentAfterEngageCount++
+        if (silentAfterEngageCount <= 1 && consultTurnCount < MAX_CONSULT_TURNS) {
+            PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Brief pause during live consultation (code=$errorCode); prompting once.")
+            rescheduleSafetyTimeout(35_000L)
+            speakAloud("আর কিছু বলবেন, নাকি এখন বন্ধ করবো?", UTTERANCE_DISCUSS_CONTINUE)
+        } else {
+            PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Consultation finished quietly after pause.")
+            speakAloud("ঠিক আছে, এখন বন্ধ করছি।", UTTERANCE_FINAL_DONE)
+        }
+    }
+
     private fun handleOwnerSpokenReply(rawSpoken: String) {
+        ownerEngaged = true
+        silentAfterEngageCount = 0
+        rescheduleSafetyTimeout(48_000L)
+        extendWakeLockIfHeld()
+
         val normalized = rawSpoken.trim().lowercase()
-        val cancelKeywords = listOf("বাতিল", "ক্যানসেল", "cancel", "থাক", "পাঠাতে হবে না", "দরকার নেই", "ignore")
+        val cancelKeywords = listOf(
+            "বাতিল", "ক্যানসেল", "cancel", "থাক", "বাদ দাও", "পাঠাতে হবে না",
+            "পাঠানোর দরকার নেই", "দরকার নেই", "ignore", "বন্ধ করো", "থামো"
+        )
         if (cancelKeywords.any { normalized == it || normalized.startsWith("$it ") }) {
             PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner cancelled voice reply: \"$rawSpoken\"")
             speakAloud("ঠিক আছে, কোনো উত্তর পাঠানো হয়নি।", UTTERANCE_FINAL_DONE)
             return
         }
 
-        // Strip natural leading voice phrasing like "বলো ...", "ওকে বলো ...", "লিখো ..."
-        val cleanedReply = rawSpoken
-            .replace(Regex("^(ওকে\\s+|তাকে\\s+|ওরে\\s+)?(বলো|বলেন|বলে\\s*দাও|লিখো|লিখে\\s*দাও|পাঠাও|পাঠিয়ে\\s*দাও|পাঠিয়ে\\s*দাও|রিপ্লাই\\s*দাও)\\s*(যে\\s*)?"), "")
-            .replace(Regex("^(tell\\s+(him|her|them)|reply|send)\\s+(that\\s+)?", RegexOption.IGNORE_CASE), "")
-            .trim()
-            .ifBlank { rawSpoken.trim() }
+        val settings = PilotStateHub.settings.value
+        if (!settings.hasAnyApiKey) {
+            val cleaned = stripLeadingReplyPrefix(rawSpoken)
+            deliverFinalReplyToSender(
+                replyText = cleaned,
+                spokenConfirmation = "ঠিক আছে, $currentSenderName কে পাঠিয়ে দিয়েছি: ${cleaned.take(120)}।"
+            )
+            return
+        }
 
-        PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Heard distant voice answer: \"$cleanedReply\"")
+        PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Owner spoke (turn ${consultTurnCount + 1}): \"$rawSpoken\"")
+        updateForegroundNotification("💬 AI পরামর্শ তৈরি করছে... ($currentSenderName)")
+
+        serviceScope.launch {
+            val senderHistory = IncomingMessageListener.getConversationHistory(currentPackageName, currentSenderName)
+            val personalFacts = PilotStateHub.personalData.value
+            val transcriptSnapshot = synchronized(consultationTranscript) { consultationTranscript.toList() }
+
+            val consultRes = GeminiRestClient.consultOwnerOnIncomingMessage(
+                apiKey = settings.effectiveApiKey,
+                modelId = settings.textModel,
+                senderName = currentSenderName,
+                appName = currentAppName,
+                incomingMessage = currentMessageText,
+                recentSenderHistory = senderHistory,
+                ownerPersonalData = personalFacts,
+                consultationTranscript = transcriptSnapshot,
+                ownerLatestUtterance = rawSpoken,
+                ownerDisplayName = currentOwnerName
+            )
+
+            consultRes.fold(
+                onSuccess = { decision ->
+                    synchronized(consultationTranscript) {
+                        consultationTranscript.add("Owner: $rawSpoken")
+                        consultationTranscript.add("AI: ${decision.spokenToOwner}")
+                    }
+                    when (decision.action) {
+                        "SEND_REPLY" -> {
+                            val replyToSend = decision.replyToSender.trim()
+                                .ifBlank { stripLeadingReplyPrefix(rawSpoken) }
+                            deliverFinalReplyToSender(
+                                replyText = replyToSend,
+                                spokenConfirmation = decision.spokenToOwner.ifBlank {
+                                    "ঠিক আছে, $currentSenderName কে পাঠিয়ে দিয়েছি: ${replyToSend.take(120)}।"
+                                }
+                            )
+                        }
+                        "CANCEL" -> {
+                            PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "AI consultation cancelled by owner.")
+                            mainHandler.post {
+                                speakAloud(
+                                    decision.spokenToOwner.ifBlank { "ঠিক আছে, কোনো উত্তর পাঠানো হলো না।" },
+                                    UTTERANCE_FINAL_DONE
+                                )
+                            }
+                        }
+                        else -> {
+                            // Live conversational back-and-forth (history readout, AI advice, refinements)
+                            consultTurnCount++
+                            PilotStateHub.log(
+                                LogLevel.AUDIO,
+                                "VoiceAsk",
+                                "Live consult turn #$consultTurnCount -> speaking & re-listening: \"${decision.spokenToOwner.take(90)}\""
+                            )
+                            mainHandler.post {
+                                rescheduleSafetyTimeout(48_000L)
+                                if (consultTurnCount < MAX_CONSULT_TURNS) {
+                                    updateForegroundNotification("🗣️ AI উত্তর বলছে... ($currentSenderName)")
+                                    speakAloud(decision.spokenToOwner, UTTERANCE_DISCUSS_CONTINUE)
+                                } else {
+                                    speakAloud(
+                                        "${decision.spokenToOwner}। এখন লাইভ সেশন শেষ করছি, প্রয়োজনে অ্যাপ থেকে উত্তর পাঠাতে পারবেন।",
+                                        UTTERANCE_FINAL_DONE
+                                    )
+                                }
+                            }
+                        }
+                    }
+                },
+                onFailure = { err ->
+                    PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Consultation Gemini call failed: ${err.message}")
+                    val fallbackReply = stripLeadingReplyPrefix(rawSpoken)
+                    deliverFinalReplyToSender(
+                        replyText = fallbackReply,
+                        spokenConfirmation = "ঠিক আছে, $currentSenderName কে পাঠিয়ে দিয়েছি: ${fallbackReply.take(120)}।"
+                    )
+                }
+            )
+        }
+    }
+
+    private fun stripLeadingReplyPrefix(rawSpoken: String): String = rawSpoken
+        .replace(Regex("^(ওকে\\s+|তাকে\\s+|ওরে\\s+)?(বলো|বলেন|বলে\\s*দাও|লিখো|লিখে\\s*দাও|পাঠাও|পাঠিয়ে\\s*দাও|পাঠিয়ে\\s*দাও|রিপ্লাই\\s*দাও)\\s*(যে\\s*)?"), "")
+        .replace(Regex("^(tell\\s+(him|her|them)|reply|send)\\s+(that\\s+)?", RegexOption.IGNORE_CASE), "")
+        .trim()
+        .ifBlank { rawSpoken.trim() }
+
+    private fun deliverFinalReplyToSender(replyText: String, spokenConfirmation: String) {
+        PilotStateHub.log(LogLevel.AUDIO, "VoiceAsk", "Sending approved reply to $currentSenderName: \"$replyText\"")
         updateForegroundNotification("📤 $currentSenderName-কে উত্তর পাঠানো হচ্ছে...")
 
         serviceScope.launch {
@@ -370,7 +521,7 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                 delivered = IncomingMessageListener.sendDirectReply(
                     context = applicationContext,
                     action = directAction,
-                    replyText = cleanedReply,
+                    replyText = replyText,
                     packageName = currentPackageName,
                     senderName = currentSenderName
                 )
@@ -379,14 +530,14 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             if (!delivered) {
                 val svc = PilotAccessibilityService.instance
                 if (svc != null) {
-                    IncomingMessageListener.registerSentReply(currentPackageName, currentSenderName, cleanedReply)
+                    IncomingMessageListener.registerSentReply(currentPackageName, currentSenderName, replyText)
                     svc.openNotificationChat(currentSenderName)
                     delay(900L)
                     val visualRes = svc.typeText(
                         index = -1,
                         x = 0,
                         y = 0,
-                        text = cleanedReply,
+                        text = replyText,
                         pressSend = true
                     )
                     delivered = visualRes.optString("status") == "ok"
@@ -394,11 +545,11 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             }
 
             if (delivered) {
+                IncomingMessageListener.appendConversationHistory(currentPackageName, currentSenderName, "Me: $replyText")
                 ChatModerationEngine.markOwnerRespondedForSender(
                     IncomingMessageListener.conversationKey(currentPackageName, currentSenderName)
                 )
-                PilotStateHub.markSensitiveMessageResolved(currentRecordId, cleanedReply)
-                // Dismiss the pending sensitive owner notification too
+                PilotStateHub.markSensitiveMessageResolved(currentRecordId, replyText)
                 val notifId = (currentRecordId.hashCode() and 0x0FFFFFFF) + 4100
                 runCatching {
                     val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -407,13 +558,10 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                 PilotStateHub.log(
                     LogLevel.SAFETY,
                     "VoiceAsk",
-                    "Hands-free voice reply delivered to $currentSenderName: \"$cleanedReply\""
+                    "Hands-free voice reply delivered to $currentSenderName: \"$replyText\""
                 )
                 mainHandler.post {
-                    speakAloud(
-                        "ঠিক আছে, $currentSenderName কে পাঠিয়ে দিয়েছি: ${cleanedReply.take(120)}।",
-                        UTTERANCE_FINAL_DONE
-                    )
+                    speakAloud(spokenConfirmation, UTTERANCE_FINAL_DONE)
                 }
             } else {
                 PilotStateHub.log(LogLevel.ERROR, "VoiceAsk", "Could not deliver spoken reply to $currentSenderName.")
@@ -423,6 +571,16 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                         UTTERANCE_FINAL_DONE
                     )
                 }
+            }
+        }
+    }
+
+    private fun extendWakeLockIfHeld() {
+        runCatching {
+            val wl = wakeLock
+            if (wl != null && wl.isHeld) {
+                wl.release()
+                wl.acquire(90_000L)
             }
         }
     }
@@ -615,8 +773,10 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
         private const val EXTRA_OWNER_NAME = "extra_owner_name"
 
         private const val UTTERANCE_READ_MESSAGE = "utt_read_message"
+        private const val UTTERANCE_DISCUSS_CONTINUE = "utt_discuss_continue"
         private const val UTTERANCE_RETRY_PROMPT = "utt_retry_prompt"
         private const val UTTERANCE_FINAL_DONE = "utt_final_done"
+        private const val MAX_CONSULT_TURNS = 6
 
         fun startEscalation(
             context: Context,

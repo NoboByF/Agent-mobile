@@ -48,6 +48,14 @@ INCOMING MESSAGES & AUTO-CHAT:
 - When you receive an [URGENT SENSITIVE MESSAGE ESCALATION] notice, someone sent a sensitive/private/financial question and Auto-Chat already sent "আমি জেনে বলছি।". Immediately ask the phone owner clearly in Bengali what reply they want to send back. As soon as the user tells you the answer, call answer_sensitive_message(sender_or_app="...", owner_answer="...") to send their exact answer back to that contact!
 - If confirmed for a regular message, call open_notification_chat(sender_or_app), inspect with get_screen_ui(), type with type_text(..., press_send=true), and confirm once sent.
 
+AI IMAGE GENERATION (generate_ai_image):
+- When the user asks to generate, create, or make an AI picture/image/wallpaper/logo/poster (e.g. "একটি পাখির ইমেজ তৈরি করে দাও", "একটা সূর্যাস্তের ছবি বানিয়ে দাও", "generate an image of a bird") — NOT sketching on an open drawing canvas — call generate_ai_image(prompt="detailed visual prompt")!
+- Once generate_ai_image succeeds, confirm warmly in 1 short sentence that the image is created and saved to their Gallery and Ask AI tab!
+- Only call start_autonomous_task(..., mode="DRAWING") when the user specifically wants you to physically draw strokes on an open drawing app/canvas on screen.
+
+ENDING THE LIVE CALL BY VOICE (end_live_call):
+- Whenever the user asks you to end/cut/disconnect the call OR clearly finishes the conversation (e.g. "কল কেটে দাও", "কল বন্ধ করো", "কথা শেষ", "রাখছি", "বাই", "আল্লাহ হাফেজ", "end call", "hang up", "bye", "we are done"), IMMEDIATELY call end_live_call(reason="...") and speak a brief warm 1-sentence goodbye! The call will hang up automatically right after your goodbye.
+
 SAFETY GUARDRAILS:
 - If any tool returns SAFETY_BLOCKED or NON_DESTRUCTIVE_GUARD, stop immediately and politely inform the user by voice that protected apps and destructive actions (delete/uninstall/reset/payment) are blocked for their safety.
 """
@@ -436,6 +444,28 @@ LANGUAGE & SPEECH LOCK — ENGLISH (en-US):
                     "max_scrolls" to prop("INTEGER", "Maximum number of scroll pages to search (1 to 6, recommended 4)")
                 ),
                 required = listOf("target", "action", "max_scrolls")
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "generate_ai_image",
+                description = "Generate a real high-quality AI image from any Bengali or English prompt (e.g. a bird, sunset, logo, portrait, illustration), save it to the phone Gallery (Pictures/LivePilot AI) and Ask AI history.",
+                properties = mapOf(
+                    "prompt" to prop("STRING", "Rich, clear description of the image to generate")
+                ),
+                required = listOf("prompt")
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "end_live_call",
+                description = "Gracefully hang up and terminate the active LivePilot AI voice call when the user asks to end/cut the call or says goodbye / conversation finished.",
+                properties = mapOf(
+                    "reason" to prop("STRING", "Short reason, e.g. 'User requested to end call' or 'Conversation finished'")
+                ),
+                required = listOf("reason")
             )
         )
 

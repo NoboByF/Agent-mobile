@@ -34,6 +34,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonAdd
@@ -176,7 +177,8 @@ suspend fun signOutFromFirebase(context: Context) {
 @Composable
 fun AuthGateScreen(
     deviceProfile: DeviceProfileIdentity,
-    onSignedIn: () -> Unit
+    onSignedIn: () -> Unit,
+    onOpenFreeExplorer: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val palette = StudioTheme.colors
@@ -848,6 +850,63 @@ fun AuthGateScreen(
                                 fontWeight = FontWeight.Bold
                             )
                         }
+                    }
+                }
+            }
+
+            // Free Explorer Offline Access Card (usable even without internet balance before sign-in)
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                color = palette.emeraldSoft,
+                border = BorderStroke(1.dp, palette.emeraldAccent.copy(alpha = 0.45f))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(EmeraldGreen),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Explore,
+                            contentDescription = "Free Explorer",
+                            tint = Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Free Explorer",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = palette.inkPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "লগইন বা ইন্টারনেট প্যাকেজ ছাড়াই ফ্রিতে Grameenphone শপ ব্রাউজ করুন।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                    }
+                    Button(
+                        onClick = onOpenFreeExplorer,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("auth_open_free_explorer_button"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = EmeraldGreen,
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Text("খুলুন", fontWeight = FontWeight.Bold)
                     }
                 }
             }

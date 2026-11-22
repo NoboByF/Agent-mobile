@@ -1,6 +1,7 @@
 package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -31,8 +33,10 @@ import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VolumeUp
@@ -54,6 +58,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -61,12 +66,18 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.ai.GeneratedImageHelper
 import com.example.data.AutoChatMode
 import com.example.data.AutoReplyDelivery
 import com.example.data.IncomingMessageRecord
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import com.example.data.MessagingApp
 import com.example.data.PermissionSnapshot
 import com.example.data.PersonalDataItem
@@ -116,6 +127,8 @@ fun AutoChatScreen(
     onSavePersonalData: (existingId: String?, title: String, content: String, category: String, shareInAutoReply: Boolean) -> Unit,
     onTogglePersonalDataShare: (PersonalDataItem) -> Unit,
     onDeletePersonalData: (String) -> Unit,
+    onSaveGeneratedImage: (String) -> Unit,
+    onShareGeneratedImage: (String, String, String?) -> Unit,
     onClearFeed: () -> Unit
 ) {
     val palette = StudioTheme.colors
@@ -423,7 +436,11 @@ fun AutoChatScreen(
                         record = msg,
                         onOpenChat = { onOpenChat(msg) },
                         onQuickReply = { onQuickAiReply(msg) },
-                        onTemplateReply = { replyText -> onTemplateReply(msg, replyText) }
+                        onTemplateReply = { replyText -> onTemplateReply(msg, replyText) },
+                        onSaveGeneratedImage = { path -> onSaveGeneratedImage(path) },
+                        onShareGeneratedImage = { path ->
+                            onShareGeneratedImage(path, "AI তৈরি ছবি (${msg.senderName})", msg.packageName)
+                        }
                     )
                 }
             }
@@ -610,13 +627,13 @@ fun AutoChatScreen(
                             Spacer(modifier = Modifier.width(12.dp))
                             Column {
                                 Text(
-                                    text = "স্ক্রিন অফ ভয়েস অ্যালার্ট ও দূর থেকে রিপ্লাই",
+                                    text = "স্ক্রিন অফ লাইভ ভয়েস পরামর্শ ও দূর থেকে রিপ্লাই",
                                     style = MaterialTheme.typography.titleSmall,
                                     color = palette.inkPrimary,
                                     fontWeight = FontWeight.SemiBold
                                 )
                                 Text(
-                                    text = "মোবাইল অফ থাকলেও গুরুত্বপূর্ণ মেসেজ জোরে পড়ে শোনাবে এবং মাইক অন করে দূর থেকে আপনার কথা শুনে অটো রিপ্লাই পাঠাবে।",
+                                    text = "গুরুত্বপূর্ণ মেসেজ এলে জোরে পড়ে শোনাবে — আপনি আগের মেসেজ জানতে চাইতে, AI-এর মতামত নিতে বা সরাসরি উত্তর বলে রিপ্লাই পাঠাতে পারবেন। দূরে থাকলে ১ বার অপেক্ষার মেসেজ দিয়ে থামবে।",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = palette.inkSecondary
                                 )
@@ -860,7 +877,9 @@ private fun IncomingMessageCard(
     record: IncomingMessageRecord,
     onOpenChat: () -> Unit,
     onQuickReply: () -> Unit,
-    onTemplateReply: (String) -> Unit
+    onTemplateReply: (String) -> Unit,
+    onSaveGeneratedImage: (String) -> Unit,
+    onShareGeneratedImage: (String) -> Unit
 ) {
     val palette = StudioTheme.colors
     StudioCardContainer(contentPadding = 14.dp) {
@@ -928,6 +947,74 @@ private fun IncomingMessageCard(
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
                 )
+            }
+        }
+
+        val generatedPath = record.generatedImagePath
+        if (!generatedPath.isNullOrBlank()) {
+            val bitmap by produceState<ImageBitmap?>(initialValue = null, key1 = generatedPath) {
+                value = withContext(Dispatchers.IO) {
+                    GeneratedImageHelper.decodeSampledBitmap(generatedPath, 960)?.asImageBitmap()
+                }
+            }
+            if (bitmap != null) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Image(
+                    bitmap = bitmap!!,
+                    contentDescription = "AI Generated Image for ${record.senderName}",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 160.dp, max = 260.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(palette.surfaceSubtle)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { onSaveGeneratedImage(generatedPath) },
+                        modifier = Modifier
+                            .weight(0.45f)
+                            .height(48.dp)
+                            .testTag("autochat_save_image_${record.id}"),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, palette.outline),
+                        contentPadding = PaddingValues(horizontal = 10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Download,
+                            contentDescription = "Save generated image",
+                            tint = palette.emeraldAccent,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(5.dp))
+                        Text("সেভ", color = palette.inkPrimary)
+                    }
+                    Button(
+                        onClick = { onShareGeneratedImage(generatedPath) },
+                        modifier = Modifier
+                            .weight(0.55f)
+                            .height(48.dp)
+                            .testTag("autochat_share_image_${record.id}"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = RoyalViolet,
+                            contentColor = Color.White
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Share,
+                            contentDescription = "Share image to ${record.app.displayName}",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("${record.app.displayName}-এ শেয়ার", maxLines = 1)
+                    }
+                }
             }
         }
 

@@ -9,6 +9,7 @@ import com.example.ai.ApiKeyPoolManager
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.ai.GeminiToolSchemas
+import com.example.ai.GeneratedImageHelper
 import com.example.automation.AutonomousMode
 import com.example.automation.AutonomousTaskEngine
 import com.example.automation.DrawingGestureHelper
@@ -81,7 +82,10 @@ class ExampleRobolectricTest {
         assertTrue(systemText.contains("Speak short Bengali"))
 
         val declarations = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
-        assertEquals(29, declarations.length())
+        assertEquals(31, declarations.length())
+        val toolNames = (0 until declarations.length()).map { declarations.getJSONObject(it).getString("name") }.toSet()
+        assertTrue(toolNames.contains("end_live_call"))
+        assertTrue(toolNames.contains("generate_ai_image"))
     }
 
     @Test
@@ -767,5 +771,110 @@ class ExampleRobolectricTest {
         )
         assertTrue(failed.isFailure)
     }
+
+    @Test
+    fun `image generation prompt detector and Gemini plus Imagen response parsers work accurately`() {
+        assertTrue(GeneratedImageHelper.isImageGenerationRequest("একটি পাখির ইমেজ তৈরি করে দাও"))
+        assertTrue(GeneratedImageHelper.isImageGenerationRequest("সূর্যাস্তের সুন্দর ছবি বানাও"))
+        assertTrue(GeneratedImageHelper.isImageGenerationRequest("generate an image of a colorful bird"))
+        assertTrue(GeneratedImageHelper.isImageGenerationRequest("/image futuristic Dhaka skyline"))
+
+        assertFalse(GeneratedImageHelper.isImageGenerationRequest("এই ছবিটি বিশ্লেষণ করো"))
+        assertFalse(GeneratedImageHelper.isImageGenerationRequest("describe this image for me"))
+        assertFalse(GeneratedImageHelper.isImageGenerationRequest("কেমন আছো ভাই?"))
+
+        val fakePngB64 = android.util.Base64.encodeToString(byteArrayOf(1, 2, 3, 4), android.util.Base64.NO_WRAP)
+        val geminiJson = """
+            {
+              "candidates": [{
+                "content": {
+                  "parts": [
+                    { "text": "এটি আপনার রঙিন পাখির ছবি।" },
+                    { "inlineData": { "mimeType": "image/png", "data": "$fakePngB64" } }
+                  ]
+                }
+              }]
+            }
+        """.trimIndent()
+        val parsedGemini = GeminiRestClient.parseGeneratedImageFromGenerateContent(
+            bodyStr = geminiJson,
+            modelUsed = "gemini-2.5-flash-image",
+            keyLabel = "Key 1"
+        )
+        assertNotNull(parsedGemini)
+        assertEquals("image/png", parsedGemini!!.mimeType)
+        assertEquals(4, parsedGemini.imageBytes.size)
+        assertEquals("এটি আপনার রঙিন পাখির ছবি।", parsedGemini.captionText)
+
+        val imagenJson = """
+            {
+              "predictions": [{
+                "bytesBase64Encoded": "$fakePngB64",
+                "mimeType": "image/jpeg"
+              }]
+            }
+        """.trimIndent()
+        val parsedImagen = GeminiRestClient.parseGeneratedImageFromImagen(
+            bodyStr = imagenJson,
+            modelUsed = "imagen-3.0-generate-002"
+        )
+        assertNotNull(parsedImagen)
+        assertEquals("image/jpeg", parsedImagen!!.mimeType)
+        assertEquals(4, parsedImagen.imageBytes.size)
+    }
+
+    @Test
+    fun `owner voice consultation parser distinguishes DISCUSS, SEND_REPLY, and CANCEL actions`() {
+        val discuss = GeminiRestClient.parseOwnerConsultationJson(
+            rawText = """{"action":"DISCUSS","spoken_to_owner":"ও আগে বলেছিল জরুরি কথা আছে। আপনি কি বলবো?","reply_to_sender":""}""",
+            fallbackUtterance = "আগে কী মেসেজ করেছিল?"
+        )
+        assertEquals("DISCUSS", discuss.action)
+        assertEquals("", discuss.replyToSender)
+        assertTrue(discuss.spokenToOwner.contains("আগে বলেছিল"))
+
+        val send = GeminiRestClient.parseOwnerConsultationJson(
+            rawText = """{"action":"SEND_REPLY","spoken_to_owner":"ঠিক আছে, পাঠিয়ে দিচ্ছি।","reply_to_sender":"আমি ১০ মিনিট পর কল দিচ্ছি ভাই।"}""",
+            fallbackUtterance = "ওকে বলো আমি ১০ মিনিট পর কল দিচ্ছি"
+        )
+        assertEquals("SEND_REPLY", send.action)
+        assertEquals("আমি ১০ মিনিট পর কল দিচ্ছি ভাই।", send.replyToSender)
+
+        val cancel = GeminiRestClient.parseOwnerConsultationJson(
+            rawText = """{"action":"CANCEL","spoken_to_owner":"ঠিক আছে, বাদ দিলাম।","reply_to_sender":""}""",
+            fallbackUtterance = "বাদ দাও"
+        )
+        assertEquals("CANCEL", cancel.action)
+        assertEquals("", cancel.replyToSender)
+
+        // Guard: SEND_REPLY with empty reply_to_sender must safely fall back to DISCUSS
+        val guardEmpty = GeminiRestClient.parseOwnerConsultationJson(
+            rawText = """{"action":"SEND_REPLY","spoken_to_owner":"পাঠাবো?","reply_to_sender":"   "}""",
+            fallbackUtterance = "পাঠাও"
+        )
+        assertEquals("DISCUSS", guardEmpty.action)
+        assertEquals("", guardEmpty.replyToSender)
+    }
+
+    @Test
+    fun `free explorer url policy validates default Grameenphone URL and blocks unsafe schemes`() {
+        assertEquals(
+            "https://www.grameenphone.com/shop/devices/phones",
+            com.example.ui.screens.FreeExplorerUrlPolicy.DEFAULT_URL
+        )
+        assertTrue(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("https://www.grameenphone.com/shop/devices/phones"))
+        assertTrue(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("http://grameenphone.com"))
+        assertEquals(
+            "grameenphone.com",
+            com.example.ui.screens.FreeExplorerUrlPolicy.formatHostDisplay("https://www.grameenphone.com/shop/devices/phones")
+        )
+
+        assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("javascript:alert(1)"))
+        assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("file:///etc/passwd"))
+        assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("content://com.example/secret"))
+        assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("intent://scan/#Intent;end"))
+        assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl(""))
+    }
 }
+
 

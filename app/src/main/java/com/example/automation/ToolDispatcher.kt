@@ -3,6 +3,7 @@ package com.example.automation
 import android.content.Context
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
+import com.example.ai.GeneratedImageHelper
 import com.example.ai.LiveToolCall
 import com.example.data.AgentActivity
 import com.example.data.AskAiMessage
@@ -194,6 +195,24 @@ class ToolDispatcher(
                 )
             }
 
+            "generate_ai_image" -> {
+                executeGenerateAiImage(args.optString("prompt", ""))
+            }
+
+            "end_live_call" -> {
+                val reason = args.optString("reason", "User ended live call").trim()
+                PilotStateHub.log(LogLevel.TOOL, "EndCall", "end_live_call triggered: $reason")
+                PilotStateHub.activeController?.scheduleEndCallAfterSpeech(delayMs = 4_200L)
+                JSONObject()
+                    .put("status", "ok")
+                    .put("ending_call", true)
+                    .put("reason", reason)
+                    .put(
+                        "instruction",
+                        "Say a brief warm goodbye in 1 short sentence; the call will end automatically right after you finish speaking."
+                    )
+            }
+
             else -> null
         }
 
@@ -354,6 +373,66 @@ class ToolDispatcher(
         )
     }
 
+    private suspend fun executeGenerateAiImage(rawPrompt: String): JSONObject {
+        val prompt = rawPrompt.trim()
+        if (prompt.isBlank()) {
+            return JSONObject().put("status", "error").put("message", "Image prompt was empty.")
+        }
+        val settings = PilotStateHub.settings.value
+        if (!settings.hasAnyApiKey) {
+            return JSONObject().put("status", "error").put("message", "No Gemini API key configured.")
+        }
+        PilotStateHub.log(LogLevel.TOOL, "ImageGen", "Live call generating AI image: $prompt")
+        val result = GeminiRestClient.generateImage(
+            apiKey = settings.effectiveApiKey,
+            prompt = prompt
+        )
+        return result.fold(
+            onSuccess = { gen ->
+                val savedFile = GeneratedImageHelper.saveGeneratedBytesToAppFile(
+                    context = appContext,
+                    bytes = gen.imageBytes,
+                    mimeType = gen.mimeType
+                )
+                val galleryRes = GeneratedImageHelper.saveImageFileToGallery(
+                    context = appContext,
+                    filePath = savedFile.absolutePath,
+                    displayLabel = "LivePilot_AI"
+                )
+                val caption = gen.captionText.ifBlank {
+                    "\"$prompt\" — আপনার ছবিটি তৈরি হয়ে গেছে এবং গ্যালারিতে (Pictures/LivePilot AI) সেভ করা হয়েছে।"
+                }
+                PilotStateHub.recordGeneratedImageInAskAi(
+                    prompt = prompt,
+                    imagePath = savedFile.absolutePath,
+                    caption = caption,
+                    modelUsed = gen.modelUsed
+                )
+                PilotStateHub.log(
+                    LogLevel.TOOL,
+                    "ImageGen",
+                    "Image generated via ${gen.modelUsed} (savedToGallery=${galleryRes.isSuccess})"
+                )
+                JSONObject()
+                    .put("status", "ok")
+                    .put("model", gen.modelUsed)
+                    .put("saved_to_gallery", galleryRes.isSuccess)
+                    .put("saved_to_ask_ai", true)
+                    .put("file_name", savedFile.name)
+                    .put(
+                        "message",
+                        "Image generated successfully and saved to Gallery (Pictures/LivePilot AI) and Ask AI tab. Confirm warmly to the user."
+                    )
+            },
+            onFailure = { err ->
+                PilotStateHub.log(LogLevel.ERROR, "ImageGen", "Live call image generation failed: ${err.message}")
+                JSONObject()
+                    .put("status", "error")
+                    .put("message", err.message ?: "Image generation failed.")
+            }
+        )
+    }
+
     private suspend fun executeAnswerSensitiveMessage(
         senderOrApp: String,
         ownerAnswer: String,
@@ -460,6 +539,8 @@ class ToolDispatcher(
         "draw_strokes" -> "🎨 Drawing strokes..."
         "search_on_screen" -> "🔍 Searching '${call.args.optString("query", "").take(18)}'..."
         "find_and_interact" -> "🔎 Finding '${call.args.optString("target", "").take(18)}'..."
+        "generate_ai_image" -> "🎨 Generating AI image..."
+        "end_live_call" -> "📞 Ending live call..."
         "wait_ms" -> "Waiting..."
         else -> "Executing ${call.name}..."
     }
@@ -492,6 +573,8 @@ class ToolDispatcher(
         "draw_strokes" -> "Drew Vector Strokes"
         "search_on_screen" -> "Search: ${call.args.optString("query", "").take(20)}"
         "find_and_interact" -> "Found: ${call.args.optString("target", "").take(20)}"
+        "generate_ai_image" -> "Generated Image"
+        "end_live_call" -> "Ended Live Call"
         else -> call.name
     }
 }

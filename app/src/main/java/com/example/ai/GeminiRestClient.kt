@@ -40,6 +40,20 @@ data class SmartAutoReplyResult(
     val messageType: String = "NORMAL" // NORMAL | ABUSIVE | SPAM_NONSENSE | SENSITIVE_OWNER_ONLY
 )
 
+data class OwnerVoiceConsultationResult(
+    val action: String, // SEND_REPLY | DISCUSS | CANCEL
+    val spokenToOwner: String,
+    val replyToSender: String = ""
+)
+
+data class GeneratedImageResult(
+    val imageBytes: ByteArray,
+    val mimeType: String,
+    val captionText: String,
+    val modelUsed: String,
+    val keyLabelUsed: String? = null
+)
+
 private class GeminiHttpException(
     val httpCode: Int,
     override val message: String
@@ -771,6 +785,416 @@ object GeminiRestClient {
         screenContext = screenContext,
         sensitiveGuardEnabled = PilotStateHub.settings.value.sensitiveQuestionGuardEnabled
     ).map { it.replyText }
+
+    /**
+     * Live conversational voice consultation between the phone owner and AI when an important/sensitive
+     * incoming message arrives. The owner can ask what the sender wrote previously, ask AI's opinion
+     * on what reply would be best, refine the wording, cancel, or approve sending the reply!
+     */
+    suspend fun consultOwnerOnIncomingMessage(
+        apiKey: String = "",
+        modelId: String,
+        senderName: String,
+        appName: String,
+        incomingMessage: String,
+        recentSenderHistory: List<String>,
+        ownerPersonalData: List<PersonalDataItem>,
+        consultationTranscript: List<String>,
+        ownerLatestUtterance: String,
+        ownerDisplayName: String = ""
+    ): Result<OwnerVoiceConsultationResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
+            val shareableFacts = ownerPersonalData.filter { it.title.isNotBlank() && it.content.isNotBlank() }
+
+            val systemPrompt = buildString {
+                append(
+                    """
+                    You are LivePilot AI having a natural, live hands-free voice conversation with the phone owner about an important incoming message from $senderName on $appName.
+                    Speak concisely (1-3 clear spoken sentences, no markdown/bullets/emojis) in natural Bangladeshi Bengali (or English if the owner speaks English).
+
+                    You MUST decide ONE exact "action" and return strict JSON only:
+                    1. "DISCUSS": Use when the owner is asking you a question or consulting with you BEFORE sending anything — for example:
+                       - Asking what $senderName messaged earlier ("আগে ও কী মেসেজ করেছিল?", "আগে কী বলেছে?") -> Summarize the Recent Chat History aloud naturally and ask what they'd like to reply.
+                       - Asking for your advice/suggestion ("তোমার মতে কী রিপ্লাই দিলে ভালো হবে?", "কী বলবো বলো তো?") -> Suggest a smart, polite reply aloud and ask if you should send it.
+                       - Asking any follow-up question, checking personal data, or thinking out loud.
+                       Set "reply_to_sender" to "" (empty) for DISCUSS!
+                    2. "SEND_REPLY": Use ONLY when the owner clearly tells you what message to send ("ওকে বলো আমি এখন ব্যস্ত", "পাঠিয়ে দাও আমি আধা ঘণ্টা পর কল দেবো") OR explicitly approves your previously suggested reply ("হ্যাঁ এটাই পাঠাও", "ঠিক আছে পাঠিয়ে দাও", "পাঠাও", "yes send it").
+                       Put the exact clean, polished message text to send to $senderName in "reply_to_sender" (NO meta-words like "ওকে বলো"), and put a brief warm spoken confirmation in "spoken_to_owner".
+                    3. "CANCEL": Use when the owner says not to send anything, cancel, ignore, or stop ("বাদ দাও", "পাঠাতে হবে না", "থাক", "বাতিল", "cancel", "ignore").
+                       Set "reply_to_sender" to "" and put a brief confirmation in "spoken_to_owner".
+
+                    Return ONLY valid JSON:
+                    {
+                      "action": "DISCUSS" | "SEND_REPLY" | "CANCEL",
+                      "spoken_to_owner": "concise natural spoken response to the owner",
+                      "reply_to_sender": "exact message to send to $senderName when action is SEND_REPLY, else empty string"
+                    }
+                    """.trimIndent()
+                )
+                if (shareableFacts.isNotEmpty()) {
+                    append("\n\nOWNER'S SAVED PERSONAL DATA (\"আমার ডাটা\"):\n")
+                    shareableFacts.take(20).forEach { fact ->
+                        append("- [").append(fact.category).append("] ")
+                            .append(fact.title).append(": ")
+                            .append(fact.content).append('\n')
+                    }
+                }
+            }
+
+            val userPrompt = buildString {
+                if (ownerDisplayName.isNotBlank()) {
+                    append("Owner Name: ").append(ownerDisplayName).append('\n')
+                }
+                append("Messaging App: ").append(appName).append('\n')
+                append("Sender: ").append(senderName).append('\n')
+                append("Latest Important Incoming Message: \"").append(incomingMessage).append("\"\n\n")
+
+                append("Recent Chat History with $senderName (oldest to newest):\n")
+                if (recentSenderHistory.isEmpty()) {
+                    append("- (No earlier messages recorded before this one)\n")
+                } else {
+                    recentSenderHistory.takeLast(10).forEach { line ->
+                        append("- ").append(line).append('\n')
+                    }
+                }
+
+                if (consultationTranscript.isNotEmpty()) {
+                    append("\nLive Voice Consultation So Far:\n")
+                    consultationTranscript.takeLast(10).forEach { turn ->
+                        append("- ").append(turn).append('\n')
+                    }
+                }
+
+                append("\nOwner just spoke: \"").append(ownerLatestUtterance).append("\"\n")
+                append("Return strict JSON only.")
+            }
+
+            val payload = JSONObject()
+                .put(
+                    "system_instruction",
+                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPrompt)))
+                )
+                .put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("role", "user")
+                            .put("parts", JSONArray().put(JSONObject().put("text", userPrompt)))
+                    )
+                )
+                .put(
+                    "generationConfig",
+                    JSONObject()
+                        .put("temperature", 0.35)
+                        .put("responseMimeType", "application/json")
+                )
+            val bodyJson = payload.toString()
+
+            val modelsToTry = if (cleanModel != "gemini-2.5-flash") {
+                listOf(cleanModel, "gemini-2.5-flash")
+            } else {
+                listOf(cleanModel)
+            }
+
+            var lastErr: Throwable? = null
+            for ((idx, targetModel) in modelsToTry.withIndex()) {
+                val hasNext = idx < modelsToTry.lastIndex
+                try {
+                    return@runCatching executeWithPoolFailover(
+                        explicitApiKey = apiKey,
+                        tag = "VoiceConsult",
+                        penalizeKeyOnQuota = !hasNext
+                    ) { _, activeKey ->
+                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                        val request = Request.Builder()
+                            .url("$REST_BASE/models/$targetModel:generateContent?key=$encodedKey")
+                            .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+                            .build()
+
+                        client.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                throw GeminiHttpException(response.code, extractApiError(bodyStr, response.code))
+                            }
+                            val root = JSONObject(bodyStr)
+                            val parts = root.optJSONArray("candidates")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("content")
+                                ?.optJSONArray("parts")
+                            val rawText = buildString {
+                                if (parts != null) {
+                                    for (i in 0 until parts.length()) {
+                                        val p = parts.optJSONObject(i) ?: continue
+                                        if (p.optBoolean("thought", false)) continue
+                                        append(p.optString("text", ""))
+                                    }
+                                }
+                            }.trim()
+                            parseOwnerConsultationJson(rawText, ownerLatestUtterance)
+                        }
+                    }
+                } catch (e: Throwable) {
+                    lastErr = e
+                    val msg = e.message.orEmpty()
+                    val canFallback = hasNext && (
+                        (e is GeminiHttpException && (e.httpCode == 404 || e.httpCode == 429 || e.httpCode in 500..599)) ||
+                            msg.contains("429") || msg.contains("404") || msg.contains("503")
+                        )
+                    if (canFallback) continue
+                    throw e
+                }
+            }
+            throw lastErr ?: IllegalStateException("Owner voice consultation failed.")
+        }
+    }
+
+    internal fun parseOwnerConsultationJson(
+        rawText: String,
+        fallbackUtterance: String
+    ): OwnerVoiceConsultationResult {
+        val json = runCatching { extractCleanJsonObject(rawText) }.getOrNull()
+        if (json != null) {
+            val rawAction = json.optString("action", "DISCUSS").trim().uppercase()
+            val normalizedAction = when (rawAction) {
+                "SEND_REPLY", "SEND", "REPLY" -> "SEND_REPLY"
+                "CANCEL", "STOP", "IGNORE" -> "CANCEL"
+                else -> "DISCUSS"
+            }
+            val spoken = json.optString("spoken_to_owner", "").trim()
+            val reply = json.optString("reply_to_sender", "").trim().removeSurrounding("\"")
+            return if (normalizedAction == "SEND_REPLY" && reply.isBlank()) {
+                OwnerVoiceConsultationResult(
+                    action = "DISCUSS",
+                    spokenToOwner = spoken.ifBlank { "ঠিক কী লিখে পাঠাবো একটু পরিষ্কার করে বলুন?" },
+                    replyToSender = ""
+                )
+            } else {
+                OwnerVoiceConsultationResult(
+                    action = normalizedAction,
+                    spokenToOwner = spoken.ifBlank {
+                        when (normalizedAction) {
+                            "SEND_REPLY" -> "ঠিক আছে, উত্তরটি পাঠিয়ে দিচ্ছি।"
+                            "CANCEL" -> "ঠিক আছে, কোনো উত্তর পাঠানো হলো না।"
+                            else -> "বলুন, কী উত্তর পাঠাতে চান?"
+                        }
+                    },
+                    replyToSender = if (normalizedAction == "SEND_REPLY") reply else ""
+                )
+            }
+        }
+        return OwnerVoiceConsultationResult(
+            action = "DISCUSS",
+            spokenToOwner = rawText.trim().ifBlank { "দুঃখিত, আরেকবার বলুন। আপনি কি \"$fallbackUtterance\" পাঠাতে চান?" },
+            replyToSender = ""
+        )
+    }
+
+    /**
+     * Generates a real AI image from a Bengali or English prompt using Gemini native image models
+     * (with multi-API-key failover + automatic fallback across image-capable models and Imagen).
+     */
+    suspend fun generateImage(
+        apiKey: String = "",
+        prompt: String
+    ): Result<GeneratedImageResult> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanPrompt = prompt.trim()
+            require(cleanPrompt.isNotBlank()) { "ছবি তৈরির জন্য একটি প্রম্পট লিখুন।" }
+
+            val discovered = PilotStateHub.discoveredModels.value
+            val geminiImageModels = LinkedHashSet<String>().apply {
+                discovered
+                    .filter {
+                        it.supportsGenerateContent &&
+                            it.id.contains("image", ignoreCase = true) &&
+                            !it.id.contains("imagen", ignoreCase = true)
+                    }
+                    .forEach { add(it.id) }
+                add("gemini-2.5-flash-image")
+                add("gemini-2.0-flash-exp-image-generation")
+                add("gemini-2.0-flash-preview-image-generation")
+            }.toList()
+
+            val enhancedPrompt = "Generate a vivid, high-quality, detailed image for this request: $cleanPrompt"
+            val genContentPayload = JSONObject()
+                .put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("role", "user")
+                            .put("parts", JSONArray().put(JSONObject().put("text", enhancedPrompt)))
+                    )
+                )
+                .put(
+                    "generationConfig",
+                    JSONObject().put(
+                        "responseModalities",
+                        JSONArray().put("TEXT").put("IMAGE")
+                    )
+                )
+                .toString()
+
+            var lastError: Throwable? = null
+
+            // Phase 1: Try Gemini native multimodal image generation models
+            for ((idx, candidateModel) in geminiImageModels.withIndex()) {
+                val hasMoreCandidates = idx < geminiImageModels.lastIndex || true
+                try {
+                    return@runCatching executeWithPoolFailover(
+                        explicitApiKey = apiKey,
+                        tag = "ImageGen",
+                        penalizeKeyOnQuota = !hasMoreCandidates
+                    ) { entry, activeKey ->
+                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                        val url = "$REST_BASE/models/$candidateModel:generateContent?key=$encodedKey"
+                        val request = Request.Builder()
+                            .url(url)
+                            .post(genContentPayload.toRequestBody(JSON_MEDIA_TYPE))
+                            .build()
+
+                        val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
+                        PilotStateHub.log(
+                            LogLevel.INFO,
+                            "ImageGen",
+                            "Generating image via $candidateModel$labelSuffix: \"${cleanPrompt.take(60)}\""
+                        )
+
+                        client.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                val errMsg = extractApiError(bodyStr, response.code)
+                                PilotStateHub.log(LogLevel.ERROR, "ImageGen", "Error ($candidateModel)$labelSuffix: $errMsg")
+                                throw GeminiHttpException(response.code, errMsg)
+                            }
+                            parseGeneratedImageFromGenerateContent(
+                                bodyStr = bodyStr,
+                                modelUsed = candidateModel,
+                                keyLabel = entry?.label
+                            ) ?: error("No image data returned by $candidateModel.")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    lastError = e
+                    PilotStateHub.log(
+                        LogLevel.INFO,
+                        "ImageGen",
+                        "Model $candidateModel unavailable (${e.message?.take(70)}); trying next image model..."
+                    )
+                }
+            }
+
+            // Phase 2: Fallback to Imagen predict endpoint if available on the user's API key
+            val imagenModels = listOf("imagen-3.0-generate-002", "imagen-3.0-fast-generate-001")
+            val imagenPayload = JSONObject()
+                .put("instances", JSONArray().put(JSONObject().put("prompt", cleanPrompt)))
+                .put("parameters", JSONObject().put("sampleCount", 1))
+                .toString()
+
+            for ((idx, imagenModel) in imagenModels.withIndex()) {
+                val isLast = idx == imagenModels.lastIndex
+                try {
+                    return@runCatching executeWithPoolFailover(
+                        explicitApiKey = apiKey,
+                        tag = "ImageGen",
+                        penalizeKeyOnQuota = isLast
+                    ) { entry, activeKey ->
+                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                        val url = "$REST_BASE/models/$imagenModel:predict?key=$encodedKey"
+                        val request = Request.Builder()
+                            .url(url)
+                            .post(imagenPayload.toRequestBody(JSON_MEDIA_TYPE))
+                            .build()
+
+                        PilotStateHub.log(LogLevel.INFO, "ImageGen", "Trying fallback Imagen model $imagenModel...")
+                        client.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                throw GeminiHttpException(response.code, extractApiError(bodyStr, response.code))
+                            }
+                            parseGeneratedImageFromImagen(
+                                bodyStr = bodyStr,
+                                modelUsed = imagenModel,
+                                keyLabel = entry?.label
+                            ) ?: error("No image returned by $imagenModel.")
+                        }
+                    }
+                } catch (e: Throwable) {
+                    lastError = e
+                }
+            }
+
+            throw lastError ?: IllegalStateException(
+                "ছবি তৈরি করা যায়নি। আপনার Gemini API Key-তে Image Generation মডেল অ্যাক্সেস বা কোটা আছে কিনা চেক করুন।"
+            )
+        }
+    }
+
+    internal fun parseGeneratedImageFromGenerateContent(
+        bodyStr: String,
+        modelUsed: String,
+        keyLabel: String? = null
+    ): GeneratedImageResult? {
+        val root = runCatching { JSONObject(bodyStr) }.getOrNull() ?: return null
+        val parts = root.optJSONArray("candidates")
+            ?.optJSONObject(0)
+            ?.optJSONObject("content")
+            ?.optJSONArray("parts")
+            ?: return null
+
+        var imageBytes: ByteArray? = null
+        var mimeType = "image/png"
+        val captionBuilder = StringBuilder()
+
+        for (i in 0 until parts.length()) {
+            val part = parts.optJSONObject(i) ?: continue
+            val inline = part.optJSONObject("inlineData") ?: part.optJSONObject("inline_data")
+            if (inline != null && imageBytes == null) {
+                val dataB64 = inline.optString("data", "").trim()
+                val mime = inline.optString("mimeType", inline.optString("mime_type", "image/png"))
+                if (dataB64.isNotBlank() && mime.startsWith("image/", ignoreCase = true)) {
+                    imageBytes = runCatching { Base64.decode(dataB64, Base64.DEFAULT) }.getOrNull()
+                    mimeType = mime
+                }
+            }
+            val text = part.optString("text", "").trim()
+            if (text.isNotBlank() && !part.optBoolean("thought", false)) {
+                if (captionBuilder.isNotEmpty()) captionBuilder.append("\n")
+                captionBuilder.append(text)
+            }
+        }
+
+        val bytes = imageBytes ?: return null
+        if (bytes.isEmpty()) return null
+        return GeneratedImageResult(
+            imageBytes = bytes,
+            mimeType = mimeType,
+            captionText = captionBuilder.toString().trim(),
+            modelUsed = modelUsed,
+            keyLabelUsed = keyLabel
+        )
+    }
+
+    internal fun parseGeneratedImageFromImagen(
+        bodyStr: String,
+        modelUsed: String,
+        keyLabel: String? = null
+    ): GeneratedImageResult? {
+        val root = runCatching { JSONObject(bodyStr) }.getOrNull() ?: return null
+        val firstPred = root.optJSONArray("predictions")?.optJSONObject(0) ?: return null
+        val b64 = firstPred.optString("bytesBase64Encoded", "").trim()
+        if (b64.isBlank()) return null
+        val bytes = runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull() ?: return null
+        if (bytes.isEmpty()) return null
+        val mime = firstPred.optString("mimeType", "image/png").ifBlank { "image/png" }
+        return GeneratedImageResult(
+            imageBytes = bytes,
+            mimeType = mime,
+            captionText = "",
+            modelUsed = modelUsed,
+            keyLabelUsed = keyLabel
+        )
+    }
 
     /**
      * Ensures Gemini REST contents strictly alternate user/model turns and start with a user turn.

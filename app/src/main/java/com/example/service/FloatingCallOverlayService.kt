@@ -95,6 +95,9 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     private var toolDispatcher: ToolDispatcher? = null
     private var stateObserverJob: Job? = null
     private var autoVisionJob: Job? = null
+    @Volatile
+    private var pendingEndCallAfterTurn: Boolean = false
+    private var pendingEndCallJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -169,6 +172,9 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     private fun startLiveSession() {
+        pendingEndCallAfterTurn = false
+        pendingEndCallJob?.cancel()
+        pendingEndCallJob = null
         val settings = PilotStateHub.settings.value
         PilotStateHub.clearRecentToolEvents()
         PilotStateHub.updateSession {
@@ -325,6 +331,19 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         }
     }
 
+    override fun onTurnComplete() {
+        if (pendingEndCallAfterTurn) {
+            pendingEndCallJob?.cancel()
+            pendingEndCallJob = serviceScope.launch {
+                // Allow brief audio drain so the farewell finishes playing cleanly on speakerphone
+                delay(1_150L)
+                if (pendingEndCallAfterTurn) {
+                    endCallSession()
+                }
+            }
+        }
+    }
+
     // --- OverlaySessionController ---
 
     override fun toggleMute() {
@@ -415,7 +434,25 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         stopSelf()
     }
 
+    override fun scheduleEndCallAfterSpeech(delayMs: Long) {
+        pendingEndCallAfterTurn = true
+        PilotStateHub.log(LogLevel.TOOL, "EndCall", "Voice-requested call hangup armed (max ${delayMs}ms).")
+        PilotStateHub.updateSession {
+            it.copy(statusTicker = "কল কেটে দেওয়া হচ্ছে...")
+        }
+        pendingEndCallJob?.cancel()
+        pendingEndCallJob = serviceScope.launch {
+            delay(delayMs.coerceIn(1_800L, 6_500L))
+            if (pendingEndCallAfterTurn) {
+                endCallSession()
+            }
+        }
+    }
+
     private fun cleanupSessionResources() {
+        pendingEndCallAfterTurn = false
+        pendingEndCallJob?.cancel()
+        pendingEndCallJob = null
         stopPrecisionVoiceRecognition(restoreMic = false)
         PilotStateHub.activeController = null
         PilotStateHub.pendingStartupCommand = null

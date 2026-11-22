@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -39,22 +41,28 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PermMedia
 import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -65,13 +73,17 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -81,6 +93,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.ai.GeneratedImageHelper
 import com.example.ai.MediaAttachmentHelper
 import com.example.data.AskAiMessage
 import com.example.data.AttachmentKind
@@ -93,6 +106,8 @@ import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.EmeraldGreen
 import com.example.ui.theme.RoyalViolet
 import com.example.ui.theme.StudioTheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @Composable
 fun AskAiScreen(
@@ -101,10 +116,13 @@ fun AskAiScreen(
     isCallActive: Boolean,
     onSelectTextModel: (String) -> Unit,
     onToggleSearchGrounding: (Boolean) -> Unit,
+    onToggleImageMode: (Boolean) -> Unit,
     onAddAttachments: (List<Uri>) -> Unit,
     onRemoveAttachment: (String) -> Unit,
     onSendPrompt: (String) -> Unit,
     onSendToLiveCall: (String) -> Unit,
+    onSaveGeneratedImage: (String) -> Unit,
+    onShareGeneratedImage: (String, String) -> Unit,
     onClearThread: () -> Unit
 ) {
     val palette = StudioTheme.colors
@@ -162,7 +180,7 @@ fun AskAiScreen(
                     color = palette.inkPrimary
                 )
                 Text(
-                    text = "Photos, videos, PDFs, files & live Google Search",
+                    text = "ছবি তৈরি (AI Image), ফাইল বিশ্লেষণ ও লাইভ গুগল সার্চ",
                     style = MaterialTheme.typography.bodySmall,
                     color = palette.inkSecondary
                 )
@@ -246,11 +264,39 @@ fun AskAiScreen(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    item {
+                        FilterChip(
+                            selected = uiState.imageModeEnabled,
+                            onClick = { onToggleImageMode(!uiState.imageModeEnabled) },
+                            modifier = Modifier.testTag("ask_ai_image_mode_chip"),
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Filled.Brush,
+                                    contentDescription = "AI Image Mode",
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            },
+                            label = {
+                                Text(
+                                    text = if (uiState.imageModeEnabled) "ছবি তৈরি: চালু" else "ছবি তৈরি (AI Image)",
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = palette.roseSoft,
+                                selectedLabelColor = palette.roseAccent,
+                                selectedLeadingIconColor = palette.roseAccent
+                            )
+                        )
+                    }
                     items(selectableModels) { modelId ->
-                        val selected = modelId.equals(settings.textModel, ignoreCase = true)
+                        val selected = !uiState.imageModeEnabled && modelId.equals(settings.textModel, ignoreCase = true)
                         FilterChip(
                             selected = selected,
-                            onClick = { onSelectTextModel(modelId) },
+                            onClick = {
+                                if (uiState.imageModeEnabled) onToggleImageMode(false)
+                                onSelectTextModel(modelId)
+                            },
                             label = {
                                 Text(
                                     text = modelChipLabel(modelId),
@@ -325,8 +371,8 @@ fun AskAiScreen(
                 Spacer(modifier = Modifier.height(16.dp))
 
                 val starters = listOf(
+                    "একটি রঙিন পাখির সুন্দর ইমেজ তৈরি করে দাও",
                     "আজকের ঢাকার আবহাওয়া ও বড় খবর কী?",
-                    "Best CapCut workflow for smooth mobile reels",
                     "Write a polite Bengali auto-reply while I'm driving"
                 )
                 Column(
@@ -370,6 +416,8 @@ fun AskAiScreen(
                         onSendToLiveCall = {
                             onSendToLiveCall("Follow this plan or speak this briefly: ${msg.text.take(400)}")
                         },
+                        onSaveGeneratedImage = { path -> onSaveGeneratedImage(path) },
+                        onShareGeneratedImage = { path, caption -> onShareGeneratedImage(path, caption) },
                         onOpenUrl = { url ->
                             runCatching {
                                 context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -523,10 +571,10 @@ fun AskAiScreen(
                 onValueChange = { inputText = it },
                 placeholder = {
                     Text(
-                        text = if (uiState.pendingAttachments.isNotEmpty()) {
-                            "ফাইল সম্পর্কে প্রশ্ন লিখুন..."
-                        } else {
-                            "Ask or attach photo/video/file..."
+                        text = when {
+                            uiState.imageModeEnabled -> "কী ছবি তৈরি করতে চান লিখুন (যেমন: একটি পাখির ছবি)..."
+                            uiState.pendingAttachments.isNotEmpty() -> "ফাইল সম্পর্কে প্রশ্ন লিখুন..."
+                            else -> "প্রশ্ন করুন বা ছবি তৈরি করতে লিখুন..."
                         },
                         color = palette.inkMuted,
                         maxLines = 1,
@@ -587,6 +635,8 @@ private fun ChatMessageBubble(
     isCallActive: Boolean,
     onCopy: () -> Unit,
     onSendToLiveCall: () -> Unit,
+    onSaveGeneratedImage: (String) -> Unit,
+    onShareGeneratedImage: (String, String) -> Unit,
     onOpenUrl: (String) -> Unit
 ) {
     val palette = StudioTheme.colors
@@ -650,6 +700,83 @@ private fun ChatMessageBubble(
                         color = Color.White
                     )
                 } else {
+                    val imgPath = message.generatedImagePath
+                    if (!imgPath.isNullOrBlank()) {
+                        val imageBitmap by produceState<ImageBitmap?>(initialValue = null, key1 = imgPath) {
+                            value = withContext(Dispatchers.IO) {
+                                GeneratedImageHelper.decodeSampledBitmap(imgPath, 1024)?.asImageBitmap()
+                            }
+                        }
+                        if (imageBitmap != null) {
+                            Image(
+                                bitmap = imageBitmap!!,
+                                contentDescription = "AI Generated Image",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 180.dp, max = 300.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(palette.surfaceSubtle)
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = { onSaveGeneratedImage(imgPath) },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("save_generated_image_${message.id}"),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, palette.outline),
+                                    contentPadding = PaddingValues(horizontal = 10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Download,
+                                        contentDescription = "Save image to gallery",
+                                        tint = palette.emeraldAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "গ্যালারিতে সেভ",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = palette.inkPrimary,
+                                        maxLines = 1
+                                    )
+                                }
+                                Button(
+                                    onClick = { onShareGeneratedImage(imgPath, message.text) },
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("share_generated_image_${message.id}"),
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = RoyalViolet,
+                                        contentColor = Color.White
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Share,
+                                        contentDescription = "Share generated image",
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "শেয়ার",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+                    }
+
                     Text(
                         text = formatAiRichText(message.text),
                         style = MaterialTheme.typography.bodyMedium,

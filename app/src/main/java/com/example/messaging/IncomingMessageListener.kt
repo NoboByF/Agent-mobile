@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.example.ai.GeminiRestClient
+import com.example.ai.GeneratedImageHelper
 import com.example.automation.PilotAccessibilityService
 import com.example.data.AutoChatMode
 import com.example.data.AutoReplyDelivery
@@ -260,6 +261,68 @@ class IncomingMessageListener : NotificationListenerService() {
         if (!settings.hasAnyApiKey) {
             PilotStateHub.log(LogLevel.ERROR, "AutoReply", "Skipped auto-reply: API key not set.")
             return
+        }
+
+        // Step 1.5: Real AI Image Generation for incoming requests like "একটি পাখির ইমেজ তৈরি করে দাও"
+        if (GeneratedImageHelper.isImageGenerationRequest(combinedIncomingText)) {
+            PilotStateHub.log(
+                LogLevel.INFO,
+                "AutoReply",
+                "Image request from ${record.senderName}; generating real AI image..."
+            )
+            val imgRes = GeminiRestClient.generateImage(
+                apiKey = settings.effectiveApiKey,
+                prompt = combinedIncomingText
+            )
+            val generated = imgRes.getOrNull()
+            if (generated != null) {
+                val savedFile = GeneratedImageHelper.saveGeneratedBytesToAppFile(
+                    context = applicationContext,
+                    bytes = generated.imageBytes,
+                    mimeType = generated.mimeType
+                )
+                GeneratedImageHelper.saveImageFileToGallery(
+                    context = applicationContext,
+                    filePath = savedFile.absolutePath,
+                    displayLabel = "LivePilot_Chat"
+                )
+                PilotStateHub.recordGeneratedImageInAskAi(
+                    prompt = "${record.senderName}: $combinedIncomingText",
+                    imagePath = savedFile.absolutePath,
+                    caption = generated.captionText.ifBlank {
+                        "${record.senderName} (${record.app.displayName})-এর অনুরোধে ছবিটি তৈরি হয়েছে।"
+                    },
+                    modelUsed = generated.modelUsed
+                )
+                val isBengali = combinedIncomingText.any { it in '\u0980'..'\u09FF' }
+                val chatReply = if (isBengali) {
+                    "আপনার জন্য ছবিটি তৈরি করে রেখেছি! গ্যালারি ও Auto-Chat-এ সেভ হয়েছে, এখনই পাঠিয়ে দেওয়া হবে।"
+                } else {
+                    "I've generated your image and saved it on the phone! I'll share it with you shortly."
+                }
+                registerSentReply(record.packageName, record.senderName, chatReply)
+                lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                val delivered = deliverReply(
+                    settingsDelivery = settings.autoReplyDelivery,
+                    record = record,
+                    replyAction = replyAction,
+                    replyText = chatReply
+                )
+                if (delivered) {
+                    appendConversationHistory(convKey, "Me: $chatReply")
+                }
+                PilotStateHub.markMessageGeneratedImage(
+                    recordId = record.id,
+                    imagePath = savedFile.absolutePath,
+                    replyText = if (delivered) chatReply else null
+                )
+                PilotStateHub.log(
+                    LogLevel.INFO,
+                    "AutoReply",
+                    "Generated real AI image for ${record.senderName} (${savedFile.name}); ready for 1-tap Share."
+                )
+                return
+            }
         }
 
         val shareablePersonalData = personalData.filter {
@@ -596,6 +659,13 @@ class IncomingMessageListener : NotificationListenerService() {
             recentSentReplies.clear()
             conversationHistoryMap.clear()
         }
+
+        fun appendConversationHistory(packageName: String, senderName: String, line: String) {
+            appendConversationHistory(conversationKey(packageName, senderName), line)
+        }
+
+        fun getConversationHistory(packageName: String, senderName: String): List<String> =
+            getConversationHistory(conversationKey(packageName, senderName))
 
         private fun appendConversationHistory(convKey: String, line: String) {
             val list = conversationHistoryMap.computeIfAbsent(convKey) { CopyOnWriteArrayList() }

@@ -343,7 +343,8 @@ class PilotPreferences(context: Context) {
                             citations = citations,
                             attachments = attachments,
                             modelUsed = obj.optString("modelUsed").ifBlank { null },
-                            timestamp = obj.optString("timestamp")
+                            timestamp = obj.optString("timestamp"),
+                            generatedImagePath = obj.optString("generatedImagePath").ifBlank { null }
                         )
                     )
                 }
@@ -379,6 +380,7 @@ class PilotPreferences(context: Context) {
                     .put("attachments", attachmentsArr)
                     .put("modelUsed", msg.modelUsed ?: "")
                     .put("timestamp", msg.timestamp)
+                    .put("generatedImagePath", msg.generatedImagePath ?: "")
             )
         }
         prefs.edit().putString(KEY_ASK_AI_HISTORY, arr.toString()).apply()

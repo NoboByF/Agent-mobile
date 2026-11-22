@@ -12,6 +12,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.ai.ApiKeyPoolManager
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
+import com.example.ai.GeneratedImageHelper
 import com.example.ai.MediaAttachmentHelper
 import com.example.ai.PreparedAttachment
 import com.example.automation.PilotAccessibilityService
@@ -55,6 +56,7 @@ data class AskAiUiState(
     val messages: List<AskAiMessage> = emptyList(),
     val pendingAttachments: List<ChatAttachmentMeta> = emptyList(),
     val searchGroundingEnabled: Boolean = true,
+    val imageModeEnabled: Boolean = false,
     val isGenerating: Boolean = false,
     val attachmentStatusText: String? = null,
     val errorText: String? = null
@@ -114,6 +116,22 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     init {
         val maxExistingId = _askAiState.value.messages.maxOfOrNull { it.id } ?: 0L
         chatIdCounter = AtomicLong(maxExistingId + 1L)
+        PilotStateHub.onExternalAskAiMessagesAdded = { added ->
+            if (added.isNotEmpty()) {
+                val maxAddedId = added.maxOfOrNull { it.id } ?: 0L
+                if (maxAddedId >= chatIdCounter.get()) {
+                    chatIdCounter.set(maxAddedId + 1L)
+                }
+                _askAiState.update { current ->
+                    val existingIds = current.messages.map { it.id }.toHashSet()
+                    val fresh = added.filter { it.id !in existingIds }
+                    if (fresh.isEmpty()) current else current.copy(messages = (current.messages + fresh).takeLast(80))
+                }
+                added.forEach { msg ->
+                    viewModelScope.launch { cloudRepo.saveAskAiMessage(msg) }
+                }
+            }
+        }
         refreshPermissions()
         startCloudSyncIfAuthenticated()
     }
@@ -198,16 +216,32 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 4. Observe Ask AI History for this device
+        // 4. Observe Ask AI History for this device (preserving device-local generated image paths)
         viewModelScope.launch {
             cloudRepo.observeAskAiMessages().collect { cloudMessages ->
                 if (cloudMessages.isNotEmpty() && !_askAiState.value.isGenerating) {
-                    val maxId = cloudMessages.maxOfOrNull { it.id } ?: 0L
+                    val localImageMap = buildMap<Long, String> {
+                        prefs.loadAskAiHistory().forEach { local ->
+                            if (!local.generatedImagePath.isNullOrBlank()) put(local.id, local.generatedImagePath)
+                        }
+                        _askAiState.value.messages.forEach { local ->
+                            if (!local.generatedImagePath.isNullOrBlank()) put(local.id, local.generatedImagePath)
+                        }
+                    }
+                    val mergedMessages = cloudMessages.map { msg ->
+                        val localPath = localImageMap[msg.id]
+                        if (localPath != null && msg.generatedImagePath.isNullOrBlank()) {
+                            msg.copy(generatedImagePath = localPath)
+                        } else {
+                            msg
+                        }
+                    }
+                    val maxId = mergedMessages.maxOfOrNull { it.id } ?: 0L
                     if (maxId >= chatIdCounter.get()) {
                         chatIdCounter.set(maxId + 1L)
                     }
-                    prefs.saveAskAiHistory(cloudMessages)
-                    _askAiState.update { it.copy(messages = cloudMessages) }
+                    prefs.saveAskAiHistory(mergedMessages)
+                    _askAiState.update { it.copy(messages = mergedMessages) }
                 }
             }
         }
@@ -281,6 +315,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         PilotStateHub.onSettingsChangedListener = null
+        PilotStateHub.onExternalAskAiMessagesAdded = null
         pendingSettingsSyncJob?.cancel()
         super.onCleared()
     }
@@ -744,6 +779,37 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         _askAiState.update { it.copy(searchGroundingEnabled = enabled) }
     }
 
+    fun toggleImageGenerationMode(enabled: Boolean) {
+        _askAiState.update { it.copy(imageModeEnabled = enabled) }
+    }
+
+    fun saveGeneratedImageToGallery(filePath: String) {
+        viewModelScope.launch {
+            val res = GeneratedImageHelper.saveImageFileToGallery(
+                context = getApplication(),
+                filePath = filePath,
+                displayLabel = "LivePilot_AI"
+            )
+            _bannerMessage.value = if (res.isSuccess) {
+                "✓ ছবিটি ফোনের গ্যালারিতে (Pictures/LivePilot AI) সেভ হয়েছে।"
+            } else {
+                "গ্যালারিতে সেভ ব্যর্থ: ${res.exceptionOrNull()?.localizedMessage ?: "আবার চেষ্টা করুন"}"
+            }
+        }
+    }
+
+    fun shareGeneratedImage(filePath: String, caption: String = "", targetPackage: String? = null) {
+        val ok = GeneratedImageHelper.shareImageFile(
+            context = getApplication(),
+            filePath = filePath,
+            caption = caption,
+            targetPackage = targetPackage
+        )
+        if (!ok) {
+            _bannerMessage.value = "ছবিটি শেয়ার করা যায়নি — ফাইলটি পাওয়া যাচ্ছে না।"
+        }
+    }
+
     fun addAskAiAttachments(uris: List<Uri>) {
         if (uris.isEmpty()) return
         val ctx = getApplication<Application>()
@@ -788,6 +854,10 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         val effectivePrompt = clean.ifBlank {
             "এই ছবি/ভিডিও/ফাইলটি ভালোভাবে বিশ্লেষণ করে বাংলায় পরিষ্কারভাবে উত্তর দাও।"
         }
+        val shouldGenerateImage = pending.isEmpty() && (
+            _askAiState.value.imageModeEnabled ||
+                GeneratedImageHelper.isImageGenerationRequest(effectivePrompt)
+            )
 
         val userMsg = AskAiMessage(
             id = chatIdCounter.getAndIncrement(),
@@ -804,15 +874,76 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 messages = updatedHistory,
                 pendingAttachments = emptyList(),
                 isGenerating = true,
-                attachmentStatusText = if (pending.isNotEmpty()) {
-                    "Preparing ${pending.size} file(s) / media for Gemini..."
-                } else null,
+                attachmentStatusText = when {
+                    shouldGenerateImage -> "🎨 AI দিয়ে ছবি তৈরি হচ্ছে..."
+                    pending.isNotEmpty() -> "Preparing ${pending.size} file(s) / media for Gemini..."
+                    else -> null
+                },
                 errorText = null
             )
         }
 
         val searchEnabled = _askAiState.value.searchGroundingEnabled
         viewModelScope.launch {
+            if (shouldGenerateImage) {
+                val imgResult = GeminiRestClient.generateImage(
+                    apiKey = currentSettings.effectiveApiKey,
+                    prompt = effectivePrompt
+                )
+                imgResult.onSuccess { gen ->
+                    val savedFile = GeneratedImageHelper.saveGeneratedBytesToAppFile(
+                        context = getApplication(),
+                        bytes = gen.imageBytes,
+                        mimeType = gen.mimeType
+                    )
+                    val galleryOk = GeneratedImageHelper.saveImageFileToGallery(
+                        context = getApplication(),
+                        filePath = savedFile.absolutePath,
+                        displayLabel = "LivePilot_AI"
+                    ).isSuccess
+                    val modelBadge = if (!gen.keyLabelUsed.isNullOrBlank() && settings.value.apiKeys.size > 1) {
+                        "${gen.modelUsed} • ${gen.keyLabelUsed}"
+                    } else {
+                        gen.modelUsed
+                    }
+                    val captionText = gen.captionText.ifBlank {
+                        if (galleryOk) {
+                            "আপনার প্রম্পট অনুযায়ী ছবি তৈরি হয়ে গেছে এবং গ্যালারিতে (Pictures/LivePilot AI) সেভ করা হয়েছে।"
+                        } else {
+                            "আপনার প্রম্পট অনুযায়ী ছবি তৈরি হয়ে গেছে।"
+                        }
+                    }
+                    val aiMsg = AskAiMessage(
+                        id = chatIdCounter.getAndIncrement(),
+                        isUser = false,
+                        text = captionText,
+                        modelUsed = modelBadge,
+                        generatedImagePath = savedFile.absolutePath,
+                        timestamp = PilotStateHub.formatNow()
+                    )
+                    val finalHistory = _askAiState.value.messages + aiMsg
+                    prefs.saveAskAiHistory(finalHistory)
+                    launch { cloudRepo.saveAskAiMessage(aiMsg) }
+                    _askAiState.update {
+                        it.copy(
+                            messages = finalHistory,
+                            isGenerating = false,
+                            attachmentStatusText = null,
+                            errorText = null
+                        )
+                    }
+                }.onFailure { err ->
+                    _askAiState.update {
+                        it.copy(
+                            isGenerating = false,
+                            attachmentStatusText = null,
+                            errorText = err.message ?: "ছবি তৈরি করা যায়নি। API Key কোটা চেক করে আবার চেষ্টা করুন।"
+                        )
+                    }
+                }
+                return@launch
+            }
+
             val prepared = mutableListOf<PreparedAttachment>()
             for (meta in pending) {
                 val prepResult = MediaAttachmentHelper.prepareForGemini(getApplication(), meta)

@@ -28,6 +28,7 @@ interface OverlaySessionController {
     fun triggerManualVisionCapture()
     fun emergencyStopActions()
     fun endCallSession()
+    fun scheduleEndCallAfterSpeech(delayMs: Long = 3200L) {}
     fun setOverlayTemporarilyHidden(hidden: Boolean)
     fun setOverlayPassThrough(passThrough: Boolean)
     fun showTouchIndicator(x: Int, y: Int, label: String = "")
@@ -74,6 +75,9 @@ object PilotStateHub {
 
     @Volatile
     var onSettingsChangedListener: ((PilotSettings) -> Unit)? = null
+
+    @Volatile
+    var onExternalAskAiMessagesAdded: ((List<AskAiMessage>) -> Unit)? = null
 
     private val notificationHandles = ConcurrentHashMap<String, CachedNotificationHandle>()
 
@@ -240,6 +244,50 @@ object PilotStateHub {
                 if (msg.id == recordId) msg.copy(autoRepliedText = replyText) else msg
             }
         }
+    }
+
+    fun markMessageGeneratedImage(recordId: String, imagePath: String, replyText: String? = null) {
+        _incomingMessages.update { current ->
+            current.map { msg ->
+                if (msg.id == recordId) {
+                    msg.copy(
+                        generatedImagePath = imagePath,
+                        autoRepliedText = replyText ?: msg.autoRepliedText
+                    )
+                } else {
+                    msg
+                }
+            }
+        }
+    }
+
+    fun recordGeneratedImageInAskAi(
+        prompt: String,
+        imagePath: String,
+        caption: String,
+        modelUsed: String
+    ) {
+        val prefs = preferences ?: return
+        val current = prefs.loadAskAiHistory()
+        val nextBaseId = (current.maxOfOrNull { it.id } ?: 0L) + 1L
+        val nowLabel = formatNow()
+        val userMsg = AskAiMessage(
+            id = nextBaseId,
+            isUser = true,
+            text = "🎨 $prompt",
+            timestamp = nowLabel
+        )
+        val aiMsg = AskAiMessage(
+            id = nextBaseId + 1L,
+            isUser = false,
+            text = caption.ifBlank { "আপনার জন্য ছবিটি তৈরি করে গ্যালারিতে সেভ করা হয়েছে।" },
+            modelUsed = modelUsed,
+            timestamp = nowLabel,
+            generatedImagePath = imagePath
+        )
+        val updated = (current + userMsg + aiMsg).takeLast(30)
+        prefs.saveAskAiHistory(updated)
+        onExternalAskAiMessagesAdded?.invoke(listOf(userMsg, aiMsg))
     }
 
     fun markMessageSensitiveEscalated(

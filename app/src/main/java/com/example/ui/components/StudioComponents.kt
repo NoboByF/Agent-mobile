@@ -31,10 +31,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.ChatBubble
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Icon
@@ -70,6 +72,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.CyanBright
+import com.example.ui.theme.EmeraldGreen
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.theme.RosePink
 import com.example.ui.theme.RoyalViolet
@@ -101,6 +104,12 @@ enum class PilotTab(
         selectedIcon = Icons.Filled.ChatBubble,
         unselectedIcon = Icons.Outlined.ChatBubbleOutline,
         testTag = "nav_tab_auto_chat"
+    ),
+    EXPLORER(
+        label = "Explorer",
+        selectedIcon = Icons.Filled.Explore,
+        unselectedIcon = Icons.Outlined.Explore,
+        testTag = "nav_tab_explorer"
     ),
     SETTINGS(
         label = "Settings",
@@ -375,7 +384,7 @@ fun FloatingPilotBottomBar(
         modifier = modifier
             .fillMaxWidth()
             .navigationBarsPadding()
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(horizontal = 12.dp, vertical = 10.dp),
         contentAlignment = Alignment.Center
     ) {
         Surface(
@@ -394,7 +403,7 @@ fun FloatingPilotBottomBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 6.dp, vertical = 6.dp),
+                    .padding(horizontal = 4.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.SpaceEvenly,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -404,12 +413,14 @@ fun FloatingPilotBottomBar(
                         PilotTab.HOME -> if (palette.isDark) palette.cobaltAccent else CobaltBlue
                         PilotTab.ASK_AI -> if (palette.isDark) palette.violetAccent else RoyalViolet
                         PilotTab.AUTO_CHAT -> if (palette.isDark) palette.roseAccent else RosePink
+                        PilotTab.EXPLORER -> if (palette.isDark) palette.emeraldAccent else EmeraldGreen
                         PilotTab.SETTINGS -> if (palette.isDark) palette.amberAccent else WarmAmber
                     }
                     val soft = when (tab) {
                         PilotTab.HOME -> palette.cobaltSoft
                         PilotTab.ASK_AI -> palette.violetSoft
                         PilotTab.AUTO_CHAT -> palette.roseSoft
+                        PilotTab.EXPLORER -> palette.emeraldSoft
                         PilotTab.SETTINGS -> palette.amberSoft
                     }
                     val pillBg by animateColorAsState(
@@ -447,7 +458,7 @@ fun FloatingPilotBottomBar(
                                     imageVector = if (isSelected) tab.selectedIcon else tab.unselectedIcon,
                                     contentDescription = tab.label,
                                     tint = iconTint,
-                                    modifier = Modifier.size(22.dp)
+                                    modifier = Modifier.size(21.dp)
                                 )
                                 if (tab == PilotTab.AUTO_CHAT && unreadMessageCount > 0) {
                                     Box(
@@ -462,8 +473,9 @@ fun FloatingPilotBottomBar(
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = tab.label,
-                                style = MaterialTheme.typography.labelMedium,
+                                style = MaterialTheme.typography.labelSmall,
                                 color = if (isSelected) accent else palette.inkMuted,
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )

@@ -166,7 +166,8 @@ data class IncomingMessageRecord(
     val sensitivityReason: String? = null,
     val needsOwnerAnswer: Boolean = false,
     val ownerQuestion: String? = null,
-    val ownerResolvedReply: String? = null
+    val ownerResolvedReply: String? = null,
+    val generatedImagePath: String? = null
 )
 
 data class WebCitation(
@@ -199,7 +200,8 @@ data class AskAiMessage(
     val citations: List<WebCitation> = emptyList(),
     val attachments: List<ChatAttachmentMeta> = emptyList(),
     val modelUsed: String? = null,
-    val timestamp: String
+    val timestamp: String,
+    val generatedImagePath: String? = null
 )
 
 data class DiscoveredModel(

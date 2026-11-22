@@ -40,6 +40,7 @@ interface GeminiLiveCallbacks {
     fun onConnectionPhaseChanged(phase: LiveConnectionPhase, detail: String)
     fun onInputTranscript(text: String)
     fun onOutputTranscript(text: String)
+    fun onTurnComplete() {}
 }
 
 class GeminiLiveClient(
@@ -421,6 +422,10 @@ class GeminiLiveClient(
                         }
                     }
                 }
+            }
+
+            if (content.optBoolean("turnComplete", false)) {
+                callbacks.onTurnComplete()
             }
         }
     }

@@ -74,6 +74,7 @@ import com.example.ui.components.PilotTab
 import com.example.ui.screens.AskAiScreen
 import com.example.ui.screens.AuthGateScreen
 import com.example.ui.screens.AutoChatScreen
+import com.example.ui.screens.FreeExplorerScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.SettingsLogsScreen
 import com.example.ui.screens.signOutFromFirebase
@@ -109,6 +110,7 @@ class MainActivity : ComponentActivity() {
         requestedTabState.value = when (tabKey) {
             "AUTO_CHAT" -> PilotTab.AUTO_CHAT
             "ASK_AI" -> PilotTab.ASK_AI
+            "EXPLORER", "FREE_EXPLORER" -> PilotTab.EXPLORER
             "SETTINGS" -> PilotTab.SETTINGS
             else -> PilotTab.HOME
         }
@@ -157,13 +159,22 @@ private fun LivePilotAppEntry(
         }
 
         val signedInUser = currentUser
+        var openOfflineExplorer by rememberSaveable { mutableStateOf(false) }
         if (signedInUser == null) {
-            AuthGateScreen(
-                deviceProfile = deviceProfile,
-                onSignedIn = {
-                    currentUser = runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull()
-                }
-            )
+            if (openOfflineExplorer) {
+                FreeExplorerScreen(
+                    standaloneMode = true,
+                    onExitStandalone = { openOfflineExplorer = false }
+                )
+            } else {
+                AuthGateScreen(
+                    deviceProfile = deviceProfile,
+                    onSignedIn = {
+                        currentUser = runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull()
+                    },
+                    onOpenFreeExplorer = { openOfflineExplorer = true }
+                )
+            }
         } else {
             val sessionKey = "${firebaseConfigRev}_${signedInUser.uid}"
             key(sessionKey) {
@@ -434,10 +445,15 @@ private fun LivePilotAppRoot(
                             isCallActive = sessionState.isServiceRunning,
                             onSelectTextModel = { viewModel.updateTextModel(it) },
                             onToggleSearchGrounding = { viewModel.toggleSearchGrounding(it) },
+                            onToggleImageMode = { viewModel.toggleImageGenerationMode(it) },
                             onAddAttachments = { viewModel.addAskAiAttachments(it) },
                             onRemoveAttachment = { viewModel.removeAskAiAttachment(it) },
                             onSendPrompt = { viewModel.sendAskAiPrompt(it) },
                             onSendToLiveCall = { viewModel.sendSilentCommandToCall(it) },
+                            onSaveGeneratedImage = { viewModel.saveGeneratedImageToGallery(it) },
+                            onShareGeneratedImage = { path, caption ->
+                                viewModel.shareGeneratedImage(path, caption)
+                            },
                             onClearThread = { viewModel.clearAskAiThread() }
                         )
 
@@ -470,7 +486,15 @@ private fun LivePilotAppRoot(
                             },
                             onTogglePersonalDataShare = { viewModel.togglePersonalDataShare(it) },
                             onDeletePersonalData = { viewModel.deletePersonalDataEntry(it) },
+                            onSaveGeneratedImage = { viewModel.saveGeneratedImageToGallery(it) },
+                            onShareGeneratedImage = { path, caption, pkg ->
+                                viewModel.shareGeneratedImage(path, caption, pkg)
+                            },
                             onClearFeed = { viewModel.clearIncomingFeed() }
+                        )
+
+                        PilotTab.EXPLORER -> FreeExplorerScreen(
+                            standaloneMode = false
                         )
 
                         PilotTab.SETTINGS -> SettingsLogsScreen(
