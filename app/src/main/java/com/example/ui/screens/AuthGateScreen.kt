@@ -22,11 +22,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Login
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CloudDone
-import androidx.compose.material.icons.filled.Login
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -103,12 +103,14 @@ fun AuthGateScreen(
 
     // Silent auto sign-in attempt on launch (separate GetCredentialRequest using GetGoogleIdOption only)
     LaunchedEffect(Unit) {
-        if (Firebase.auth.currentUser != null) {
+        if (runCatching { Firebase.auth.currentUser }.getOrNull() != null) {
             onSignedIn()
             return@LaunchedEffect
         }
         val webClientId = runCatching { context.getString(R.string.default_web_client_id) }.getOrNull()
-        if (webClientId.isNullOrBlank()) return@LaunchedEffect
+        if (webClientId.isNullOrBlank() || webClientId.startsWith("000000000000-")) {
+            return@LaunchedEffect
+        }
         try {
             val credentialManager = CredentialManager.create(context)
             val silentOption = GetGoogleIdOption.Builder()
@@ -132,8 +134,8 @@ fun AuthGateScreen(
             throw e
         } catch (_: NoCredentialException) {
             // No previously authorized account; wait cleanly for user tap
-        } catch (_: GetCredentialCancellationException) {
-            // User dismissed prompt
+        } catch (e: GetCredentialCancellationException) {
+            Log.w("Auth", "Silent Google Sign-In dismissed by user", e)
         } catch (e: Exception) {
             Log.d("AuthGate", "Silent sign-in skipped: ${e.message}")
         } finally {
@@ -148,6 +150,10 @@ fun AuthGateScreen(
             errorMessage = null
             try {
                 val webClientId = context.getString(R.string.default_web_client_id)
+                if (webClientId.isBlank() || webClientId.startsWith("000000000000-")) {
+                    errorMessage = "এই Release APK-তে Firebase কনফিগারেশন (app/google-services.json) যুক্ত করা হয়নি। GitHub Repository Secrets-এ GOOGLE_SERVICES_JSON যোগ করে পুনরায় বিল্ড করুন।"
+                    return@launch
+                }
                 val credentialManager = CredentialManager.create(context)
                 val googleOption = GetSignInWithGoogleOption.Builder(webClientId).build()
                 val request = GetCredentialRequest.Builder()
@@ -166,8 +172,8 @@ fun AuthGateScreen(
                 }
             } catch (e: CancellationException) {
                 throw e
-            } catch (_: GetCredentialCancellationException) {
-                // User cancelled — show no error
+            } catch (e: GetCredentialCancellationException) {
+                Log.w("Auth", "Interactive Google Sign-In cancelled by user", e)
             } catch (e: Exception) {
                 Log.e("AuthGate", "Google Sign-In failed", e)
                 errorMessage = "Google লগইন ব্যর্থ হয়েছে: ${e.localizedMessage ?: "আবার চেষ্টা করুন"}"
@@ -283,7 +289,7 @@ fun AuthGateScreen(
                         text = "আপনার \"আমার ডাটা\" (My Data), রুটিন ও চ্যাট হিস্ট্রি Firebase-এ সুরক্ষিত থাকবে — অ্যাপ ডিলিট করলেও মুছবে না।"
                     )
                     FeatureRow(
-                        icon = Icons.Filled.VolumeUp,
+                        icon = Icons.AutoMirrored.Filled.VolumeUp,
                         tint = palette.roseAccent,
                         text = "স্ক্রিন অফ থাকলেও গুরুত্বপূর্ণ মেসেজ জোরে পড়ে শোনাবে ও দূর থেকে আপনার ভয়েস শুনে অটো রিপ্লাই দেবে।"
                     )
@@ -329,7 +335,7 @@ fun AuthGateScreen(
                     Text("সাইন-ইন হচ্ছে...", style = MaterialTheme.typography.titleSmall)
                 } else {
                     Icon(
-                        imageVector = Icons.Filled.Login,
+                        imageVector = Icons.AutoMirrored.Filled.Login,
                         contentDescription = "Sign in with Google",
                         modifier = Modifier.size(20.dp)
                     )

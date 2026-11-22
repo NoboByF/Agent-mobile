@@ -115,10 +115,12 @@ jobs:
             echo "newly_generated=true" >> "$GITHUB_OUTPUT"
           fi
 
+          FINGERPRINT_SHA1=$(keytool -list -v -keystore "$TARGET_JKS" -alias upload -storepass "$STORE_PASS" | awk -F'SHA1: ' '/SHA1:/ && !found {print $2; found=1}')
           FINGERPRINT=$(keytool -list -v -keystore "$TARGET_JKS" -alias upload -storepass "$STORE_PASS" | awk -F'SHA256: ' '/SHA256:/ && !found {print $2; found=1}')
           NEXT_VERSION_CODE=$((100 + GITHUB_RUN_NUMBER))
           NEXT_VERSION_NAME="2.0.${GITHUB_RUN_NUMBER}"
 
+          echo "sha1=$FINGERPRINT_SHA1" >> "$GITHUB_OUTPUT"
           echo "sha256=$FINGERPRINT" >> "$GITHUB_OUTPUT"
           echo "version_code=$NEXT_VERSION_CODE" >> "$GITHUB_OUTPUT"
           echo "version_name=$NEXT_VERSION_NAME" >> "$GITHUB_OUTPUT"
@@ -129,6 +131,76 @@ jobs:
           echo "VERSION_CODE=$NEXT_VERSION_CODE" >> "$GITHUB_ENV"
           echo "VERSION_NAME=$NEXT_VERSION_NAME" >> "$GITHUB_ENV"
 
+      - name: Prepare Firebase google-services.json
+        id: prepare-firebase
+        env:
+          SECRET_GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          SECRET_GOOGLE_SERVICES_JSON_B64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          set -euo pipefail
+          TARGET_GS="$GITHUB_WORKSPACE/app/google-services.json"
+
+          if [ -n "$SECRET_GOOGLE_SERVICES_JSON_B64" ]; then
+            echo "Restoring app/google-services.json from GitHub Secret GOOGLE_SERVICES_JSON_BASE64."
+            printf '%s' "$SECRET_GOOGLE_SERVICES_JSON_B64" | tr -d '[:space:]' | base64 -d > "$TARGET_GS"
+            echo "firebase_source=GitHub Secret (GOOGLE_SERVICES_JSON_BASE64)" >> "$GITHUB_OUTPUT"
+            echo "is_placeholder=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$SECRET_GOOGLE_SERVICES_JSON" ]; then
+            echo "Restoring app/google-services.json from GitHub Secret GOOGLE_SERVICES_JSON."
+            printf '%s' "$SECRET_GOOGLE_SERVICES_JSON" > "$TARGET_GS"
+            echo "firebase_source=GitHub Secret (GOOGLE_SERVICES_JSON)" >> "$GITHUB_OUTPUT"
+            echo "is_placeholder=false" >> "$GITHUB_OUTPUT"
+          elif [ -f "$TARGET_GS" ]; then
+            echo "Using app/google-services.json from repository."
+            echo "firebase_source=Repository (app/google-services.json)" >> "$GITHUB_OUTPUT"
+            echo "is_placeholder=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::app/google-services.json is missing in repo and GitHub Secrets. Generating a CI fallback file so Release APK compiles cleanly. Add GOOGLE_SERVICES_JSON secret + Release SHA-1 in Firebase Console for Google Sign-In & Cloud Sync."
+            cat > "$TARGET_GS" <<'EOF'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "livepilot-ci-placeholder",
+              "storage_bucket": "livepilot-ci-placeholder.firebasestorage.app"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.aistudio.livepilotai.k7m2x9"
+                  }
+                },
+                "oauth_client": [
+                  {
+                    "client_id": "000000000000-ci-placeholder.apps.googleusercontent.com",
+                    "client_type": 3
+                  }
+                ],
+                "api_key": [
+                  {
+                    "current_key": "CI_PLACEHOLDER_ADD_GOOGLE_SERVICES_JSON_SECRET"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": [
+                      {
+                        "client_id": "000000000000-ci-placeholder.apps.googleusercontent.com",
+                        "client_type": 3
+                      }
+                    ]
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+            echo "firebase_source=CI Placeholder (Add GOOGLE_SERVICES_JSON Secret)" >> "$GITHUB_OUTPUT"
+            echo "is_placeholder=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build Signed Release APK
         run: gradle :app:assembleRelease --no-daemon
 
@@ -138,7 +210,13 @@ jobs:
             echo "### LivePilot AI Release Build #${{ github.run_number }}"
             echo "- **Version:** \`${{ steps.prepare-keystore.outputs.version_name }}\` (versionCode \`${{ steps.prepare-keystore.outputs.version_code }}\`)"
             echo "- **Keystore Source:** ${{ steps.prepare-keystore.outputs.source }}"
+            echo "- **Firebase Config:** ${{ steps.prepare-firebase.outputs.firebase_source }}"
+            echo "- **Certificate SHA-1 (for Firebase Google Sign-In):** \`${{ steps.prepare-keystore.outputs.sha1 }}\`"
             echo "- **Certificate SHA-256:** \`${{ steps.prepare-keystore.outputs.sha256 }}\`"
+            if [ "${{ steps.prepare-firebase.outputs.is_placeholder }}" = "true" ]; then
+              echo ""
+              echo "> **Firebase Setup Required for GitHub Release APKs:** Copy \`app/google-services.json\` from AI Studio into GitHub Secret \`GOOGLE_SERVICES_JSON\` (**Settings → Secrets and variables → Actions**), and add the **SHA-1** above to your Android app (\`com.aistudio.livepilotai.k7m2x9\`) in Firebase Console so Google Sign-In & Firestore Cloud Sync work in Release APKs."
+            fi
             if [ "${{ steps.prepare-keystore.outputs.newly_generated }}" = "true" ]; then
               echo ""
               echo "> **Action Recommended (One-Time):** Download \`LivePilot-Keystore-Setup-PRIVATE\` artifact once, save the 3 values in **Settings → Secrets and variables → Actions**, then delete that artifact so updates work forever."
