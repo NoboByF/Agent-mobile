@@ -50,7 +50,7 @@ class PilotPreferences(context: Context) {
 
         val legacySingleKey = prefs.getString(KEY_API_KEY, "").orEmpty().trim()
         val parsedKeys = loadApiKeysJson()
-        val migratedKeys = if (parsedKeys.isEmpty() && legacySingleKey.isNotBlank()) {
+        val rawMigratedKeys = if (parsedKeys.isEmpty() && legacySingleKey.isNotBlank()) {
             listOf(
                 GeminiApiKeyEntry(
                     id = "key_primary",
@@ -61,6 +61,17 @@ class PilotPreferences(context: Context) {
             )
         } else {
             parsedKeys
+        }
+        val migratedKeys = if (rawMigratedKeys.count { it.enabled && it.key.isNotBlank() } == 1) {
+            rawMigratedKeys.map { entry ->
+                if (!entry.isInvalid && entry.cooldownUntilMs > 0L) {
+                    entry.copy(cooldownUntilMs = 0L, lastError = null)
+                } else {
+                    entry
+                }
+            }
+        } else {
+            rawMigratedKeys
         }
         val savedActiveId = prefs.getString(KEY_ACTIVE_API_KEY_ID, null)
         val resolvedActiveId = when {

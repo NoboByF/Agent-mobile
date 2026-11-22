@@ -217,6 +217,57 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    fun `single key never enters 60m lockout and generic billing boilerplate stays short cooldown`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = PilotPreferences(context)
+        val t0 = 2_000_000L
+
+        val googleBoilerplate429 = ApiKeyPoolManager.classifyFailure(
+            httpCode = 429,
+            message = "You exceeded your current quota, please check your plan and billing details. Quota exceeded for metric: free_tier_requests."
+        )
+        assertEquals(ApiFailureKind.RATE_LIMIT_SHORT, googleBoilerplate429.kind)
+
+        val singleKey = GeminiApiKeyEntry(
+            id = "solo_key",
+            label = "Gemini",
+            key = "AIzaSySoloTestKey00001",
+            enabled = true
+        )
+        PilotStateHub.updateSettings {
+            PilotSettings(
+                apiKey = singleKey.key,
+                apiKeys = listOf(singleKey),
+                activeApiKeyId = singleKey.id,
+                autoRotateApiKeys = true
+            )
+        }
+
+        val dailyErr = ApiKeyPoolManager.classifyFailure(
+            httpCode = 429,
+            message = "Daily quota exhausted"
+        )
+        val promoted = ApiKeyPoolManager.reportFailureAndRotate("solo_key", dailyErr, nowMs = t0)
+        assertNull(promoted)
+
+        // Single key must remain immediately selectable (never 0/1 READY / WAIT 59m)
+        val afterFailure = PilotStateHub.settings.value
+        assertEquals(0L, afterFailure.apiKeys.first().cooldownUntilMs)
+        assertEquals(1, afterFailure.healthyKeyCount(nowMs = t0 + 1_000L))
+        assertEquals("solo_key", ApiKeyPoolManager.selectBestKey(nowMs = t0 + 1_000L).entry?.id)
+
+        // Legacy persisted cooldown on a single key heals automatically on loadSettings()
+        prefs.saveSettings(
+            afterFailure.copy(
+                apiKeys = listOf(singleKey.copy(cooldownUntilMs = t0 + 3_600_000L, lastError = "Old cooldown"))
+            )
+        )
+        val healed = prefs.loadSettings()
+        assertEquals(0L, healed.apiKeys.first().cooldownUntilMs)
+        assertNull(healed.apiKeys.first().lastError)
+    }
+
+    @Test
     fun `addKeysFromInput parses multi-line keys, deduplicates, and legacy single key migrates cleanly`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val rawPrefs = context.getSharedPreferences("livepilot_ai_secure_prefs", Context.MODE_PRIVATE)

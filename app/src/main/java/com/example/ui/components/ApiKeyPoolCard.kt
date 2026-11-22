@@ -88,7 +88,9 @@ fun ApiKeyPoolCard(
     // Periodic clock tick when any key is in cooldown so countdown labels update live
     var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val hasCooldownKey = settings.apiKeys.any { it.isCoolingDown(nowMs) }
-    val hasUnhealthyKey = settings.apiKeys.any { it.isInvalid || it.isCoolingDown(nowMs) }
+    val hasUnhealthyKey = settings.apiKeys.any {
+        it.isInvalid || it.isCoolingDown(nowMs) || !it.lastError.isNullOrBlank()
+    }
     LaunchedEffect(hasCooldownKey) {
         if (!hasCooldownKey) return@LaunchedEffect
         while (true) {
@@ -223,7 +225,11 @@ fun ApiKeyPoolCard(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
-                    text = "Reset All Cooldowns & Retry Flags",
+                    text = if (hasCooldownKey || settings.apiKeys.any { it.isInvalid }) {
+                        "Reset All Cooldowns & Retry Flags"
+                    } else {
+                        "Clear Error Notice"
+                    },
                     style = MaterialTheme.typography.labelLarge,
                     color = palette.amberAccent
                 )

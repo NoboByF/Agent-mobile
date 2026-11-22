@@ -79,54 +79,6 @@ object ApiKeyPoolManager {
             )
         }
 
-        // Quota / Rate Limit detection
-        val isQuotaOrRate = httpCode == 429 ||
-            lower.contains("resource_exhausted") ||
-            lower.contains("quota") ||
-            lower.contains("rate limit") ||
-            lower.contains("rate-limit") ||
-            lower.contains("too many requests") ||
-            lower.contains("exceeded") ||
-            lower.contains("limit: 0") ||
-            lower.contains("billing") ||
-            lower.contains("exhausted")
-
-        if (isQuotaOrRate) {
-            val isDailyOrHardQuota = lower.contains("per day") ||
-                lower.contains("daily") ||
-                lower.contains("rpd") ||
-                lower.contains("limit: 0") ||
-                lower.contains("billing") ||
-                lower.contains("free tier")
-
-            val isMinuteRateLimit = !isDailyOrHardQuota && (
-                lower.contains("per minute") ||
-                    lower.contains("rpm") ||
-                    lower.contains("tpm") ||
-                    lower.contains("rate limit") ||
-                    lower.contains("rate-limit") ||
-                    lower.contains("too many requests")
-                )
-
-            return when {
-                isDailyOrHardQuota -> ApiFailureClassification(
-                    kind = ApiFailureKind.QUOTA_EXHAUSTED,
-                    cooldownMs = COOLDOWN_QUOTA_DAILY_MS,
-                    summary = "Daily quota exhausted (60m cooldown)"
-                )
-                isMinuteRateLimit -> ApiFailureClassification(
-                    kind = ApiFailureKind.RATE_LIMIT_SHORT,
-                    cooldownMs = COOLDOWN_SHORT_RATE_LIMIT_MS,
-                    summary = "Rate limit hit (90s cooldown)"
-                )
-                else -> ApiFailureClassification(
-                    kind = ApiFailureKind.QUOTA_EXHAUSTED,
-                    cooldownMs = COOLDOWN_QUOTA_STANDARD_MS,
-                    summary = "Quota exhausted (15m cooldown)"
-                )
-            }
-        }
-
         // WebSocket policy/server close codes when paired with key/quota hints
         if (wsCloseCode == 1008) {
             return if (lower.contains("key") || lower.contains("auth") || lower.contains("unauth")) {
@@ -141,11 +93,17 @@ object ApiKeyPoolManager {
                     cooldownMs = 0L,
                     summary = raw.take(100)
                 )
-            } else {
+            } else if (lower.contains("quota") || lower.contains("exhausted") || lower.contains("limit") || lower.contains("billing")) {
                 ApiFailureClassification(
                     kind = ApiFailureKind.QUOTA_EXHAUSTED,
                     cooldownMs = COOLDOWN_QUOTA_STANDARD_MS,
                     summary = "WS 1008: Policy/Quota limit"
+                )
+            } else {
+                ApiFailureClassification(
+                    kind = ApiFailureKind.TRANSIENT,
+                    cooldownMs = 0L,
+                    summary = raw.ifBlank { "WS 1008 closed" }.take(100)
                 )
             }
         }
@@ -156,6 +114,57 @@ object ApiKeyPoolManager {
                 cooldownMs = COOLDOWN_QUOTA_STANDARD_MS,
                 summary = "WS 1011: Server quota limit"
             )
+        }
+
+        // Quota / Rate Limit detection
+        val isQuotaOrRate = httpCode == 429 ||
+            lower.contains("resource_exhausted") ||
+            lower.contains("quota") ||
+            lower.contains("rate limit") ||
+            lower.contains("rate-limit") ||
+            lower.contains("too many requests") ||
+            lower.contains("exceeded") ||
+            lower.contains("limit: 0") ||
+            lower.contains("billing") ||
+            lower.contains("exhausted")
+
+        if (isQuotaOrRate) {
+            val isDailyOrHardQuota = lower.contains("per day") ||
+                lower.contains("requests per day") ||
+                lower.contains("rpd") ||
+                lower.contains("daily") ||
+                lower.contains("limit: 0") ||
+                lower.contains("billing not enabled") ||
+                lower.contains("enable billing") ||
+                lower.contains("billing account")
+
+            val isMinuteRateLimit = !isDailyOrHardQuota && (
+                lower.contains("per minute") ||
+                    lower.contains("rpm") ||
+                    lower.contains("tpm") ||
+                    lower.contains("rate limit") ||
+                    lower.contains("rate-limit") ||
+                    lower.contains("too many requests") ||
+                    lower.contains("check your plan")
+                )
+
+            return when {
+                isDailyOrHardQuota -> ApiFailureClassification(
+                    kind = ApiFailureKind.QUOTA_EXHAUSTED,
+                    cooldownMs = COOLDOWN_QUOTA_DAILY_MS,
+                    summary = "Daily quota exhausted (60m cooldown)"
+                )
+                isMinuteRateLimit -> ApiFailureClassification(
+                    kind = ApiFailureKind.RATE_LIMIT_SHORT,
+                    cooldownMs = COOLDOWN_SHORT_RATE_LIMIT_MS,
+                    summary = "Rate limit hit (90s cooldown)"
+                )
+                else -> ApiFailureClassification(
+                    kind = ApiFailureKind.RATE_LIMIT_SHORT,
+                    cooldownMs = COOLDOWN_SHORT_RATE_LIMIT_MS,
+                    summary = "Rate limit / quota hit (90s cooldown)"
+                )
+            }
         }
 
         return ApiFailureClassification(
@@ -183,6 +192,16 @@ object ApiKeyPoolManager {
 
         val activeIndex = enabledKeys.indexOfFirst { it.id == settings.activeApiKeyId }
             .takeIf { it >= 0 } ?: 0
+
+        // Single-key mode: never lock out a valid key behind a cooldown timer when there are no backup keys to switch to.
+        if (enabledKeys.size == 1) {
+            val single = enabledKeys.first()
+            return if (single.id !in excludeIds && !single.isInvalid) {
+                KeySelectionOutcome(entry = single, totalEnabledKeys = 1)
+            } else {
+                KeySelectionOutcome(entry = null, nextAvailableInSec = 0L, totalEnabledKeys = 1)
+            }
+        }
 
         if (!settings.autoRotateApiKeys) {
             val activeCandidate = enabledKeys[activeIndex]
@@ -276,6 +295,9 @@ object ApiKeyPoolManager {
             if (failedIdx < 0) return@updateSettings current
 
             failedLabel = pool[failedIdx].label
+            val enabledCount = pool.count { it.enabled && it.key.isNotBlank() }
+            val hasBackupKey = current.autoRotateApiKeys && enabledCount > 1
+
             val updatedPool = pool.map { entry ->
                 if (entry.id == failedKeyId) {
                     when (classification.kind) {
@@ -286,11 +308,20 @@ object ApiKeyPoolManager {
                             lastUsedAtMs = nowMs
                         )
                         ApiFailureKind.RATE_LIMIT_SHORT,
-                        ApiFailureKind.QUOTA_EXHAUSTED -> entry.copy(
-                            cooldownUntilMs = nowMs + classification.cooldownMs,
-                            lastError = classification.summary,
-                            lastUsedAtMs = nowMs
-                        )
+                        ApiFailureKind.QUOTA_EXHAUSTED -> if (hasBackupKey) {
+                            entry.copy(
+                                cooldownUntilMs = nowMs + classification.cooldownMs,
+                                lastError = classification.summary,
+                                lastUsedAtMs = nowMs
+                            )
+                        } else {
+                            // No backup keys to rotate to: record error notice without locking out the user's only key
+                            entry.copy(
+                                cooldownUntilMs = 0L,
+                                lastError = "Rate/quota notice (auto-retry ready): ${classification.summary}",
+                                lastUsedAtMs = nowMs
+                            )
+                        }
                         ApiFailureKind.TRANSIENT -> entry
                     }
                 } else {
@@ -298,7 +329,7 @@ object ApiKeyPoolManager {
                 }
             }
 
-            if (current.autoRotateApiKeys) {
+            if (hasBackupKey) {
                 for (offset in 1 until updatedPool.size) {
                     val candidate = updatedPool[(failedIdx + offset) % updatedPool.size]
                     if (candidate.isAvailable(nowMs)) {

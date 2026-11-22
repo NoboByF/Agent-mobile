@@ -302,7 +302,11 @@ class GeminiLiveClient(
                 return
             } else {
                 val selection = ApiKeyPoolManager.selectBestKey()
-                val exhaustedMsg = ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
+                val exhaustedMsg = if (selection.entry != null) {
+                    "Live API limit reached: $reason"
+                } else {
+                    ApiKeyPoolManager.buildNoKeyAvailableMessage(selection)
+                }
                 callbacks.onConnectionPhaseChanged(LiveConnectionPhase.ERROR, exhaustedMsg)
                 PilotStateHub.log(LogLevel.ERROR, "KeyPool", exhaustedMsg)
                 return

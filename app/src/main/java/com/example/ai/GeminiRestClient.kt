@@ -55,6 +55,7 @@ object GeminiRestClient {
     private inline fun <T> executeWithPoolFailover(
         explicitApiKey: String,
         tag: String,
+        penalizeKeyOnQuota: Boolean = true,
         block: (keyEntry: GeminiApiKeyEntry?, rawApiKey: String) -> T
     ): T {
         val settings = PilotStateHub.settings.value
@@ -112,6 +113,19 @@ object GeminiRestClient {
                         }
                         throw e
                     }
+                    // If caller still has fallback models to try (e.g., 2.5-pro 429 -> 2.5-flash),
+                    // only rotate to another key for this model without locking out the key for fallback models.
+                    if (!penalizeKeyOnQuota && classification.kind != ApiFailureKind.INVALID_KEY) {
+                        if (attempt < maxAttempts) {
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                tag,
+                                "Model quota on ${entry.label}; trying another key before model fallback..."
+                            )
+                            break
+                        }
+                        throw e
+                    }
                     val promoted = ApiKeyPoolManager.reportFailureAndRotate(
                         failedKeyId = entry.id,
                         classification = classification
@@ -128,7 +142,7 @@ object GeminiRestClient {
                         settings = PilotStateHub.settings.value,
                         excludeIds = triedIds
                     )
-                    if (nextSelection.entry == null) {
+                    if (nextSelection.entry == null && pool.count { it.enabled && it.key.isNotBlank() } > 1) {
                         throw IllegalStateException(
                             "${e.message} • ${ApiKeyPoolManager.buildNoKeyAvailableMessage(nextSelection)}"
                         )
@@ -222,7 +236,8 @@ object GeminiRestClient {
         apiKey: String = "",
         modelId: String,
         history: List<AskAiMessage>,
-        enableGoogleSearch: Boolean
+        enableGoogleSearch: Boolean,
+        allowModelFallback: Boolean = true
     ): Result<ChatGenerationResult> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
@@ -251,62 +266,91 @@ object GeminiRestClient {
             }
             val bodyJson = payload.toString()
 
-            executeWithPoolFailover(apiKey, "AskAI") { entry, activeKey ->
-                val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
-                val url = "$REST_BASE/models/$cleanModel:generateContent?key=$encodedKey"
-                val request = Request.Builder()
-                    .url(url)
-                    .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
-                    .build()
+            val modelsToTry = if (allowModelFallback && cleanModel != "gemini-2.5-flash") {
+                listOf(cleanModel, "gemini-2.5-flash")
+            } else {
+                listOf(cleanModel)
+            }
+            var lastChatError: Throwable? = null
+            for ((idx, targetModel) in modelsToTry.withIndex()) {
+                val hasNextModel = idx < modelsToTry.lastIndex
+                try {
+                    return@runCatching executeWithPoolFailover(
+                        explicitApiKey = apiKey,
+                        tag = "AskAI",
+                        penalizeKeyOnQuota = !hasNextModel
+                    ) { entry, activeKey ->
+                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                        val url = "$REST_BASE/models/$targetModel:generateContent?key=$encodedKey"
+                        val request = Request.Builder()
+                            .url(url)
+                            .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+                            .build()
 
-                val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
-                PilotStateHub.log(
-                    LogLevel.INFO,
-                    "AskAI",
-                    "Calling $cleanModel$labelSuffix (searchGrounding=$enableGoogleSearch)..."
-                )
+                        val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
+                        PilotStateHub.log(
+                            LogLevel.INFO,
+                            "AskAI",
+                            "Calling $targetModel$labelSuffix (searchGrounding=$enableGoogleSearch)..."
+                        )
 
-                client.newCall(request).execute().use { response ->
-                    val bodyStr = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        val errMsg = extractApiError(bodyStr, response.code)
-                        PilotStateHub.log(LogLevel.ERROR, "AskAI", "Error$labelSuffix: $errMsg")
-                        throw GeminiHttpException(response.code, errMsg)
-                    }
-
-                    val root = JSONObject(bodyStr)
-                    val candidates = root.optJSONArray("candidates")
-                    val firstCandidate = candidates?.optJSONObject(0)
-                        ?: error("No response candidate returned by $cleanModel.")
-
-                    val parts = firstCandidate.optJSONObject("content")?.optJSONArray("parts")
-                    val sb = StringBuilder()
-                    if (parts != null) {
-                        for (i in 0 until parts.length()) {
-                            val t = parts.optJSONObject(i)?.optString("text", "").orEmpty()
-                            if (t.isNotBlank()) {
-                                if (sb.isNotEmpty()) sb.append("\n")
-                                sb.append(t)
+                        client.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                val errMsg = extractApiError(bodyStr, response.code)
+                                PilotStateHub.log(LogLevel.ERROR, "AskAI", "Error$labelSuffix: $errMsg")
+                                throw GeminiHttpException(response.code, errMsg)
                             }
+
+                            val root = JSONObject(bodyStr)
+                            val candidates = root.optJSONArray("candidates")
+                            val firstCandidate = candidates?.optJSONObject(0)
+                                ?: error("No response candidate returned by $targetModel.")
+
+                            val parts = firstCandidate.optJSONObject("content")?.optJSONArray("parts")
+                            val sb = StringBuilder()
+                            if (parts != null) {
+                                for (i in 0 until parts.length()) {
+                                    val t = parts.optJSONObject(i)?.optString("text", "").orEmpty()
+                                    if (t.isNotBlank()) {
+                                        if (sb.isNotEmpty()) sb.append("\n")
+                                        sb.append(t)
+                                    }
+                                }
+                            }
+
+                            val citations = parseGroundingCitations(firstCandidate.optJSONObject("groundingMetadata"))
+                            val finalText = sb.toString().trim().ifBlank { "I couldn't generate a text reply for that prompt." }
+
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                "AskAI",
+                                "Received response$labelSuffix (${finalText.length} chars, ${citations.size} web sources)."
+                            )
+                            ChatGenerationResult(
+                                text = finalText,
+                                citations = citations,
+                                modelUsed = targetModel,
+                                keyLabelUsed = entry?.label
+                            )
                         }
                     }
-
-                    val citations = parseGroundingCitations(firstCandidate.optJSONObject("groundingMetadata"))
-                    val finalText = sb.toString().trim().ifBlank { "I couldn't generate a text reply for that prompt." }
-
-                    PilotStateHub.log(
-                        LogLevel.INFO,
-                        "AskAI",
-                        "Received response$labelSuffix (${finalText.length} chars, ${citations.size} web sources)."
-                    )
-                    ChatGenerationResult(
-                        text = finalText,
-                        citations = citations,
-                        modelUsed = cleanModel,
-                        keyLabelUsed = entry?.label
-                    )
+                } catch (e: Throwable) {
+                    lastChatError = e
+                    val msg = e.message.orEmpty()
+                    val canFallback = hasNextModel && (
+                        (e is GeminiHttpException && (e.httpCode == 404 || e.httpCode == 429 || e.httpCode in 500..599)) ||
+                            msg.contains("429") || msg.contains("404") || msg.contains("503") ||
+                            msg.contains("quota", ignoreCase = true) || msg.contains("high demand", ignoreCase = true)
+                        )
+                    if (canFallback) {
+                        PilotStateHub.log(LogLevel.INFO, "AskAI", "Model '$targetModel' unavailable; falling back to '${modelsToTry[idx + 1]}'")
+                        continue
+                    }
+                    throw e
                 }
             }
+            throw lastChatError ?: IllegalStateException("Chat generation failed.")
         }
     }
 
@@ -358,34 +402,62 @@ object GeminiRestClient {
                 )
             val bodyJson = payload.toString()
 
-            executeWithPoolFailover(apiKey, "AutoReply") { _, activeKey ->
-                val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
-                val request = Request.Builder()
-                    .url("$REST_BASE/models/$cleanModel:generateContent?key=$encodedKey")
-                    .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
-                    .build()
+            val modelsToTry = if (cleanModel != "gemini-2.5-flash") {
+                listOf(cleanModel, "gemini-2.5-flash")
+            } else {
+                listOf(cleanModel)
+            }
+            var lastAutoError: Throwable? = null
+            for ((idx, targetModel) in modelsToTry.withIndex()) {
+                val hasNextModel = idx < modelsToTry.lastIndex
+                try {
+                    return@runCatching executeWithPoolFailover(
+                        explicitApiKey = apiKey,
+                        tag = "AutoReply",
+                        penalizeKeyOnQuota = !hasNextModel
+                    ) { _, activeKey ->
+                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                        val request = Request.Builder()
+                            .url("$REST_BASE/models/$targetModel:generateContent?key=$encodedKey")
+                            .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+                            .build()
 
-                client.newCall(request).execute().use { response ->
-                    val bodyStr = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        throw GeminiHttpException(response.code, extractApiError(bodyStr, response.code))
-                    }
-                    val root = JSONObject(bodyStr)
-                    val parts = root.optJSONArray("candidates")
-                        ?.optJSONObject(0)
-                        ?.optJSONObject("content")
-                        ?.optJSONArray("parts")
-                    val reply = buildString {
-                        if (parts != null) {
-                            for (i in 0 until parts.length()) {
-                                append(parts.optJSONObject(i)?.optString("text", "").orEmpty())
+                        client.newCall(request).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                throw GeminiHttpException(response.code, extractApiError(bodyStr, response.code))
                             }
+                            val root = JSONObject(bodyStr)
+                            val parts = root.optJSONArray("candidates")
+                                ?.optJSONObject(0)
+                                ?.optJSONObject("content")
+                                ?.optJSONArray("parts")
+                            val reply = buildString {
+                                if (parts != null) {
+                                    for (i in 0 until parts.length()) {
+                                        append(parts.optJSONObject(i)?.optString("text", "").orEmpty())
+                                    }
+                                }
+                            }.trim().removeSurrounding("\"")
+                            require(reply.isNotBlank()) { "Empty auto-reply returned." }
+                            reply
                         }
-                    }.trim().removeSurrounding("\"")
-                    require(reply.isNotBlank()) { "Empty auto-reply returned." }
-                    reply
+                    }
+                } catch (e: Throwable) {
+                    lastAutoError = e
+                    val msg = e.message.orEmpty()
+                    val canFallback = hasNextModel && (
+                        (e is GeminiHttpException && (e.httpCode == 404 || e.httpCode == 429 || e.httpCode in 500..599)) ||
+                            msg.contains("429") || msg.contains("404") || msg.contains("503") ||
+                            msg.contains("quota", ignoreCase = true) || msg.contains("high demand", ignoreCase = true)
+                        )
+                    if (canFallback) {
+                        continue
+                    }
+                    throw e
                 }
             }
+            throw lastAutoError ?: IllegalStateException("Auto-reply generation failed.")
         }
     }
 
@@ -533,10 +605,15 @@ object GeminiRestClient {
 
             for ((idx, candidateModel) in modelCandidates.withIndex()) {
                 var allowThinkingConfig = candidateModel.contains("2.5")
+                val hasFallbackModel = allowModelFallback && idx < modelCandidates.lastIndex
                 while (true) {
                     try {
                         val bodyJson = buildPayloadJson(candidateModel, allowThinkingConfig)
-                        return@runCatching executeWithPoolFailover(apiKey, "AutoPilot") { entry, activeKey ->
+                        return@runCatching executeWithPoolFailover(
+                            explicitApiKey = apiKey,
+                            tag = "AutoPilot",
+                            penalizeKeyOnQuota = !hasFallbackModel
+                        ) { entry, activeKey ->
                             val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
                             val url = "$REST_BASE/models/$candidateModel:generateContent?key=$encodedKey"
                             val request = Request.Builder()
@@ -718,7 +795,8 @@ object GeminiRestClient {
                     timestamp = PilotStateHub.formatNow()
                 )
             ),
-            enableGoogleSearch = false
+            enableGoogleSearch = false,
+            allowModelFallback = false
         )
         val latency = (System.currentTimeMillis() - started).coerceAtLeast(1L)
         return result.fold(
