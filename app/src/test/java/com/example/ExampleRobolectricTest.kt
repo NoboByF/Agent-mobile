@@ -557,6 +557,28 @@ class ExampleRobolectricTest {
         assertTrue(prompt.contains("OWNER'S SAVED PERSONAL DATA"))
         assertTrue(prompt.contains("আমি একজন Android ডেভেলপার।"))
         PilotStateHub.setPersonalData(emptyList())
+
+        // Verify zero-login JSON backup export and restore round-trip
+        val backupJson = com.example.data.DeviceBackupManager.exportToJson(
+            deviceProfile = profile,
+            settings = reloadedSettings.copy(
+                apiKeys = listOf(GeminiApiKeyEntry(id = "k1", label = "Main", key = "AIzaSyBackupKey001"))
+            ),
+            personalData = reloadedFacts,
+            allRoutines = listOf(
+                PilotRoutine("r_custom", "Morning", "Open news", "Open news app", RoutineAccent.COBALT, isBuiltIn = false)
+            ) + PilotSettings.DEFAULT_ROUTINES,
+            askAiMessages = listOf(AskAiMessage(id = 10L, isUser = true, text = "Hello", timestamp = "10:00"))
+        )
+        val restored = com.example.data.DeviceBackupManager.parseFromJson(backupJson).getOrThrow()
+        assertEquals(profile.deviceId, restored.sourceDeviceId)
+        assertEquals(1, restored.settings.apiKeys.size)
+        assertEquals("AIzaSyBackupKey001", restored.settings.apiKeys.first().key)
+        assertTrue(restored.settings.deletedModels.contains("gemini-2.0-flash"))
+        assertEquals(1, restored.personalData.size)
+        assertEquals("আমার পেশা", restored.personalData.first().title)
+        assertEquals(1, restored.customRoutines.size)
+        assertEquals(1, restored.askAiMessages.size)
     }
 }
 

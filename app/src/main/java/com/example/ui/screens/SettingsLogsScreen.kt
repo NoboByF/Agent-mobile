@@ -20,6 +20,7 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
@@ -27,6 +28,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Palette
@@ -36,6 +38,7 @@ import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -115,6 +118,7 @@ fun SettingsLogsScreen(
     settings: PilotSettings,
     deviceProfile: DeviceProfileIdentity,
     userEmail: String?,
+    isCloudSignedIn: Boolean,
     cloudSyncStatus: String,
     discoveredModels: List<DiscoveredModel>,
     isFetchingModels: Boolean,
@@ -125,6 +129,9 @@ fun SettingsLogsScreen(
     logs: List<DiagnosticLogEntry>,
     onSyncNow: () -> Unit,
     onSignOut: () -> Unit,
+    onOpenGoogleSignIn: () -> Unit,
+    onExportBackupFile: () -> Unit,
+    onImportBackupFile: () -> Unit,
     onAddApiKeys: (String, String) -> Unit,
     onSetActiveApiKey: (String) -> Unit,
     onToggleApiKeyEnabled: (String) -> Unit,
@@ -282,21 +289,29 @@ fun SettingsLogsScreen(
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Column {
                                     Text(
-                                        text = "Firebase ডিভাইস ক্লাউড প্রোফাইল",
+                                        text = if (isCloudSignedIn) {
+                                            "Firebase ডিভাইস ক্লাউড প্রোফাইল"
+                                        } else {
+                                            "অটো ডিভাইস প্রোফাইল ও ব্যাকআপ"
+                                        },
                                         style = MaterialTheme.typography.titleMedium,
                                         color = palette.inkPrimary
                                     )
                                     Text(
-                                        text = userEmail ?: "Signed in",
+                                        text = if (isCloudSignedIn) {
+                                            userEmail ?: "Google Signed In"
+                                        } else {
+                                            "লগইন ছাড়াই অটো চালু • শুধু এই মোবাইলের ডাটা"
+                                        },
                                         style = MaterialTheme.typography.bodySmall,
                                         color = palette.inkSecondary
                                     )
                                 }
                             }
                             StatusPillBadge(
-                                label = "ISOLATED",
-                                accentColor = palette.emeraldAccent,
-                                containerColor = palette.emeraldSoft
+                                label = if (isCloudSignedIn) "CLOUD" else "AUTO LOCAL",
+                                accentColor = if (isCloudSignedIn) palette.emeraldAccent else palette.cobaltAccent,
+                                containerColor = if (isCloudSignedIn) palette.emeraldSoft else palette.cobaltSoft
                             )
                         }
 
@@ -331,7 +346,7 @@ fun SettingsLogsScreen(
                                 )
                                 Spacer(modifier = Modifier.height(4.dp))
                                 Text(
-                                    text = "$cloudSyncStatus • এই মোবাইলের API Key, ডিলিট করা মডেল ও ডাটা অন্য মোবাইলে যাবে না।",
+                                    text = "$cloudSyncStatus • এই মোবাইলের API Key, ডিলিট করা মডেল ও আমার ডাটা আলাদাভাবে সংরক্ষিত আছে।",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = palette.inkSecondary
                                 )
@@ -339,44 +354,110 @@ fun SettingsLogsScreen(
                         }
 
                         Spacer(modifier = Modifier.height(10.dp))
+                        // 1-Tap Backup Export & Restore (works without Google Sign-In!)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             OutlinedButton(
-                                onClick = onSyncNow,
+                                onClick = onExportBackupFile,
                                 modifier = Modifier
                                     .weight(1f)
                                     .height(48.dp)
-                                    .testTag("settings_cloud_sync_button"),
+                                    .testTag("settings_export_backup_button"),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.Filled.Sync,
-                                    contentDescription = "Sync now",
+                                    imageVector = Icons.Filled.Download,
+                                    contentDescription = "Save backup file",
+                                    tint = palette.cobaltAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("ব্যাকআপ সেভ", color = palette.inkPrimary, maxLines = 1)
+                            }
+                            OutlinedButton(
+                                onClick = onImportBackupFile,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("settings_import_backup_button"),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.UploadFile,
+                                    contentDescription = "Restore backup file",
                                     tint = palette.emeraldAccent,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Sync Now", color = palette.inkPrimary)
+                                Text("রিস্টোর করুন", color = palette.inkPrimary, maxLines = 1)
                             }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        if (isCloudSignedIn) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = onSyncNow,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("settings_cloud_sync_button"),
+                                    shape = RoundedCornerShape(12.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Sync,
+                                        contentDescription = "Sync now",
+                                        tint = palette.emeraldAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Sync Now", color = palette.inkPrimary)
+                                }
+                                OutlinedButton(
+                                    onClick = onSignOut,
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(48.dp)
+                                        .testTag("settings_sign_out_button"),
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, palette.roseAccent.copy(alpha = 0.5f))
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.AutoMirrored.Filled.Logout,
+                                        contentDescription = "Sign out",
+                                        tint = palette.roseAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text("Sign Out", color = palette.roseAccent)
+                                }
+                            }
+                        } else {
                             OutlinedButton(
-                                onClick = onSignOut,
+                                onClick = onOpenGoogleSignIn,
                                 modifier = Modifier
-                                    .weight(1f)
+                                    .fillMaxWidth()
                                     .height(48.dp)
-                                    .testTag("settings_sign_out_button"),
+                                    .testTag("settings_connect_google_button"),
                                 shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, palette.roseAccent.copy(alpha = 0.5f))
+                                border = BorderStroke(1.dp, palette.cobaltAccent.copy(alpha = 0.45f))
                             ) {
                                 Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.Logout,
-                                    contentDescription = "Sign out",
-                                    tint = palette.roseAccent,
+                                    imageVector = Icons.AutoMirrored.Filled.Login,
+                                    contentDescription = "Connect Google Firebase sync",
+                                    tint = palette.cobaltAccent,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text("Sign Out", color = palette.roseAccent)
+                                Text(
+                                    text = "Google দিয়ে Firebase সিঙ্ক (ঐচ্ছিক)",
+                                    color = palette.cobaltAccent
+                                )
                             }
                         }
                     }

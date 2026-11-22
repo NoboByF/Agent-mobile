@@ -127,12 +127,16 @@ private fun LivePilotAppEntry(
 ) {
     val context = LocalContext.current
     PilotStateHub.ensureInitialized(context.applicationContext)
+    val prefs = remember(context) { PilotStateHub.getPreferences(context.applicationContext) }
     val hubSettings by PilotStateHub.settings.collectAsStateWithLifecycle()
     val deviceProfile = remember(context) { DeviceIdentityHelper.resolve(context) }
     val appScope = rememberCoroutineScope()
 
     var currentUser by remember {
         mutableStateOf(runCatching { Firebase.auth.currentUser }.getOrNull())
+    }
+    var autoLocalMode by remember {
+        mutableStateOf(prefs.isAutoLocalDeviceMode())
     }
 
     DisposableEffect(Unit) {
@@ -157,25 +161,37 @@ private fun LivePilotAppEntry(
         }
 
         val signedInUser = currentUser
-        if (signedInUser == null) {
+        if (signedInUser == null && !autoLocalMode) {
             AuthGateScreen(
                 deviceProfile = deviceProfile,
                 onSignedIn = {
                     currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+                },
+                onOneClickAutoStart = {
+                    prefs.setAutoLocalDeviceMode(true)
+                    autoLocalMode = true
                 }
             )
         } else {
-            key(signedInUser.uid) {
-                val scopedViewModel: PilotViewModel = viewModel(key = signedInUser.uid)
+            val sessionKey = signedInUser?.uid ?: "local_${deviceProfile.deviceId}"
+            key(sessionKey) {
+                val scopedViewModel: PilotViewModel = viewModel(key = sessionKey)
                 LivePilotAppRoot(
                     requestedTab = requestedTab,
                     onConsumedRequestedTab = onConsumedRequestedTab,
-                    userEmail = signedInUser.email ?: signedInUser.displayName,
+                    userEmail = signedInUser?.email ?: signedInUser?.displayName,
+                    isCloudSignedIn = signedInUser != null,
                     onSignOut = {
                         appScope.launch {
                             signOutFromFirebaseAndCredentials(context)
+                            prefs.setAutoLocalDeviceMode(false)
+                            autoLocalMode = false
                             currentUser = null
                         }
+                    },
+                    onOpenGoogleSignIn = {
+                        prefs.setAutoLocalDeviceMode(false)
+                        autoLocalMode = false
                     },
                     viewModel = scopedViewModel
                 )
@@ -189,7 +205,9 @@ private fun LivePilotAppRoot(
     requestedTab: PilotTab?,
     onConsumedRequestedTab: () -> Unit,
     userEmail: String?,
+    isCloudSignedIn: Boolean,
     onSignOut: () -> Unit,
+    onOpenGoogleSignIn: () -> Unit,
     viewModel: PilotViewModel
 ) {
     val context = LocalContext.current
@@ -245,6 +263,37 @@ private fun LivePilotAppRoot(
         } else {
             pendingStartCallAfterPerm = false
             pendingRoutineAfterPerm = null
+        }
+    }
+
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            val payload = viewModel.exportDeviceBackupJson()
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                out.write(payload.toByteArray(Charsets.UTF_8))
+                out.flush()
+            } ?: error("ফাইল লেখা সম্ভব হয়নি।")
+        }.onSuccess {
+            viewModel.showNotice("✓ এই মোবাইলের সম্পূর্ণ ব্যাকআপ ফাইল সেভ হয়েছে।")
+        }.onFailure { err ->
+            viewModel.showNotice("ব্যাকআপ সেভ ব্যর্থ: ${err.localizedMessage ?: "আবার চেষ্টা করুন"}")
+        }
+    }
+
+    val importBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                ?: error("ফাইল পড়া সম্ভব হয়নি।")
+        }.onSuccess { rawJson ->
+            viewModel.importDeviceBackupJson(rawJson)
+        }.onFailure { err ->
+            viewModel.showNotice("ব্যাকআপ ফাইল পড়া ব্যর্থ: ${err.localizedMessage ?: "আবার চেষ্টা করুন"}")
         }
     }
 
@@ -443,6 +492,7 @@ private fun LivePilotAppRoot(
                             settings = settings,
                             deviceProfile = viewModel.deviceProfile,
                             userEmail = userEmail,
+                            isCloudSignedIn = isCloudSignedIn,
                             cloudSyncStatus = cloudSyncStatus,
                             discoveredModels = discoveredModels,
                             isFetchingModels = isFetchingModels,
@@ -453,6 +503,13 @@ private fun LivePilotAppRoot(
                             logs = logs,
                             onSyncNow = { viewModel.syncNowToCloud() },
                             onSignOut = onSignOut,
+                            onOpenGoogleSignIn = onOpenGoogleSignIn,
+                            onExportBackupFile = {
+                                exportBackupLauncher.launch("LivePilot_${viewModel.deviceProfile.deviceId}_backup.json")
+                            },
+                            onImportBackupFile = {
+                                importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                            },
                             onAddApiKeys = { raw, label -> viewModel.addApiKeys(raw, label) },
                             onSetActiveApiKey = { viewModel.setActiveApiKey(it) },
                             onToggleApiKeyEnabled = { viewModel.toggleApiKeyEnabled(it) },

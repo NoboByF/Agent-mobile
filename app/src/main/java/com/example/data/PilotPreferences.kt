@@ -10,6 +10,13 @@ class PilotPreferences(context: Context) {
     private val prefs: SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
+    fun isAutoLocalDeviceMode(): Boolean =
+        prefs.getBoolean(KEY_AUTO_LOCAL_DEVICE_MODE, false)
+
+    fun setAutoLocalDeviceMode(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_AUTO_LOCAL_DEVICE_MODE, enabled).apply()
+    }
+
     fun loadSettings(): PilotSettings {
         val enabledNames = prefs.getStringSet(KEY_ENABLED_APPS, null)
         val enabledApps = if (enabledNames == null) {
@@ -375,8 +382,139 @@ class PilotPreferences(context: Context) {
         prefs.edit().putString(KEY_ASK_AI_HISTORY, arr.toString()).apply()
     }
 
+    fun exportDeviceBackupJson(deviceId: String, deviceLabel: String): String {
+        val root = JSONObject()
+        root.put("backupVersion", 1)
+        root.put("exportedAtMs", System.currentTimeMillis())
+        root.put("deviceId", deviceId)
+        root.put("deviceLabel", deviceLabel)
+
+        val settings = loadSettings()
+        val settingsObj = JSONObject()
+            .put("apiKeysJson", serializeApiKeysJson(settings.apiKeys))
+            .put("activeApiKeyId", settings.activeApiKeyId.orEmpty())
+            .put("autoRotateApiKeys", settings.autoRotateApiKeys)
+            .put("liveModel", settings.liveModel)
+            .put("agentModel", settings.agentModel)
+            .put("textModel", settings.textModel)
+            .put("deletedModels", JSONArray(settings.deletedModels))
+            .put("verifyTaskCompletion", settings.verifyTaskCompletion)
+            .put("voiceName", settings.voiceName)
+            .put("voiceLanguage", settings.voiceLanguage.name)
+            .put("speakerphoneOn", settings.speakerphoneOn)
+            .put("autoVisionDefaultOn", settings.autoVisionDefaultOn)
+            .put("autoVisionIntervalSec", settings.autoVisionIntervalSec)
+            .put("showTouchVisualizer", settings.showTouchVisualizer)
+            .put("showFloatingCaptions", settings.showFloatingCaptions)
+            .put("themeMode", settings.themeMode.name)
+            .put("customVoiceInstructions", settings.customVoiceInstructions)
+            .put("autoChatMode", settings.autoChatMode.name)
+            .put("autoReplyDelivery", settings.autoReplyDelivery.name)
+            .put("autoReplyPersona", settings.autoReplyPersona)
+            .put("sensitiveQuestionGuardEnabled", settings.sensitiveQuestionGuardEnabled)
+            .put("handsFreeVoiceEscalationEnabled", settings.handsFreeVoiceEscalationEnabled)
+            .put("enabledMessagingApps", JSONArray(settings.enabledMessagingApps.map { it.name }))
+
+        root.put("settings", settingsObj)
+        root.put("personalDataJson", prefs.getString(KEY_PERSONAL_DATA_JSON, "[]") ?: "[]")
+        root.put("customRoutinesJson", prefs.getString(KEY_CUSTOM_ROUTINES, "[]") ?: "[]")
+        root.put("askAiHistoryJson", prefs.getString(KEY_ASK_AI_HISTORY, "[]") ?: "[]")
+        return root.toString(2)
+    }
+
+    fun importDeviceBackupJson(rawJson: String): Result<String> {
+        return runCatching {
+            val root = JSONObject(rawJson)
+            val sObj = root.optJSONObject("settings")
+                ?: throw IllegalArgumentException("ব্যাকআপ ফাইলে settings ডাটা পাওয়া যায়নি।")
+
+            val parsedKeys = parseApiKeysJson(sObj.optString("apiKeysJson", "[]"))
+            val activeId = sObj.optString("activeApiKeyId", "").ifBlank { null }
+            val resolvedActive = activeId?.takeIf { id -> parsedKeys.any { it.id == id } }
+                ?: parsedKeys.firstOrNull { it.enabled }?.id
+                ?: parsedKeys.firstOrNull()?.id
+            val mirrorKey = parsedKeys.firstOrNull { it.id == resolvedActive }?.key
+                ?: parsedKeys.firstOrNull { it.enabled }?.key
+                ?: ""
+
+            val deletedArr = sObj.optJSONArray("deletedModels") ?: JSONArray()
+            val deletedModels = buildList {
+                for (i in 0 until deletedArr.length()) {
+                    val m = deletedArr.optString(i, "").trim()
+                    if (m.isNotBlank()) add(m)
+                }
+            }.distinct()
+
+            val appsArr = sObj.optJSONArray("enabledMessagingApps") ?: JSONArray()
+            val enabledApps = buildSet {
+                for (i in 0 until appsArr.length()) {
+                    runCatching { MessagingApp.valueOf(appsArr.optString(i, "")) }.getOrNull()?.let { add(it) }
+                }
+            }.ifEmpty { MessagingApp.entries.toSet() }
+
+            val restoredSettings = PilotSettings(
+                apiKey = mirrorKey,
+                apiKeys = parsedKeys,
+                activeApiKeyId = resolvedActive,
+                autoRotateApiKeys = sObj.optBoolean("autoRotateApiKeys", true),
+                liveModel = sObj.optString("liveModel", PilotSettings.DEFAULT_LIVE_MODEL)
+                    .ifBlank { PilotSettings.DEFAULT_LIVE_MODEL },
+                agentModel = sObj.optString("agentModel", PilotSettings.DEFAULT_AGENT_MODEL)
+                    .ifBlank { PilotSettings.DEFAULT_AGENT_MODEL },
+                textModel = sObj.optString("textModel", PilotSettings.DEFAULT_TEXT_MODEL)
+                    .ifBlank { PilotSettings.DEFAULT_TEXT_MODEL },
+                deletedModels = deletedModels,
+                verifyTaskCompletion = sObj.optBoolean("verifyTaskCompletion", true),
+                voiceName = sObj.optString("voiceName", PilotSettings.DEFAULT_VOICE)
+                    .ifBlank { PilotSettings.DEFAULT_VOICE },
+                voiceLanguage = runCatching {
+                    VoiceLanguage.valueOf(sObj.optString("voiceLanguage", VoiceLanguage.BENGALI_BD.name))
+                }.getOrDefault(VoiceLanguage.BENGALI_BD),
+                speakerphoneOn = sObj.optBoolean("speakerphoneOn", true),
+                autoVisionDefaultOn = sObj.optBoolean("autoVisionDefaultOn", false),
+                autoVisionIntervalSec = sObj.optInt("autoVisionIntervalSec", 4).coerceIn(2, 10),
+                showTouchVisualizer = sObj.optBoolean("showTouchVisualizer", true),
+                showFloatingCaptions = sObj.optBoolean("showFloatingCaptions", true),
+                themeMode = runCatching {
+                    AppThemeMode.valueOf(sObj.optString("themeMode", AppThemeMode.SYSTEM.name))
+                }.getOrDefault(AppThemeMode.SYSTEM),
+                customVoiceInstructions = sObj.optString("customVoiceInstructions", ""),
+                autoChatMode = runCatching {
+                    AutoChatMode.valueOf(sObj.optString("autoChatMode", AutoChatMode.LIVE_VOICE_ALERT.name))
+                }.getOrDefault(AutoChatMode.LIVE_VOICE_ALERT),
+                autoReplyDelivery = runCatching {
+                    AutoReplyDelivery.valueOf(sObj.optString("autoReplyDelivery", AutoReplyDelivery.SILENT_DIRECT_REPLY.name))
+                }.getOrDefault(AutoReplyDelivery.SILENT_DIRECT_REPLY),
+                autoReplyPersona = sObj.optString("autoReplyPersona", PilotSettings.DEFAULT_AUTO_REPLY_PERSONA)
+                    .ifBlank { PilotSettings.DEFAULT_AUTO_REPLY_PERSONA },
+                sensitiveQuestionGuardEnabled = sObj.optBoolean("sensitiveQuestionGuardEnabled", true),
+                handsFreeVoiceEscalationEnabled = sObj.optBoolean("handsFreeVoiceEscalationEnabled", true),
+                enabledMessagingApps = enabledApps
+            )
+            saveSettings(restoredSettings)
+
+            root.optString("personalDataJson", "").takeIf { it.isNotBlank() }?.let { rawPd ->
+                JSONArray(rawPd) // validate JSON array
+                prefs.edit().putString(KEY_PERSONAL_DATA_JSON, rawPd).apply()
+            }
+            root.optString("customRoutinesJson", "").takeIf { it.isNotBlank() }?.let { rawRt ->
+                JSONArray(rawRt)
+                prefs.edit().putString(KEY_CUSTOM_ROUTINES, rawRt).apply()
+            }
+            root.optString("askAiHistoryJson", "").takeIf { it.isNotBlank() }?.let { rawChat ->
+                JSONArray(rawChat)
+                prefs.edit().putString(KEY_ASK_AI_HISTORY, rawChat).apply()
+            }
+
+            val restoredLabel = root.optString("deviceLabel", "ডিভাইস ব্যাকআপ").ifBlank { "ডিভাইস ব্যাকআপ" }
+            val pdCount = loadPersonalData().size
+            "✓ ব্যাকআপ রিস্টোর সফল ($restoredLabel • ${parsedKeys.size} API Key, $pdCount আমার ডাটা)।"
+        }
+    }
+
     companion object {
         private const val PREFS_NAME = "livepilot_ai_secure_prefs"
+        private const val KEY_AUTO_LOCAL_DEVICE_MODE = "auto_local_device_mode_enabled"
         private const val KEY_API_KEY = "gemini_api_key"
         private const val KEY_API_KEYS_JSON = "gemini_api_keys_json"
         private const val KEY_ACTIVE_API_KEY_ID = "gemini_active_api_key_id"

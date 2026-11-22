@@ -35,8 +35,9 @@ class CloudSyncRepository(context: Context) {
     private val appContext = context.applicationContext
     val deviceProfile: DeviceProfileIdentity = DeviceIdentityHelper.resolve(appContext)
 
-    private val db: FirebaseFirestore =
+    private val db: FirebaseFirestore by lazy {
         FirebaseFirestore.getInstance(appContext.getString(R.string.firestore_database_id))
+    }
 
     private fun requireUserId(): String =
         Firebase.auth.currentUser?.uid

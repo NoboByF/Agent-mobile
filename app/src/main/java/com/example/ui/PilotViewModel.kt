@@ -121,7 +121,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     private fun startCloudSyncIfAuthenticated() {
         val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
         if (currentUser == null) {
-            _cloudSyncStatus.value = "Local mode (Sign in for Firebase backup)"
+            _cloudSyncStatus.value = "অটো ডিভাইস প্রোফাইল (লোকাল সেভ চালু) • ${deviceProfile.displayLabel}"
             return
         }
 
@@ -229,6 +229,37 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 _bannerMessage.value = "ক্লাউড সিঙ্ক ব্যর্থ হয়েছে: ${cfgRes.exceptionOrNull()?.localizedMessage ?: "ইন্টারনেট চেক করুন"}"
             }
         }
+    }
+
+    fun exportDeviceBackupJson(): String =
+        prefs.exportDeviceBackupJson(
+            deviceId = deviceProfile.deviceId,
+            deviceLabel = deviceProfile.displayLabel
+        )
+
+    fun importDeviceBackupJson(rawJson: String) {
+        val result = prefs.importDeviceBackupJson(rawJson)
+        result.onSuccess { summary ->
+            PilotStateHub.applySettingsFromCloud(prefs.loadSettings())
+            PilotStateHub.setPersonalData(prefs.loadPersonalData())
+            _routines.value = prefs.loadRoutines()
+            val restoredChat = prefs.loadAskAiHistory()
+            val maxId = restoredChat.maxOfOrNull { it.id } ?: 0L
+            if (maxId >= chatIdCounter.get()) {
+                chatIdCounter.set(maxId + 1L)
+            }
+            _askAiState.update { it.copy(messages = restoredChat) }
+            _bannerMessage.value = summary
+            if (runCatching { Firebase.auth.currentUser }.getOrNull() != null) {
+                syncNowToCloud()
+            }
+        }.onFailure { err ->
+            _bannerMessage.value = "ব্যাকআপ রিস্টোর ব্যর্থ: ${err.localizedMessage ?: "সঠিক JSON ফাইল দিন"}"
+        }
+    }
+
+    fun showNotice(message: String) {
+        _bannerMessage.value = message
     }
 
     override fun onCleared() {

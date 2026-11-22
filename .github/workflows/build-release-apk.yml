@@ -215,7 +215,7 @@ jobs:
             echo "- **Certificate SHA-256:** \`${{ steps.prepare-keystore.outputs.sha256 }}\`"
             if [ "${{ steps.prepare-firebase.outputs.is_placeholder }}" = "true" ]; then
               echo ""
-              echo "> **Firebase Setup Required for GitHub Release APKs:** Copy \`app/google-services.json\` from AI Studio into GitHub Secret \`GOOGLE_SERVICES_JSON\` (**Settings → Secrets and variables → Actions**), and add the **SHA-1** above to your Android app (\`com.aistudio.livepilotai.k7m2x9\`) in Firebase Console so Google Sign-In & Firestore Cloud Sync work in Release APKs."
+              echo "> **Ready to Install:** This Release APK works immediately without login or secrets (all API keys, My Data, and settings are saved locally with 1-tap JSON backup/restore). Optional: add \`GOOGLE_SERVICES_JSON\` secret + SHA-1 in Firebase Console only if you also want cloud sync."
             fi
             if [ "${{ steps.prepare-keystore.outputs.newly_generated }}" = "true" ]; then
               echo ""

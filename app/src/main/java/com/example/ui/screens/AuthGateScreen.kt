@@ -24,6 +24,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Shield
@@ -32,6 +33,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -86,7 +88,8 @@ suspend fun signOutFromFirebaseAndCredentials(context: Context) {
 @Composable
 fun AuthGateScreen(
     deviceProfile: DeviceProfileIdentity,
-    onSignedIn: () -> Unit
+    onSignedIn: () -> Unit,
+    onOneClickAutoStart: () -> Unit
 ) {
     val context = LocalContext.current
     val palette = StudioTheme.colors
@@ -223,7 +226,7 @@ fun AuthGateScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Firebase ক্লাউড ব্যাকআপ ও প্রতি মোবাইলের আলাদা প্রোফাইল চালু করতে Google অ্যাকাউন্ট দিয়ে সাইন-ইন করুন।",
+                    text = "এক ক্লিকে অটোমেটিক এই মোবাইলের প্রোফাইল চালু করুন—কোনো লগইন লাগবে না। চাইলে পরে Google দিয়ে Firebase ক্লাউড সিঙ্কও চালু করতে পারবেন।",
                     style = MaterialTheme.typography.bodyMedium,
                     color = palette.inkSecondary,
                     textAlign = TextAlign.Center
@@ -312,38 +315,69 @@ fun AuthGateScreen(
                 }
             }
 
+            // Primary 1-Click Automatic Entry (No Google Sign-In required)
             Button(
+                onClick = onOneClickAutoStart,
+                enabled = !isSigningIn,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+                    .testTag("one_click_auto_start_button"),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = EmeraldGreen,
+                    contentColor = Color.White
+                )
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Bolt,
+                    contentDescription = "One-click auto start",
+                    modifier = Modifier.size(22.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "এক ক্লিকে অটো চালু করুন (লগইন ছাড়াই)",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            // Optional Google Sign-In for Firebase Cloud Sync
+            OutlinedButton(
                 onClick = { startInteractiveGoogleSignIn() },
                 enabled = !isSigningIn,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(54.dp)
+                    .height(52.dp)
                     .testTag("google_sign_in_button"),
                 shape = RoundedCornerShape(16.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = CobaltBlue,
-                    contentColor = Color.White
-                )
+                border = BorderStroke(1.2.dp, CobaltBlue.copy(alpha = 0.6f))
             ) {
                 if (isSigningIn) {
                     CircularProgressIndicator(
-                        color = Color.White,
+                        color = CobaltBlue,
                         strokeWidth = 2.5.dp,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
-                    Text("সাইন-ইন হচ্ছে...", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        text = "Google সাইন-ইন হচ্ছে...",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = CobaltBlue
+                    )
                 } else {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.Login,
                         contentDescription = "Sign in with Google",
+                        tint = CobaltBlue,
                         modifier = Modifier.size(20.dp)
                     )
                     Spacer(modifier = Modifier.width(10.dp))
                     Text(
-                        text = "Google দিয়ে সাইন-ইন করুন",
+                        text = "Google দিয়ে Firebase সিঙ্ক (ঐচ্ছিক)",
                         style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold
+                        color = CobaltBlue,
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }
