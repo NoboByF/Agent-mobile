@@ -263,8 +263,8 @@ class AutonomousTaskEngine(
             "Locked canvas_box=[${activeCanvasBox.joinToString(",")}]"
         )
 
-        // Phase 2: Up to 3 iterative drawing stages (Core Sketch -> Visual Self-Check Details -> Final Polish/User Edits)
-        val maxStages = 3
+        // Phase 2: 4-Stage Studio Artist Loop (Outline -> Self-Critique/Color/Brush/Fill -> Leaves/Details -> Final Polish & Cleanup)
+        val maxStages = 4
         for (stage in 1..maxStages) {
             coroutineContext.ensureActive()
             if (System.currentTimeMillis() - startedAtMs > MAX_TASK_DURATION_MS) break
@@ -277,9 +277,10 @@ class AutonomousTaskEngine(
             updateHudProgress(
                 true,
                 when (stage) {
-                    1 -> "🎨 Planning artwork..."
-                    2 -> "🎨 Reviewing & adding details..."
-                    else -> "🎨 Polishing artwork..."
+                    1 -> "🎨 Stage 1: Setting brush & sketch..."
+                    2 -> "🎨 Stage 2: Color, size & main form..."
+                    3 -> "🎨 Stage 3: Accent details & shading..."
+                    else -> "🎨 Stage 4: Cleanup & final polish..."
                 }
             )
 
@@ -295,20 +296,24 @@ class AutonomousTaskEngine(
                 if (stage == 1) {
                     append(
                         """
-                        Generate the complete primary artistic vector drawing for the user's goal!
-                        CRITICAL COORDINATE SYSTEM:
-                        - All stroke points MUST use CANVAS-RELATIVE coordinates from 0 to 1000:
-                          (0,0) = top-left of the white canvas, (500,500) = dead center of canvas, (1000,1000) = bottom-right of canvas.
-                        - Keep the main subject well-composed inside 100..900 so nothing is clipped at edges.
-                        - Make it genuinely recognizable, graceful, and detailed: use 14 to 24 smooth strokes.
-                        - Each curved stroke MUST have 4 to 10 ordered [x, y] waypoints so Bezier smoothing creates real organic curves (e.g., for a bird: curved head crown, pointed beak upper & lower, eye dot, curved throat & breast, back contour, sweeping upper & lower wings with layered feather curves, fanned tail feathers, legs/claws, and a tree branch with leaves).
+                        Inspect the screenshot. Stage 1 builds a CLEAN, WELL-PROPORTIONED, ATTRACTIVE base structure!
+                        ARTISTIC & TOOL CONTROLS:
+                        1. Look at the toolbar (brush size slider, color swatch, brush/eraser toggle).
+                           If the brush color is unsuitable (e.g. white on white canvas, or wrong starting color) OR brush size needs adjusting OR an eraser is currently selected instead of brush, set "tool_goal" to describe the exact toolbar change needed BEFORE drawing (e.g., "Switch to Brush tool, set dark/clean outline color, set brush size ~5"). Otherwise leave "tool_goal": "".
+                        2. All stroke points MUST use CANVAS-RELATIVE coordinates from 0 to 1000:
+                           (0,0) = top-left of white canvas, (500,500) = dead center of canvas, (1000,1000) = bottom-right of canvas.
+                        3. Compose inside 140..860 so artwork is balanced, centered, and NEVER cramped or sloppy.
+                        4. Use 10 to 18 smooth curved strokes (5 to 12 waypoints each) for clean foundational geometry:
+                           - For a FLOWER / ROSE / LOTUS: draw a gentle curved central stem, circular sepal base, a round center disk/core, and 6–8 symmetrical wide rounded petals radiating cleanly around the center disk (each petal = wide smooth arc leaving space, NOT pinched tangled figure-8 loops!).
+                           - For a BIRD: proportional tilted oval body, smooth neck/head dome, crisp pointed beak, sweeping curved wing silhouette, tail fan curves, perched legs, and a clean branch.
                         - Return strict JSON:
                           {
                             "done": false,
-                            "summary": "Brief description of what this stage draws",
-                            "tool_taps": [],
+                            "undo_count": 0,
+                            "tool_goal": "",
+                            "summary": "What Stage 1 sets up and draws",
                             "strokes": [
-                              {"label": "Head curve", "points": [[420,260],[455,220],[505,215],[545,245],[555,295]]}
+                              {"label": "Center circle", "points": [[460,360],[500,335],[540,360],[540,400],[500,425],[460,400],[460,360]]}
                             ]
                           }
                         """.trimIndent()
@@ -316,11 +321,26 @@ class AutonomousTaskEngine(
                 } else {
                     append(
                         """
-                        LOOK CAREFULLY at the latest screenshot showing what has ALREADY been drawn on the canvas.
-                        - Evaluate the drawing honestly. If it already looks complete, recognizable, and satisfies all user instructions, return {"done": true, "summary": "...", "tool_taps": [], "strokes": []}.
-                        - Otherwise, add 6 to 16 high-impact finishing strokes (missing features, feather/leaf details, eye highlights, branch/ground lines, subtle shading strokes, or user-requested changes) in CANVAS-RELATIVE 0..1000 coordinates.
-                        - Optionally include screen-coordinate (0..1000) "tool_taps": [{"x":..., "y":..., "label":"..."}] ONLY if changing color or brush preset visibly shown on screen.
-                        - Return strict JSON with keys: done, summary, tool_taps, strokes.
+                        CAREFULLY CRITIQUE the latest screenshot of what has been drawn so far!
+                        You are a real digital artist controlling ibisPaint / FlipaCreate / FlipaClip / Canvas tools:
+                        1. SELF-CORRECTION (Undo / Eraser):
+                           - If previous strokes look messy, badly overlapped, lopsided, or ugly, set "undo_count" (1 to 10) to undo bad strokes cleanly FIRST! Or set "tool_goal" to use Eraser + redraw cleanly!
+                        2. BRUSH SIZE & COLOR VARIETY (CRITICAL — DO NOT DRAW MONOCHROME STICK ART!):
+                           - Use "tool_goal" whenever changing color, adjusting brush size slider (bigger for petal fill/coloring, smaller for fine outlines/veins/eye), or toggling Brush/Eraser!
+                           - Example for Stage 2 flower: "Open color picker, choose vibrant rose-red/pink, close color picker, and set brush size slider larger (~12)"
+                           - Example for Stage 3 flower: "Open color picker, choose lush green for leaves (or golden yellow for center pollen dots) and set brush size medium-fine (~5)"
+                           - Remember if opening a color wheel modal takes multiple taps (tap swatch -> tap color -> close popup), just describe the goal in "tool_goal" — an interactive Vision sub-agent will navigate the popup for you step by step BEFORE dispatching "strokes"!
+                        3. STROKES:
+                           - Add 8 to 18 intentional strokes (petal shading/fill arcs, secondary layered petals, serrated/curved leaves with midrib veins, golden center texture dots, feathers, highlights, etc.) in CANVAS-RELATIVE 0..1000 coordinates.
+                           - Only set "done": true if the drawing genuinely looks rich, colorful/shaded (when tools allow), clean, and complete with zero messy defects.
+                        - Return strict JSON:
+                          {
+                            "done": false,
+                            "undo_count": 0,
+                            "tool_goal": "",
+                            "summary": "Critique and improvements in this stage",
+                            "strokes": [...]
+                          }
                         """.trimIndent()
                     )
                 }
@@ -341,19 +361,34 @@ class AutonomousTaskEngine(
                 return
             }
 
-            // Optional color/brush taps before this stage's strokes
-            val toolTaps = stagePlan.optJSONArray("tool_taps")
-            if (toolTaps != null) {
-                for (t in 0 until minOf(toolTaps.length(), 4)) {
-                    coroutineContext.ensureActive()
-                    val tap = toolTaps.optJSONObject(t) ?: continue
-                    val tx = tap.optInt("x", -1)
-                    val ty = tap.optInt("y", -1)
-                    if (tx in 1..999 && ty in 1..999) {
-                        service.clickNormalized(tx, ty, tap.optString("label", "Tool"))
-                        delay(300L)
-                    }
-                }
+            // Step A: Execute Undo taps if artist critiqued previous strokes as messy
+            val undoCount = stagePlan.optInt("undo_count", 0).coerceIn(0, 12)
+            if (undoCount > 0) {
+                updateHudProgress(true, "↩️ Undoing $undoCount mistake(s)...")
+                runVisualToolAdjustment(
+                    service = service,
+                    modelId = modelId,
+                    toolGoal = "Tap the Undo button on the toolbar exactly $undoCount time(s) to undo messy strokes, then stop immediately.",
+                    initialShot = latestShot,
+                    maxSteps = undoCount + 2
+                )
+                delay(320L)
+                latestShot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896) ?: latestShot
+            }
+
+            // Step B: Interactive Vision sub-loop for Brush Size slider, Color Wheel popup, or Eraser/Brush switch!
+            val toolGoal = stagePlan.optString("tool_goal", "").trim()
+            if (toolGoal.isNotBlank()) {
+                updateHudProgress(true, "🖌️ ${toolGoal.take(26)}...")
+                runVisualToolAdjustment(
+                    service = service,
+                    modelId = modelId,
+                    toolGoal = toolGoal,
+                    initialShot = latestShot,
+                    maxSteps = 6
+                )
+                delay(300L)
+                latestShot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896) ?: latestShot
             }
 
             val strokes = stagePlan.optJSONArray("strokes")
@@ -366,7 +401,7 @@ class AutonomousTaskEngine(
                     normalizedSpace = true,
                     canvasBoundsNorm = activeCanvasBox
                 ) { doneCount, totalCount, strokeLabel ->
-                    updateHudProgress(true, "🎨 $doneCount/$totalCount: $strokeLabel")
+                    updateHudProgress(true, "🎨 $stage/$maxStages • $doneCount/$totalCount: $strokeLabel")
                 }
                 totalStrokesDrawn += res.optInt("completed_strokes", 0)
                 PilotStateHub.recordToolExecuted(
@@ -377,11 +412,11 @@ class AutonomousTaskEngine(
             }
 
             val isDone = stagePlan.optBoolean("done", false) && userGuidanceQueue.isEmpty()
-            if (isDone || (stage >= 2 && strokes.isEmpty() && userGuidanceQueue.isEmpty())) {
+            if (isDone || (stage >= 2 && strokes.isEmpty() && undoCount == 0 && toolGoal.isBlank() && userGuidanceQueue.isEmpty())) {
                 break
             }
 
-            // Capture updated canvas screenshot for visual self-verification in next stage
+            // Capture updated canvas screenshot for visual self-critique in next stage
             if (stage < maxStages) {
                 delay(450L)
                 latestShot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896) ?: latestShot
@@ -402,8 +437,83 @@ class AutonomousTaskEngine(
             "Drawing finished: $totalStrokesDrawn total strokes in ${elapsedSec}s."
         )
         notifyLiveVoice(
-            "[SYSTEM EVENT: Autonomous drawing task VERIFIED COMPLETED! Goal='$goal', drew $totalStrokesDrawn smooth strokes in ${elapsedSec} seconds. Warmly inform the user in 1-2 short sentences in their language and ask if they want any tweaks or more details.]"
+            "[SYSTEM EVENT: Autonomous drawing task VERIFIED COMPLETED! Goal='$goal', drew $totalStrokesDrawn smooth strokes across stages in ${elapsedSec} seconds. Warmly inform the user in 1-2 short sentences in their language and ask if they want any tweaks or more details.]"
         )
+    }
+
+    /**
+     * Interactive multi-step Vision toolbar controller for drawing apps (ibisPaint, FlipaCreate, FlipaClip, Canva).
+     * Supports tapping Color Swatch -> picking color inside Color Wheel popup -> closing popup,
+     * dragging Brush Size/Opacity sliders, tapping +/- size buttons, toggling Brush<->Eraser, and tapping Undo/Redo.
+     */
+    private suspend fun runVisualToolAdjustment(
+        service: PilotAccessibilityService,
+        modelId: String,
+        toolGoal: String,
+        initialShot: ByteArray,
+        maxSteps: Int = 6
+    ) {
+        var shot = initialShot
+        val history = mutableListOf<String>()
+
+        for (step in 1..maxSteps) {
+            coroutineContext.ensureActive()
+            val uiSummary = buildCompactUiSummary(service.getScreenUiJson())
+            val plan = GeminiRestClient.generateVisionJson(
+                modelId = modelId,
+                systemPrompt = DRAWING_TOOL_CONTROLLER_PROMPT,
+                userPrompt = buildString {
+                    append("Toolbar Adjustment Goal: ").append(toolGoal).append('\n')
+                    append("Step ").append(step).append(" of ").append(maxSteps).append('\n')
+                    if (history.isNotEmpty()) {
+                        append("Steps already done:\n")
+                        history.forEach { append("- ").append(it).append('\n') }
+                    }
+                    append("Visible UI Summary:\n").append(uiSummary).append('\n')
+                    append("Look at the 0..1000 gridded screenshot. If a Color Wheel or Brush menu popup is STILL open blocking the canvas, tap its close/back/outside margin before setting done=true! Output strict JSON.")
+                },
+                jpegBytes = shot,
+                temperature = 0.12,
+                maxOutputTokens = 4096,
+                thinkingBudget = 0
+            ).getOrNull() ?: return
+
+            if (plan.optBoolean("done", false)) {
+                PilotStateHub.log(LogLevel.TOOL, "DrawTools", "Adjusted tools cleanly in ${step - 1} steps: $toolGoal")
+                return
+            }
+
+            val action = plan.optString("action", "TAP").trim().uppercase()
+            val label = plan.optString("label", action).take(22)
+            when (action) {
+                "TAP" -> {
+                    val x = plan.optInt("x", -1)
+                    val y = plan.optInt("y", -1)
+                    if (x in 1..999 && y in 1..999) {
+                        service.clickNormalized(x, y, label)
+                        history.add("TAP ($x,$y) '$label'")
+                    }
+                }
+                "DRAG" -> {
+                    val sx = plan.optInt("x", -1)
+                    val sy = plan.optInt("y", -1)
+                    val ex = plan.optInt("end_x", -1)
+                    val ey = plan.optInt("end_y", -1)
+                    if (sx in 1..999 && sy in 1..999 && ex in 1..999 && ey in 1..999) {
+                        service.dragNormalized(sx, sy, ex, ey, durationMs = 360)
+                        history.add("DRAG ($sx,$sy)->($ex,$ey) '$label'")
+                    }
+                }
+                "WAIT" -> {
+                    delay(450L)
+                    history.add("WAIT")
+                }
+            }
+            if (step < maxSteps) {
+                delay(380L)
+                shot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896) ?: shot
+            }
+        }
     }
 
     // --- GENERAL AUTONOMOUS MULTI-STEP UI / BROWSER WORKFLOW LOOP (DUAL-BRAIN + VISUAL AUDITOR) ---
@@ -860,14 +970,26 @@ Always respond with valid JSON only. Never include coordinates outside 0..1000.
 """
 
         private const val DRAWING_ARTIST_SYSTEM_PROMPT = """
-You are LivePilot's master digital vector artist controlling an Android touch stylus via smooth quadratic Bezier strokes.
-Your job is to draw genuinely recognizable, clean, well-proportioned, expressive artwork (birds, animals, flowers, trees, houses, portraits, diagrams, calligraphy) directly inside the user's canvas.
+You are LivePilot's master digital vector artist controlling an Android stylus via smooth quadratic Bezier strokes PLUS full app toolbar control (Brush Size slider, Color Wheel Picker, Brush/Eraser toggle, Undo/Redo).
 Rules:
 - All stroke points use CANVAS-RELATIVE coordinates [x, y] in 0..1000 (0,0 = canvas top-left, 500,500 = canvas center, 1000,1000 = canvas bottom-right).
-- Keep coordinates cleanly inside 80..920 so artwork sits attractively inside the canvas.
-- Use smooth multi-point curves (5 to 14 points per curved contour) instead of crude triangles or boxes.
-- Break the drawing into clear logical strokes (body silhouette, head, beak, eye, wing arcs, layered feathers, tail, legs, branch, leaves, etc.).
+- Never draw crude stick-loops or sloppy tangled ovals! Keep main artwork gracefully balanced inside 140..860.
+- Use 5 to 12 smooth curved perimeter waypoints per petal, wing, leaf, or contour.
+- Actively vary BRUSH SIZE and COLOR across stages via "tool_goal" so artwork looks vibrant, layered, and finished (e.g., clean stem/outline -> bold colored petals/body -> fine vein/pollen/feather/highlight strokes).
+- Self-critique honestly: if the previous stage has ugly overlapping lines, use "undo_count" or Eraser to fix them before drawing new strokes.
 - Output ONLY valid JSON.
+"""
+
+        private const val DRAWING_TOOL_CONTROLLER_PROMPT = """
+You are controlling the UI toolbar of a mobile drawing app (such as ibisPaint X, FlipaCreate, FlipaClip, Canva, or Sketchbook) using a 0..1000 gridded screenshot.
+Your ONLY job is to complete the requested toolbar/brush/color/eraser/undo adjustment cleanly and then close any open popup so the white drawing canvas is uncovered!
+Available JSON actions:
+- TAP: tap a visible button/icon/color swatch at (x, y) in 0..1000.
+- DRAG: drag a horizontal or vertical slider thumb (e.g. Brush Size or Opacity slider) from (x, y) to (end_x, end_y) in 0..1000.
+- WAIT: pause briefly for a popup animation.
+- Set "done": true ONLY when the requested tool/color/brush-size/undo change is complete AND any Color Picker / Brush modal popup is CLOSED!
+Always output strict JSON:
+{"done": false, "action": "TAP", "x": 500, "y": 500, "end_x": 500, "end_y": 500, "label": "Color swatch"}
 """
 
         private const val WORKFLOW_AGENT_SYSTEM_PROMPT = """

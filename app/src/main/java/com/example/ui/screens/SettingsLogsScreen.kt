@@ -365,7 +365,7 @@ fun SettingsLogsScreen(
                         }
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
-                            text = "Voice model talks in real time while THIS stronger non-Live Reasoning+Vision model executes multi-step tasks, searches, draws & audits completion. Pick gemini-2.5-pro for hardest tasks or gemini-2.5-flash for fast accuracy.",
+                            text = "Voice model talks in real time while THIS stronger non-Live Reasoning+Vision model executes multi-step tasks, brush/color/eraser control, drawing & completion audits. Tap Fetch Models above or type any preview/pro API model ID exposed to your API key.",
                             style = MaterialTheme.typography.bodySmall,
                             color = palette.inkSecondary
                         )
