@@ -378,7 +378,7 @@ LANGUAGE & SPEECH LOCK — ENGLISH (en-US):
         declarations.put(
             declareTool(
                 name = "draw_strokes",
-                description = "Directly draw one or more smooth curved freehand strokes on the current screen or inside a specified 0..1000 canvas box.",
+                description = "ONLY for a single quick corrective line/stroke. NEVER use draw_strokes to draw full objects like birds, flowers, portraits, or sketches — ALWAYS call start_autonomous_task(goal=\"...\", mode=\"DRAWING\") for full drawings!",
                 properties = mapOf(
                     "canvas_left" to prop("INTEGER", "Canvas left edge in 0..1000 screen coordinates (0 for full screen)"),
                     "canvas_top" to prop("INTEGER", "Canvas top edge in 0..1000 screen coordinates (0 for full screen)"),

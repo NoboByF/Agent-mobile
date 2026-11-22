@@ -775,39 +775,40 @@ class PilotAccessibilityService : AccessibilityService() {
         var failed = 0
         val total = strokes.size
 
-        for ((idx, stroke) in strokes.withIndex()) {
-            coroutineContext.ensureActive()
-            checkSafetyGuardrail()?.let { blocked ->
-                return blocked.put("completed_strokes", completed)
+        try {
+            controller?.setOverlayPassThrough(true)
+            delay(85L)
+
+            for ((idx, stroke) in strokes.withIndex()) {
+                coroutineContext.ensureActive()
+                checkSafetyGuardrail()?.let { blocked ->
+                    return blocked.put("completed_strokes", completed)
+                }
+
+                val screenPts = stroke.points.map { (x, y) ->
+                    DrawingGestureHelper.mapPointToScreen(
+                        x = x,
+                        y = y,
+                        screenWidth = dm.widthPixels,
+                        screenHeight = dm.heightPixels,
+                        normalizedSpace = normalizedSpace,
+                        canvasBoundsNorm = canvasBoundsNorm
+                    )
+                }
+                if (screenPts.isEmpty()) continue
+
+                val path = DrawingGestureHelper.buildSmoothAndroidPath(screenPts)
+                val durMs = DrawingGestureHelper.computeRecommendedDurationMs(screenPts, stroke.durationMs)
+                val label = stroke.label.ifBlank { "Stroke ${idx + 1}" }
+                onStrokeProgress?.invoke(idx + 1, total, label)
+
+                val ok = dispatchPathGesture(path, durMs)
+                if (ok) completed++ else failed++
+                // Small natural lift pause between strokes so web/native canvases separate strokes cleanly
+                delay(55L)
             }
-
-            val screenPts = stroke.points.map { (x, y) ->
-                DrawingGestureHelper.mapPointToScreen(
-                    x = x,
-                    y = y,
-                    screenWidth = dm.widthPixels,
-                    screenHeight = dm.heightPixels,
-                    normalizedSpace = normalizedSpace,
-                    canvasBoundsNorm = canvasBoundsNorm
-                )
-            }
-            if (screenPts.isEmpty()) continue
-
-            val path = DrawingGestureHelper.buildSmoothAndroidPath(screenPts)
-            val durMs = DrawingGestureHelper.computeRecommendedDurationMs(screenPts, stroke.durationMs)
-            val label = stroke.label.ifBlank { "Stroke ${idx + 1}" }
-            onStrokeProgress?.invoke(idx + 1, total, label)
-
-            val ok = try {
-                controller?.setOverlayPassThrough(true)
-                dispatchPathGesture(path, durMs)
-            } finally {
-                controller?.setOverlayPassThrough(false)
-            }
-
-            if (ok) completed++ else failed++
-            // Small natural lift pause between strokes so web/native canvases separate strokes cleanly
-            delay(55L)
+        } finally {
+            controller?.setOverlayPassThrough(false)
         }
 
         PilotStateHub.log(

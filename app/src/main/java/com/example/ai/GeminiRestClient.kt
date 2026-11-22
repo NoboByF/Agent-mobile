@@ -437,9 +437,10 @@ object GeminiRestClient {
 
     /**
      * Multimodal Vision + Structured JSON call for AutonomousTaskEngine (screen understanding,
-     * multi-step UI planning, visual completion auditing, and vector drawing) with both:
-     * 1) Automatic Multi-API-Key failover (429/quota/invalid key)
-     * 2) Automatic Non-Live Reasoning Model fallback (if a model ID returns HTTP 404)
+     * multi-step UI planning, visual completion auditing, and vector drawing) with:
+     * 1) Thinking-token budget protection (prevents Gemini 2.5 Flash/Pro from burning maxOutputTokens on thoughts)
+     * 2) Automatic Multi-API-Key failover (429/quota/invalid key)
+     * 3) Automatic Non-Live Reasoning Model fallback (if a model ID returns HTTP 404)
      */
     suspend fun generateVisionJson(
         apiKey: String = "",
@@ -448,7 +449,8 @@ object GeminiRestClient {
         userPrompt: String,
         jpegBytes: ByteArray?,
         temperature: Double = 0.2,
-        maxOutputTokens: Int = 8192
+        maxOutputTokens: Int = 8192,
+        thinkingBudget: Int? = 512
     ): Result<JSONObject> = withContext(Dispatchers.IO) {
         runCatching {
             val userParts = JSONArray()
@@ -465,92 +467,114 @@ object GeminiRestClient {
             }
             userParts.put(JSONObject().put("text", userPrompt))
 
-            val payload = JSONObject()
-                .put(
-                    "system_instruction",
-                    JSONObject().put(
-                        "parts",
-                        JSONArray().put(JSONObject().put("text", systemPrompt))
-                    )
-                )
-                .put(
-                    "contents",
-                    JSONArray().put(
-                        JSONObject()
-                            .put("role", "user")
-                            .put("parts", userParts)
-                    )
-                )
-                .put(
-                    "generationConfig",
-                    JSONObject()
-                        .put("temperature", temperature)
-                        .put("maxOutputTokens", maxOutputTokens)
-                        .put("responseMimeType", "application/json")
-                )
-
-            val bodyJson = payload.toString()
+            val safeMaxTokens = maxOutputTokens.coerceAtLeast(4096)
             val modelCandidates = resolveAgentFallbackModels(modelId)
             var lastModelError: Throwable? = null
 
+            fun buildPayloadJson(candidateModel: String, includeThinking: Boolean): String {
+                val genConfig = JSONObject()
+                    .put("temperature", temperature)
+                    .put("maxOutputTokens", safeMaxTokens)
+                    .put("responseMimeType", "application/json")
+
+                if (includeThinking && candidateModel.contains("2.5")) {
+                    val budget = if (candidateModel.contains("pro", ignoreCase = true)) {
+                        (thinkingBudget ?: 1024).coerceAtLeast(256)
+                    } else {
+                        (thinkingBudget ?: 512).coerceIn(0, 2048)
+                    }
+                    genConfig.put("thinkingConfig", JSONObject().put("thinkingBudget", budget))
+                }
+
+                return JSONObject()
+                    .put(
+                        "system_instruction",
+                        JSONObject().put(
+                            "parts",
+                            JSONArray().put(JSONObject().put("text", systemPrompt))
+                        )
+                    )
+                    .put(
+                        "contents",
+                        JSONArray().put(
+                            JSONObject()
+                                .put("role", "user")
+                                .put("parts", userParts)
+                        )
+                    )
+                    .put("generationConfig", genConfig)
+                    .toString()
+            }
+
             for ((idx, candidateModel) in modelCandidates.withIndex()) {
-                try {
-                    return@runCatching executeWithPoolFailover(apiKey, "AutoPilot") { entry, activeKey ->
-                        val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
-                        val url = "$REST_BASE/models/$candidateModel:generateContent?key=$encodedKey"
-                        val request = Request.Builder()
-                            .url(url)
-                            .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
-                            .build()
+                var allowThinkingConfig = candidateModel.contains("2.5")
+                while (true) {
+                    try {
+                        val bodyJson = buildPayloadJson(candidateModel, allowThinkingConfig)
+                        return@runCatching executeWithPoolFailover(apiKey, "AutoPilot") { entry, activeKey ->
+                            val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                            val url = "$REST_BASE/models/$candidateModel:generateContent?key=$encodedKey"
+                            val request = Request.Builder()
+                                .url(url)
+                                .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+                                .build()
 
-                        val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
-                        PilotStateHub.log(
-                            LogLevel.INFO,
-                            "AutoPilot",
-                            "Action Brain -> $candidateModel$labelSuffix (${(jpegBytes?.size ?: 0) / 1024}KB)"
-                        )
+                            val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                "AutoPilot",
+                                "Action Brain -> $candidateModel$labelSuffix (${(jpegBytes?.size ?: 0) / 1024}KB)"
+                            )
 
-                        client.newCall(request).execute().use { response ->
-                            val bodyStr = response.body?.string().orEmpty()
-                            if (!response.isSuccessful) {
-                                val errMsg = extractApiError(bodyStr, response.code)
-                                PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Vision error ($candidateModel)$labelSuffix: $errMsg")
-                                throw GeminiHttpException(response.code, errMsg)
-                            }
-
-                            val root = JSONObject(bodyStr)
-                            val parts = root.optJSONArray("candidates")
-                                ?.optJSONObject(0)
-                                ?.optJSONObject("content")
-                                ?.optJSONArray("parts")
-                            val rawText = buildString {
-                                if (parts != null) {
-                                    for (i in 0 until parts.length()) {
-                                        val partObj = parts.optJSONObject(i) ?: continue
-                                        // Skip internal reasoning thought parts if returned by Gemini 2.5 thinking models
-                                        if (partObj.optBoolean("thought", false)) continue
-                                        val t = partObj.optString("text", "").orEmpty()
-                                        if (t.isNotBlank()) append(t)
-                                    }
+                            client.newCall(request).execute().use { response ->
+                                val bodyStr = response.body?.string().orEmpty()
+                                if (!response.isSuccessful) {
+                                    val errMsg = extractApiError(bodyStr, response.code)
+                                    PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Vision error ($candidateModel)$labelSuffix: $errMsg")
+                                    throw GeminiHttpException(response.code, errMsg)
                                 }
-                            }.trim()
 
-                            extractCleanJsonObject(rawText)
+                                val root = JSONObject(bodyStr)
+                                val firstCand = root.optJSONArray("candidates")?.optJSONObject(0)
+                                val finishReason = firstCand?.optString("finishReason", "").orEmpty()
+                                val parts = firstCand?.optJSONObject("content")?.optJSONArray("parts")
+                                val rawText = buildString {
+                                    if (parts != null) {
+                                        for (i in 0 until parts.length()) {
+                                            val partObj = parts.optJSONObject(i) ?: continue
+                                            if (partObj.optBoolean("thought", false)) continue
+                                            val t = partObj.optString("text", "").orEmpty()
+                                            if (t.isNotBlank()) append(t)
+                                        }
+                                    }
+                                }.trim()
+
+                                if (rawText.isBlank()) {
+                                    error("Empty JSON from $candidateModel (finishReason=$finishReason)")
+                                }
+                                extractCleanJsonObject(rawText)
+                            }
                         }
+                    } catch (e: GeminiHttpException) {
+                        lastModelError = e
+                        if (allowThinkingConfig && e.httpCode == 400 &&
+                            e.message.contains("thinking", ignoreCase = true)
+                        ) {
+                            allowThinkingConfig = false
+                            continue
+                        }
+                        val isModelUnsupported = e.httpCode == 404 ||
+                            (e.httpCode == 400 && e.message.contains("not supported", ignoreCase = true))
+                        if (isModelUnsupported && idx < modelCandidates.lastIndex) {
+                            PilotStateHub.log(
+                                LogLevel.INFO,
+                                "AutoPilot",
+                                "Model '$candidateModel' unavailable (HTTP ${e.httpCode}); switching Action Brain to '${modelCandidates[idx + 1]}'"
+                            )
+                            break
+                        }
+                        throw e
                     }
-                } catch (e: GeminiHttpException) {
-                    lastModelError = e
-                    val isModelUnsupported = e.httpCode == 404 ||
-                        (e.httpCode == 400 && e.message.contains("not supported", ignoreCase = true))
-                    if (isModelUnsupported && idx < modelCandidates.lastIndex) {
-                        PilotStateHub.log(
-                            LogLevel.INFO,
-                            "AutoPilot",
-                            "Model '$candidateModel' unavailable (HTTP ${e.httpCode}); switching Action Brain to '${modelCandidates[idx + 1]}'"
-                        )
-                        continue
-                    }
-                    throw e
                 }
             }
             throw lastModelError ?: IllegalStateException("No available Action Brain model could handle the request.")

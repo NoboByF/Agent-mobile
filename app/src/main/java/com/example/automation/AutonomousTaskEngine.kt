@@ -19,6 +19,7 @@ import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.coroutineContext
 
 enum class AutonomousMode {
@@ -46,6 +47,10 @@ class AutonomousTaskEngine(
     private var currentGoal: String = ""
 
     private val userGuidanceQueue = CopyOnWriteArrayList<String>()
+    private val taskCounter = AtomicLong(0L)
+
+    @Volatile
+    private var currentTaskToken = 0L
 
     fun isRunning(): Boolean = activeJob?.isActive == true
 
@@ -68,6 +73,8 @@ class AutonomousTaskEngine(
         activeJob?.cancel()
         userGuidanceQueue.clear()
         currentGoal = cleanGoal
+        val taskToken = taskCounter.incrementAndGet()
+        currentTaskToken = taskToken
 
         val mode = resolveMode(cleanGoal, rawMode)
         val startedAt = System.currentTimeMillis()
@@ -94,7 +101,8 @@ class AutonomousTaskEngine(
                     "[SYSTEM EVENT: Autonomous task stopped due to error: ${err.message?.take(140)}. Briefly inform the user in their language.]"
                 )
             } finally {
-                if (activeJob?.isActive != true) {
+                if (currentTaskToken == taskToken) {
+                    activeJob = null
                     updateHudProgress(running = false, ticker = null)
                 }
             }
@@ -165,39 +173,51 @@ class AutonomousTaskEngine(
             return
         }
 
-        val prepPlan = GeminiRestClient.generateVisionJson(
+        val prepResult = GeminiRestClient.generateVisionJson(
             modelId = modelId,
             systemPrompt = DRAWING_PREP_SYSTEM_PROMPT,
             userPrompt = buildString {
                 append("User Drawing Goal: ").append(goal).append('\n')
                 append("The screenshot has a 0..1000 coordinate ruler grid along the top (X) and left (Y) edges.\n")
                 append("1. Locate the exact visible drawing canvas rectangle as canvas_box [left, top, right, bottom] in 0..1000 coordinates.\n")
-                append("2. If the canvas is very small/zoomed out (e.g. 30% zoom) AND a visible '+' zoom button exists, include 1-2 taps on '+' in prep_actions.\n")
-                append("3. If a brush/pencil/pen tool is NOT selected yet or needs switching from eraser/hand tool, include that tap in prep_actions.\n")
-                append("4. If no canvas is visible on screen at all, set canvas_found=false and explain in note.\n")
-                append("Return strict JSON: {\"canvas_found\": true, \"canvas_box\": [left,top,right,bottom], \"prep_actions\": [{\"type\":\"CLICK\",\"x\":500,\"y\":500,\"label\":\"Zoom in\"}], \"note\": \"...\"}")
+                append("2. Only if the canvas is very tiny/zoomed out AND a visible '+' zoom button exists, include 1 tap on '+' in prep_actions.\n")
+                append("3. If an eraser/pan tool is selected instead of a brush/pencil, include 1 tap on the brush/pencil tool in prep_actions.\n")
+                append("4. Set canvas_found=false ONLY if there is completely no drawing canvas or white sketch area anywhere on screen.\n")
+                append("Return strict JSON: {\"canvas_found\": true, \"canvas_box\": [left,top,right,bottom], \"prep_actions\": [], \"note\": \"...\"}")
             },
             jpegBytes = initialShot,
             temperature = 0.15,
-            maxOutputTokens = 1024
-        ).getOrElse { err ->
-            notifyLiveVoice("[SYSTEM EVENT: Canvas analysis failed: ${err.message?.take(120)}. Inform user briefly.]")
-            return
+            maxOutputTokens = 4096,
+            thinkingBudget = 0
+        )
+
+        val prepPlan = prepResult.getOrNull()
+        if (prepPlan == null) {
+            val errMsg = prepResult.exceptionOrNull()?.message.orEmpty()
+            // If it's a hard API key / network failure, report and stop cleanly; otherwise fall back to center canvas box and draw!
+            if (errMsg.contains("API key", ignoreCase = true) ||
+                errMsg.contains("quota", ignoreCase = true) ||
+                errMsg.contains("HTTP 401", ignoreCase = true) ||
+                errMsg.contains("HTTP 403", ignoreCase = true)
+            ) {
+                notifyLiveVoice("[SYSTEM EVENT: Drawing could not start due to API error: ${errMsg.take(120)}. Tell the user briefly.]")
+                return
+            }
+            PilotStateHub.log(LogLevel.INFO, "AutoPilot", "Canvas prep used fallback bounds ($errMsg)")
         }
 
-        val canvasFound = prepPlan.optBoolean("canvas_found", true)
+        val canvasFound = prepPlan?.optBoolean("canvas_found", true) ?: true
         if (!canvasFound) {
-            // Fall back to general UI workflow if user needs to open a drawing screen/canvas first
             PilotStateHub.log(LogLevel.INFO, "AutoPilot", "Canvas not immediately visible; switching to UI workflow first.")
             runAutonomousWorkflowLoop(service, goal, startedAtMs)
             return
         }
 
-        var canvasBox = parseCanvasBox(prepPlan.optJSONArray("canvas_box"))
-        val prepActions = prepPlan.optJSONArray("prep_actions")
+        var canvasBox = prepPlan?.let { parseCanvasBox(it.optJSONArray("canvas_box")) }
+        val prepActions = prepPlan?.optJSONArray("prep_actions")
         var ranPrepActions = false
         if (prepActions != null && prepActions.length() > 0) {
-            val count = minOf(prepActions.length(), 5)
+            val count = minOf(prepActions.length(), 3)
             for (i in 0 until count) {
                 coroutineContext.ensureActive()
                 val act = prepActions.optJSONObject(i) ?: continue
@@ -228,14 +248,15 @@ class AutonomousTaskEngine(
                 userPrompt = "Return strict JSON: {\"canvas_box\": [left, top, right, bottom]} for the active drawing canvas area in 0..1000 screen coordinates.",
                 jpegBytes = latestShot,
                 temperature = 0.1,
-                maxOutputTokens = 256
+                maxOutputTokens = 4096,
+                thinkingBudget = 0
             ).getOrNull()
             confirmObj?.optJSONArray("canvas_box")?.let {
                 parseCanvasBox(it)?.let { updated -> canvasBox = updated }
             }
         }
 
-        val activeCanvasBox = canvasBox ?: intArrayOf(120, 220, 880, 780)
+        val activeCanvasBox = canvasBox ?: intArrayOf(150, 260, 850, 720)
         PilotStateHub.log(
             LogLevel.INFO,
             "AutoPilot",
@@ -279,8 +300,8 @@ class AutonomousTaskEngine(
                         - All stroke points MUST use CANVAS-RELATIVE coordinates from 0 to 1000:
                           (0,0) = top-left of the white canvas, (500,500) = dead center of canvas, (1000,1000) = bottom-right of canvas.
                         - Keep the main subject well-composed inside 100..900 so nothing is clipped at edges.
-                        - Make it genuinely recognizable, graceful, and detailed: use 18 to 32 smooth strokes.
-                        - Each curved stroke MUST have 5 to 14 ordered [x, y] waypoints so Bezier smoothing creates real organic curves (e.g., for a bird: curved head crown, pointed beak upper & lower, eye dot, curved throat & breast, back contour, sweeping upper & lower wings with layered feather curves, fanned tail feathers, legs/claws, and a tree branch with leaves).
+                        - Make it genuinely recognizable, graceful, and detailed: use 14 to 24 smooth strokes.
+                        - Each curved stroke MUST have 4 to 10 ordered [x, y] waypoints so Bezier smoothing creates real organic curves (e.g., for a bird: curved head crown, pointed beak upper & lower, eye dot, curved throat & breast, back contour, sweeping upper & lower wings with layered feather curves, fanned tail feathers, legs/claws, and a tree branch with leaves).
                         - Return strict JSON:
                           {
                             "done": false,
@@ -297,7 +318,7 @@ class AutonomousTaskEngine(
                         """
                         LOOK CAREFULLY at the latest screenshot showing what has ALREADY been drawn on the canvas.
                         - Evaluate the drawing honestly. If it already looks complete, recognizable, and satisfies all user instructions, return {"done": true, "summary": "...", "tool_taps": [], "strokes": []}.
-                        - Otherwise, add 8 to 20 high-impact finishing strokes (missing features, feather/leaf details, eye highlights, branch/ground lines, subtle shading strokes, or user-requested changes) in CANVAS-RELATIVE 0..1000 coordinates.
+                        - Otherwise, add 6 to 16 high-impact finishing strokes (missing features, feather/leaf details, eye highlights, branch/ground lines, subtle shading strokes, or user-requested changes) in CANVAS-RELATIVE 0..1000 coordinates.
                         - Optionally include screen-coordinate (0..1000) "tool_taps": [{"x":..., "y":..., "label":"..."}] ONLY if changing color or brush preset visibly shown on screen.
                         - Return strict JSON with keys: done, summary, tool_taps, strokes.
                         """.trimIndent()
@@ -310,8 +331,9 @@ class AutonomousTaskEngine(
                 systemPrompt = DRAWING_ARTIST_SYSTEM_PROMPT,
                 userPrompt = stagePrompt,
                 jpegBytes = latestShot,
-                temperature = 0.3,
-                maxOutputTokens = 6144
+                temperature = 0.25,
+                maxOutputTokens = 8192,
+                thinkingBudget = 512
             ).getOrElse { err ->
                 PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Drawing stage $stage failed: ${err.message}")
                 if (totalStrokesDrawn > 0) break
@@ -443,7 +465,8 @@ class AutonomousTaskEngine(
                 },
                 jpegBytes = screenshot,
                 temperature = 0.15,
-                maxOutputTokens = 8192
+                maxOutputTokens = 8192,
+                thinkingBudget = 512
             ).getOrElse { err ->
                 consecutiveErrors++
                 PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Step $step planner error: ${err.message}")
@@ -598,7 +621,8 @@ class AutonomousTaskEngine(
             },
             jpegBytes = shot,
             temperature = 0.1,
-            maxOutputTokens = 2048
+            maxOutputTokens = 4096,
+            thinkingBudget = 0
         ).getOrNull()
 
         if (res == null) {

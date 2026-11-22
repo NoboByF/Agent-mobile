@@ -86,6 +86,7 @@ class GeminiLiveClient(
 
     private var reconnectAttempt = 0
     private var reconnectJob: Job? = null
+    private val triedLiveModels = LinkedHashSet<String>()
 
     fun isReadyForRealtimeInput(): Boolean = setupCompleted.get() && webSocket != null
 
@@ -100,8 +101,10 @@ class GeminiLiveClient(
         setupCompleted.set(false)
         reconnectAttempt = 0
         reconnectJob?.cancel()
+        triedLiveModels.clear()
 
         currentModel = normalizeModelPath(modelId)
+        triedLiveModels.add(currentModel)
         currentVoice = voiceName.trim().ifBlank { "Kore" }
         currentVoiceLanguage = voiceLanguage
         currentCustomInstructions = customInstructions.trim()
@@ -247,6 +250,27 @@ class GeminiLiveClient(
         wsCloseCode: Int?,
         reason: String
     ) {
+        val isModelUnsupported = (wsCloseCode == 1008 || httpCode == 404) &&
+            (reason.contains("not found", ignoreCase = true) ||
+                reason.contains("not supported", ignoreCase = true) ||
+                reason.contains("model", ignoreCase = true))
+        if (isModelUnsupported) {
+            val nextLiveModel = LIVE_FALLBACK_CANDIDATES
+                .map { normalizeModelPath(it) }
+                .firstOrNull { it !in triedLiveModels }
+            if (nextLiveModel != null) {
+                triedLiveModels.add(nextLiveModel)
+                currentModel = nextLiveModel
+                savedResumptionHandle = null
+                reconnectAttempt = 0
+                val shortName = nextLiveModel.removePrefix("models/")
+                PilotStateHub.log(LogLevel.WS, "LiveClient", "Live model unsupported; falling back to $shortName")
+                PilotStateHub.updateSession { it.copy(statusTicker = "Switching to $shortName...") }
+                scheduleReconnect("Fallback to $shortName", immediate = true)
+                return
+            }
+        }
+
         val classification = ApiKeyPoolManager.classifyFailure(
             httpCode = httpCode,
             wsCloseCode = wsCloseCode,
@@ -526,6 +550,12 @@ class GeminiLiveClient(
         private const val WS_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 
+        private val LIVE_FALLBACK_CANDIDATES = listOf(
+            "gemini-2.5-flash-native-audio-preview-12-2025",
+            "gemini-2.0-flash-live-001",
+            "gemini-3.1-flash-live-preview"
+        )
+
         private val sharedTestClient: OkHttpClient by lazy {
             OkHttpClient.Builder()
                 .connectTimeout(12, TimeUnit.SECONDS)
@@ -535,7 +565,7 @@ class GeminiLiveClient(
 
         fun normalizeModelPath(modelId: String): String {
             val cleaned = modelId.trim().removePrefix("models/")
-            return "models/${cleaned.ifBlank { "gemini-3.8-live" }}"
+            return "models/${cleaned.ifBlank { "gemini-2.5-flash-native-audio-preview-12-2025" }}"
         }
 
         fun buildSetupPayload(

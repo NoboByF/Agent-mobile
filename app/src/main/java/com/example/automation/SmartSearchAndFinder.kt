@@ -573,7 +573,8 @@ object SmartSearchAndFinder {
             userPrompt = "Find this element on screen: \"$targetDescription\". Return JSON: {\"found\": true/false, \"x\": 0..1000, \"y\": 0..1000}.",
             jpegBytes = shot,
             temperature = 0.1,
-            maxOutputTokens = 1024
+            maxOutputTokens = 4096,
+            thinkingBudget = 0
         ).getOrNull() ?: return null
 
         if (!json.optBoolean("found", false)) return null

@@ -348,8 +348,7 @@ class PilotPreferences(context: Context) {
         private val LEGACY_PLACEHOLDER_LIVE_MODELS = setOf("gemini-3.8-live")
         private val LEGACY_PLACEHOLDER_TEXT_MODELS = setOf(
             "gemini-4-hydrogen",
-            "gemini-4-carbon",
-            "gemini-3.1-flash-lite"
+            "gemini-4-carbon"
         )
     }
 }
