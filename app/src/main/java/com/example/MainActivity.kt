@@ -75,7 +75,7 @@ import com.example.ui.screens.AuthGateScreen
 import com.example.ui.screens.AutoChatScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.SettingsLogsScreen
-import com.example.ui.screens.signOutFromFirebaseAndCredentials
+import com.example.ui.screens.signOutFromFirebase
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.LivePilotTheme
 import com.example.ui.theme.StudioTheme
@@ -127,16 +127,12 @@ private fun LivePilotAppEntry(
 ) {
     val context = LocalContext.current
     PilotStateHub.ensureInitialized(context.applicationContext)
-    val prefs = remember(context) { PilotStateHub.getPreferences(context.applicationContext) }
     val hubSettings by PilotStateHub.settings.collectAsStateWithLifecycle()
     val deviceProfile = remember(context) { DeviceIdentityHelper.resolve(context) }
     val appScope = rememberCoroutineScope()
 
     var currentUser by remember {
         mutableStateOf(runCatching { Firebase.auth.currentUser }.getOrNull())
-    }
-    var autoLocalMode by remember {
-        mutableStateOf(prefs.isAutoLocalDeviceMode())
     }
 
     DisposableEffect(Unit) {
@@ -161,37 +157,27 @@ private fun LivePilotAppEntry(
         }
 
         val signedInUser = currentUser
-        if (signedInUser == null && !autoLocalMode) {
+        if (signedInUser == null) {
             AuthGateScreen(
                 deviceProfile = deviceProfile,
                 onSignedIn = {
                     currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
-                },
-                onOneClickAutoStart = {
-                    prefs.setAutoLocalDeviceMode(true)
-                    autoLocalMode = true
                 }
             )
         } else {
-            val sessionKey = signedInUser?.uid ?: "local_${deviceProfile.deviceId}"
+            val sessionKey = signedInUser.uid
             key(sessionKey) {
                 val scopedViewModel: PilotViewModel = viewModel(key = sessionKey)
                 LivePilotAppRoot(
                     requestedTab = requestedTab,
                     onConsumedRequestedTab = onConsumedRequestedTab,
-                    userEmail = signedInUser?.email ?: signedInUser?.displayName,
-                    isCloudSignedIn = signedInUser != null,
+                    userEmail = signedInUser.email ?: signedInUser.displayName,
+                    isCloudSignedIn = true,
                     onSignOut = {
                         appScope.launch {
-                            signOutFromFirebaseAndCredentials(context)
-                            prefs.setAutoLocalDeviceMode(false)
-                            autoLocalMode = false
+                            signOutFromFirebase()
                             currentUser = null
                         }
-                    },
-                    onOpenGoogleSignIn = {
-                        prefs.setAutoLocalDeviceMode(false)
-                        autoLocalMode = false
                     },
                     viewModel = scopedViewModel
                 )
@@ -207,7 +193,6 @@ private fun LivePilotAppRoot(
     userEmail: String?,
     isCloudSignedIn: Boolean,
     onSignOut: () -> Unit,
-    onOpenGoogleSignIn: () -> Unit,
     viewModel: PilotViewModel
 ) {
     val context = LocalContext.current
@@ -503,7 +488,6 @@ private fun LivePilotAppRoot(
                             logs = logs,
                             onSyncNow = { viewModel.syncNowToCloud() },
                             onSignOut = onSignOut,
-                            onOpenGoogleSignIn = onOpenGoogleSignIn,
                             onUpdateOwnerDisplayName = { viewModel.updateOwnerDisplayName(it) },
                             onExportBackupFile = {
                                 exportBackupLauncher.launch("LivePilot_${viewModel.deviceProfile.deviceId}_backup.json")

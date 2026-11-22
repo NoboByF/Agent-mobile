@@ -20,7 +20,6 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
@@ -133,7 +132,6 @@ fun SettingsLogsScreen(
     logs: List<DiagnosticLogEntry>,
     onSyncNow: () -> Unit,
     onSignOut: () -> Unit,
-    onOpenGoogleSignIn: () -> Unit,
     onUpdateOwnerDisplayName: (String) -> Unit,
     onExportBackupFile: () -> Unit,
     onImportBackupFile: () -> Unit,
@@ -468,68 +466,44 @@ fun SettingsLogsScreen(
                         }
 
                         Spacer(modifier = Modifier.height(8.dp))
-                        if (isCloudSignedIn) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                OutlinedButton(
-                                    onClick = onSyncNow,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(48.dp)
-                                        .testTag("settings_cloud_sync_button"),
-                                    shape = RoundedCornerShape(12.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Sync,
-                                        contentDescription = "Sync now",
-                                        tint = palette.emeraldAccent,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Sync Now", color = palette.inkPrimary)
-                                }
-                                OutlinedButton(
-                                    onClick = onSignOut,
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(48.dp)
-                                        .testTag("settings_sign_out_button"),
-                                    shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(1.dp, palette.roseAccent.copy(alpha = 0.5f))
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Filled.Logout,
-                                        contentDescription = "Sign out",
-                                        tint = palette.roseAccent,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Sign Out", color = palette.roseAccent)
-                                }
-                            }
-                        } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
                             OutlinedButton(
-                                onClick = onOpenGoogleSignIn,
+                                onClick = onSyncNow,
                                 modifier = Modifier
-                                    .fillMaxWidth()
+                                    .weight(1f)
                                     .height(48.dp)
-                                    .testTag("settings_connect_google_button"),
-                                shape = RoundedCornerShape(12.dp),
-                                border = BorderStroke(1.dp, palette.cobaltAccent.copy(alpha = 0.5f))
+                                    .testTag("settings_cloud_sync_button"),
+                                shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(
-                                    imageVector = Icons.AutoMirrored.Filled.Login,
-                                    contentDescription = "Connect Gmail account cloud sync",
-                                    tint = palette.cobaltAccent,
+                                    imageVector = Icons.Filled.Sync,
+                                    contentDescription = "Sync now",
+                                    tint = palette.emeraldAccent,
                                     modifier = Modifier.size(16.dp)
                                 )
                                 Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "Gmail অ্যাকাউন্ট দিয়ে ক্লাউড সিঙ্ক চালু করুন",
-                                    color = palette.cobaltAccent
+                                Text("Sync Now", color = palette.inkPrimary)
+                            }
+                            OutlinedButton(
+                                onClick = onSignOut,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("settings_sign_out_button"),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, palette.roseAccent.copy(alpha = 0.5f))
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.Logout,
+                                    contentDescription = "Sign out",
+                                    tint = palette.roseAccent,
+                                    modifier = Modifier.size(16.dp)
                                 )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Sign Out", color = palette.roseAccent)
                             }
                         }
                     }

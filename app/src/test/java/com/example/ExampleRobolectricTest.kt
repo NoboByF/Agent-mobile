@@ -689,5 +689,39 @@ class ExampleRobolectricTest {
         assertTrue(prefs.loadRoutines().any { it.id == "r_custom" })
         assertEquals(1, prefs.loadAskAiHistory().size)
     }
+
+    @Test
+    fun `email and password auth validator checks gmail format, password length, and confirmation match`() {
+        assertNull(com.example.ui.screens.AuthInputValidator.validateLogin("fahim@gmail.com", "secret123"))
+        assertNotNull(com.example.ui.screens.AuthInputValidator.validateLogin("not-an-email", "secret123"))
+        assertNotNull(com.example.ui.screens.AuthInputValidator.validateLogin("fahim@gmail.com", "12345"))
+
+        assertNull(
+            com.example.ui.screens.AuthInputValidator.validateSignUp(
+                accountName = "ফাহিম",
+                email = "fahim@gmail.com",
+                password = "secret123",
+                confirmPassword = "secret123"
+            )
+        )
+        assertNotNull(
+            com.example.ui.screens.AuthInputValidator.validateSignUp(
+                accountName = "ফাহিম",
+                email = "fahim@gmail.com",
+                password = "secret123",
+                confirmPassword = "different"
+            )
+        )
+        assertNotNull(
+            com.example.ui.screens.AuthInputValidator.validateSignUp(
+                accountName = "",
+                email = "fahim@gmail.com",
+                password = "secret123",
+                confirmPassword = "secret123"
+            )
+        )
+        assertNull(com.example.ui.screens.AuthInputValidator.validateResetEmail("fahim@gmail.com"))
+        assertNotNull(com.example.ui.screens.AuthInputValidator.validateResetEmail("bad"))
+    }
 }
 
