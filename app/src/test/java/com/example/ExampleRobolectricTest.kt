@@ -1,6 +1,8 @@
 package com.example
 
 import android.content.Context
+import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
 import androidx.test.core.app.ApplicationProvider
 import com.example.ai.ApiFailureKind
 import com.example.ai.ApiKeyPoolManager
@@ -22,6 +24,8 @@ import com.example.data.PilotStateHub
 import com.example.data.RoutineAccent
 import com.example.data.SafetyGuardrails
 import com.example.data.VoiceLanguage
+import com.example.messaging.IncomingMessageListener
+import com.example.messaging.SensitiveMessageGuard
 import com.example.ui.components.formatAiRichText
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -75,7 +79,7 @@ class ExampleRobolectricTest {
         assertTrue(systemText.contains("Speak short Bengali"))
 
         val declarations = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
-        assertEquals(28, declarations.length())
+        assertEquals(29, declarations.length())
     }
 
     @Test
@@ -443,4 +447,116 @@ class ExampleRobolectricTest {
         src.recycle()
         gridded.recycle()
     }
+
+    @Test
+    fun `messaging style extractor filters own RemoteInput replies and prevents WhatsApp self-reply loops`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val me = Person.Builder().setName("You").build()
+        val sumaiya = Person.Builder().setName("সুমাইয়া").build()
+
+        // 1. Incoming real message from সুমাইয়া -> must be extracted as incoming
+        val incomingNotif = NotificationCompat.Builder(context, "test_ch")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("সুমাইয়া")
+            .setContentText("হাই")
+            .setStyle(
+                NotificationCompat.MessagingStyle(me)
+                    .addMessage("হাই", System.currentTimeMillis(), sumaiya)
+            )
+            .build()
+
+        val extractedIncoming = SensitiveMessageGuard.extractIncomingMessage(incomingNotif)
+        assertFalse(extractedIncoming.isSelfOrSystem)
+        assertEquals("সুমাইয়া", extractedIncoming.senderName)
+        assertEquals("হাই", extractedIncoming.messageText)
+
+        // 2. Re-posted WhatsApp notification after our own RemoteInput reply (person == null or self) -> MUST be skipped!
+        val selfEchoNotif = NotificationCompat.Builder(context, "test_ch")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("সুমাইয়া")
+            .setContentText("হ্যালো! কেমন আছেন?")
+            .setStyle(
+                NotificationCompat.MessagingStyle(me)
+                    .addMessage("হাই", System.currentTimeMillis() - 1000L, sumaiya)
+                    .addMessage("হ্যালো! কেমন আছেন?", System.currentTimeMillis(), null as Person?)
+            )
+            .build()
+
+        val extractedSelf = SensitiveMessageGuard.extractIncomingMessage(selfEchoNotif)
+        assertTrue(extractedSelf.isSelfOrSystem)
+
+        // 3. Sent-reply echo guard also blocks exact sent reply even if MessagingStyle is stripped
+        IncomingMessageListener.registerSentReply("com.whatsapp", "সুমাইয়া", "হ্যালো! কেমন আছেন?")
+        assertTrue(IncomingMessageListener.isRecentSelfEcho("com.whatsapp", "সুমাইয়া", "হ্যালো! কেমন আছেন?"))
+        assertFalse(IncomingMessageListener.isRecentSelfEcho("com.whatsapp", "সুমাইয়া", "ভালো আছি, তুমি কেমন আছো?"))
+    }
+
+    @Test
+    fun `sensitive question guard detects financial, OTP, and private questions and defers politely`() {
+        val bkash = SensitiveMessageGuard.assessSensitivityLocally("ভাই আমাকে ৫০০০ টাকা বিকাশ করে দাও জরুরি")
+        assertTrue(bkash.isSensitive)
+        assertEquals("আমি জেনে বলছি।", bkash.deferralReply)
+
+        val otp = SensitiveMessageGuard.assessSensitivityLocally("Can you send me the OTP verification code?")
+        assertTrue(otp.isSensitive)
+        assertEquals("Let me check and get back to you.", otp.deferralReply)
+
+        val address = SensitiveMessageGuard.assessSensitivityLocally("তোমার বাসার ঠিকানা দাও এখন")
+        assertTrue(address.isSensitive)
+        assertEquals("আমি জেনে বলছি।", address.deferralReply)
+
+        val casual = SensitiveMessageGuard.assessSensitivityLocally("হাই কেমন আছো?")
+        assertFalse(casual.isSensitive)
+    }
+
+    @Test
+    fun `non-destructive safety guardrails block irreversible actions while permitting safe self-healing controls`() {
+        assertTrue(SafetyGuardrails.isDestructiveAction("Factory Reset", "Reset phone", "Open Settings"))
+        assertTrue(SafetyGuardrails.isDestructiveAction("Uninstall", "Tap Uninstall", "Check app info"))
+        assertTrue(SafetyGuardrails.isDestructiveAction("Pay Now", "Confirm checkout", "Search shoes on Daraz"))
+        assertTrue(SafetyGuardrails.isDestructiveAction("Delete", "Delete item", "Open gallery"))
+
+        // Benign navigation & popup self-healing buttons are permitted
+        assertFalse(SafetyGuardrails.isDestructiveAction("Skip Ad", "Dismiss popup", "Play song on YouTube"))
+        assertFalse(SafetyGuardrails.isDestructiveAction("Not now", "Close dialog", "Open Chrome"))
+        assertFalse(SafetyGuardrails.isDestructiveAction("Search", "Tap search", "Search Dhaka weather"))
+    }
+
+    @Test
+    fun `device identity is valid for Firestore path and personal data plus deleted models persist`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val profile = com.example.firebase.DeviceIdentityHelper.resolve(context)
+        assertTrue(profile.deviceId.matches(Regex("^[a-zA-Z0-9_\\-]+$")))
+        assertTrue(profile.deviceId.length in 4..64)
+        assertEquals(profile.deviceId, com.example.firebase.DeviceIdentityHelper.resolve(context).deviceId)
+
+        val prefs = PilotPreferences(context)
+        val savedSettings = PilotSettings(
+            deletedModels = listOf("gemini-2.0-flash", "gemini-1.5-pro"),
+            handsFreeVoiceEscalationEnabled = true
+        )
+        prefs.saveSettings(savedSettings)
+        val reloadedSettings = prefs.loadSettings()
+        assertTrue(reloadedSettings.deletedModels.contains("gemini-2.0-flash"))
+        assertTrue(reloadedSettings.handsFreeVoiceEscalationEnabled)
+
+        val personalFact = com.example.data.PersonalDataItem(
+            id = "pd_test_1",
+            title = "আমার পেশা",
+            content = "আমি একজন Android ডেভেলপার।",
+            category = "কাজ / পেশা",
+            shareInAutoReply = true
+        )
+        prefs.savePersonalData(listOf(personalFact))
+        val reloadedFacts = prefs.loadPersonalData()
+        assertEquals(1, reloadedFacts.size)
+        assertEquals("আমার পেশা", reloadedFacts.first().title)
+
+        PilotStateHub.setPersonalData(reloadedFacts)
+        val prompt = GeminiToolSchemas.buildSystemInstruction("", VoiceLanguage.BENGALI_BD)
+        assertTrue(prompt.contains("OWNER'S SAVED PERSONAL DATA"))
+        assertTrue(prompt.contains("আমি একজন Android ডেভেলপার।"))
+        PilotStateHub.setPersonalData(emptyList())
+    }
 }
+

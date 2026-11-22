@@ -69,6 +69,12 @@ object PilotStateHub {
     private val _permissions = MutableStateFlow(PermissionSnapshot())
     val permissions: StateFlow<PermissionSnapshot> = _permissions.asStateFlow()
 
+    private val _personalData = MutableStateFlow<List<PersonalDataItem>>(emptyList())
+    val personalData: StateFlow<List<PersonalDataItem>> = _personalData.asStateFlow()
+
+    @Volatile
+    var onSettingsChangedListener: ((PilotSettings) -> Unit)? = null
+
     private val notificationHandles = ConcurrentHashMap<String, CachedNotificationHandle>()
 
     @Volatile
@@ -82,6 +88,7 @@ object PilotStateHub {
             val prefs = PilotPreferences(context.applicationContext)
             preferences = prefs
             _settings.value = prefs.loadSettings()
+            _personalData.value = prefs.loadPersonalData()
         }
     }
 
@@ -94,6 +101,32 @@ object PilotStateHub {
         val updated = transform(_settings.value)
         _settings.value = updated
         preferences?.saveSettings(updated)
+        onSettingsChangedListener?.invoke(updated)
+    }
+
+    /**
+     * Applies cloud-synced settings without re-triggering the outbound cloud push loop.
+     */
+    fun applySettingsFromCloud(cloudSettings: PilotSettings) {
+        _settings.value = cloudSettings
+        preferences?.saveSettings(cloudSettings)
+    }
+
+    fun setPersonalData(items: List<PersonalDataItem>) {
+        _personalData.value = items
+        preferences?.savePersonalData(items)
+    }
+
+    fun upsertPersonalDataLocal(item: PersonalDataItem) {
+        val updated = _personalData.value.filterNot { it.id == item.id }.let { listOf(item) + it }
+        _personalData.value = updated
+        preferences?.savePersonalData(updated)
+    }
+
+    fun removePersonalDataLocal(entryId: String) {
+        val updated = _personalData.value.filterNot { it.id == entryId }
+        _personalData.value = updated
+        preferences?.savePersonalData(updated)
     }
 
     fun updateSession(transform: (LiveSessionState) -> LiveSessionState) {
@@ -207,6 +240,57 @@ object PilotStateHub {
                 if (msg.id == recordId) msg.copy(autoRepliedText = replyText) else msg
             }
         }
+    }
+
+    fun markMessageSensitiveEscalated(
+        recordId: String,
+        deferralReply: String,
+        reason: String?,
+        ownerQuestion: String
+    ) {
+        _incomingMessages.update { current ->
+            current.map { msg ->
+                if (msg.id == recordId) {
+                    msg.copy(
+                        autoRepliedText = deferralReply,
+                        isSensitive = true,
+                        sensitivityReason = reason,
+                        needsOwnerAnswer = true,
+                        ownerQuestion = ownerQuestion
+                    )
+                } else {
+                    msg
+                }
+            }
+        }
+    }
+
+    fun markSensitiveMessageResolved(recordId: String, ownerReply: String) {
+        _incomingMessages.update { current ->
+            current.map { msg ->
+                if (msg.id == recordId) {
+                    msg.copy(
+                        needsOwnerAnswer = false,
+                        ownerResolvedReply = ownerReply,
+                        autoRepliedText = ownerReply
+                    )
+                } else {
+                    msg
+                }
+            }
+        }
+    }
+
+    fun findPendingSensitiveMessage(query: String = ""): IncomingMessageRecord? {
+        val pending = _incomingMessages.value.filter { it.needsOwnerAnswer }
+        if (pending.isEmpty()) return null
+        val normalized = query.trim().lowercase()
+        if (normalized.isEmpty()) return pending.first()
+        return pending.firstOrNull {
+            it.id == query ||
+                it.senderName.lowercase().contains(normalized) ||
+                it.app.displayName.lowercase().contains(normalized)
+        } ?: pending.first()
     }
 
     fun clearIncomingMessages() {

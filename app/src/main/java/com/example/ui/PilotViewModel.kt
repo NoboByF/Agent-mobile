@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Application
 import android.content.ComponentName
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.provider.Settings
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -11,11 +12,14 @@ import androidx.lifecycle.viewModelScope
 import com.example.ai.ApiKeyPoolManager
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
+import com.example.ai.MediaAttachmentHelper
+import com.example.ai.PreparedAttachment
 import com.example.automation.PilotAccessibilityService
 import com.example.data.AppThemeMode
 import com.example.data.AskAiMessage
 import com.example.data.AutoChatMode
 import com.example.data.AutoReplyDelivery
+import com.example.data.ChatAttachmentMeta
 import com.example.data.ConnectionTestState
 import com.example.data.DiagnosticLogEntry
 import com.example.data.DiscoveredModel
@@ -24,14 +28,21 @@ import com.example.data.LiveCaptionLine
 import com.example.data.LiveSessionState
 import com.example.data.MessagingApp
 import com.example.data.PermissionSnapshot
+import com.example.data.PersonalDataItem
 import com.example.data.PilotRoutine
 import com.example.data.PilotSettings
 import com.example.data.PilotStateHub
 import com.example.data.RecentToolEvent
 import com.example.data.RoutineAccent
 import com.example.data.VoiceLanguage
+import com.example.firebase.CloudSyncRepository
+import com.example.firebase.DeviceProfileIdentity
 import com.example.messaging.IncomingMessageListener
 import com.example.service.FloatingCallOverlayService
+import com.google.firebase.Firebase
+import com.google.firebase.auth.auth
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -42,15 +53,20 @@ import java.util.concurrent.atomic.AtomicLong
 
 data class AskAiUiState(
     val messages: List<AskAiMessage> = emptyList(),
+    val pendingAttachments: List<ChatAttachmentMeta> = emptyList(),
     val searchGroundingEnabled: Boolean = true,
     val isGenerating: Boolean = false,
+    val attachmentStatusText: String? = null,
     val errorText: String? = null
 )
 
 class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
     private val prefs = PilotStateHub.getPreferences(application.applicationContext)
+    private val cloudRepo = CloudSyncRepository(application.applicationContext)
     private val chatIdCounter: AtomicLong
+
+    val deviceProfile: DeviceProfileIdentity = cloudRepo.deviceProfile
 
     val settings: StateFlow<PilotSettings> = PilotStateHub.settings
     val sessionState: StateFlow<LiveSessionState> = PilotStateHub.sessionState
@@ -60,6 +76,10 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     val recentToolEvents: StateFlow<List<RecentToolEvent>> = PilotStateHub.recentToolEvents
     val incomingMessages: StateFlow<List<IncomingMessageRecord>> = PilotStateHub.incomingMessages
     val discoveredModels: StateFlow<List<DiscoveredModel>> = PilotStateHub.discoveredModels
+    val personalData: StateFlow<List<PersonalDataItem>> = PilotStateHub.personalData
+
+    private val _cloudSyncStatus = MutableStateFlow("Syncing device profile...")
+    val cloudSyncStatus: StateFlow<String> = _cloudSyncStatus.asStateFlow()
 
     private val _routines = MutableStateFlow(prefs.loadRoutines())
     val routines: StateFlow<List<PilotRoutine>> = _routines.asStateFlow()
@@ -87,10 +107,134 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     private val _bannerMessage = MutableStateFlow<String?>(null)
     val bannerMessage: StateFlow<String?> = _bannerMessage.asStateFlow()
 
+    private var pendingSettingsSyncJob: Job? = null
+    private var initialDeviceCloudChecked = false
+    private var initialPersonalDataSeeded = false
+
     init {
         val maxExistingId = _askAiState.value.messages.maxOfOrNull { it.id } ?: 0L
         chatIdCounter = AtomicLong(maxExistingId + 1L)
         refreshPermissions()
+        startCloudSyncIfAuthenticated()
+    }
+
+    private fun startCloudSyncIfAuthenticated() {
+        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+        if (currentUser == null) {
+            _cloudSyncStatus.value = "Local mode (Sign in for Firebase backup)"
+            return
+        }
+
+        // Push any local settings/API-key/model change automatically to THIS device's Firestore doc
+        PilotStateHub.onSettingsChangedListener = { updatedSettings ->
+            scheduleDeviceConfigCloudSave(updatedSettings)
+        }
+
+        // 1. Observe THIS device's isolated config (API keys, deleted models, settings)
+        viewModelScope.launch {
+            cloudRepo.observeDeviceConfig().collect { cloudSettings ->
+                if (cloudSettings != null) {
+                    initialDeviceCloudChecked = true
+                    PilotStateHub.applySettingsFromCloud(cloudSettings)
+                    _cloudSyncStatus.value = "Firebase Synced • ${deviceProfile.displayLabel}"
+                } else if (!initialDeviceCloudChecked) {
+                    initialDeviceCloudChecked = true
+                    // First login on this device: back up existing local settings to this device's Firestore profile
+                    val res = cloudRepo.saveDeviceConfig(PilotStateHub.settings.value)
+                    _cloudSyncStatus.value = if (res.isSuccess) {
+                        "Firebase Synced • ${deviceProfile.displayLabel}"
+                    } else {
+                        "Cloud backup pending (offline)"
+                    }
+                }
+            }
+        }
+
+        // 2. Observe Personal Data ("আমার ডাটা") for this device
+        viewModelScope.launch {
+            cloudRepo.observePersonalData().collect { cloudItems ->
+                if (cloudItems.isNotEmpty()) {
+                    initialPersonalDataSeeded = true
+                    PilotStateHub.setPersonalData(cloudItems)
+                } else if (!initialPersonalDataSeeded) {
+                    initialPersonalDataSeeded = true
+                    val localExisting = PilotStateHub.personalData.value
+                    if (localExisting.isNotEmpty()) {
+                        localExisting.forEach { item ->
+                            launch { cloudRepo.upsertPersonalData(item) }
+                        }
+                    } else {
+                        PilotStateHub.setPersonalData(emptyList())
+                    }
+                } else {
+                    PilotStateHub.setPersonalData(emptyList())
+                }
+            }
+        }
+
+        // 3. Observe Custom Routines for this device
+        viewModelScope.launch {
+            cloudRepo.observeCustomRoutines().collect { cloudCustom ->
+                if (cloudCustom.isNotEmpty()) {
+                    val combined = cloudCustom + PilotSettings.DEFAULT_ROUTINES
+                    _routines.value = combined
+                    prefs.saveCustomRoutines(combined)
+                }
+            }
+        }
+
+        // 4. Observe Ask AI History for this device
+        viewModelScope.launch {
+            cloudRepo.observeAskAiMessages().collect { cloudMessages ->
+                if (cloudMessages.isNotEmpty() && !_askAiState.value.isGenerating) {
+                    val maxId = cloudMessages.maxOfOrNull { it.id } ?: 0L
+                    if (maxId >= chatIdCounter.get()) {
+                        chatIdCounter.set(maxId + 1L)
+                    }
+                    prefs.saveAskAiHistory(cloudMessages)
+                    _askAiState.update { it.copy(messages = cloudMessages) }
+                }
+            }
+        }
+    }
+
+    private fun scheduleDeviceConfigCloudSave(settingsSnapshot: PilotSettings) {
+        if (runCatching { Firebase.auth.currentUser }.getOrNull() == null) return
+        pendingSettingsSyncJob?.cancel()
+        pendingSettingsSyncJob = viewModelScope.launch {
+            delay(450L)
+            _cloudSyncStatus.value = "Saving to Firebase..."
+            val res = cloudRepo.saveDeviceConfig(settingsSnapshot)
+            _cloudSyncStatus.value = if (res.isSuccess) {
+                "Firebase Synced • ${deviceProfile.displayLabel}"
+            } else {
+                "Sync retry pending"
+            }
+        }
+    }
+
+    fun syncNowToCloud() {
+        if (runCatching { Firebase.auth.currentUser }.getOrNull() == null) return
+        viewModelScope.launch {
+            _cloudSyncStatus.value = "Syncing all device data..."
+            val cfgRes = cloudRepo.saveDeviceConfig(PilotStateHub.settings.value)
+            PilotStateHub.personalData.value.forEach { cloudRepo.upsertPersonalData(it) }
+            _routines.value.filter { !it.isBuiltIn }.forEach { cloudRepo.saveCustomRoutine(it) }
+            _askAiState.value.messages.takeLast(30).forEach { cloudRepo.saveAskAiMessage(it) }
+            if (cfgRes.isSuccess) {
+                _cloudSyncStatus.value = "Firebase Synced • ${deviceProfile.displayLabel}"
+                _bannerMessage.value = "✓ এই মোবাইলের সকল ডাটা Firebase ক্লাউডে সেভ হয়েছে।"
+            } else {
+                _cloudSyncStatus.value = "Sync failed"
+                _bannerMessage.value = "ক্লাউড সিঙ্ক ব্যর্থ হয়েছে: ${cfgRes.exceptionOrNull()?.localizedMessage ?: "ইন্টারনেট চেক করুন"}"
+            }
+        }
+    }
+
+    override fun onCleared() {
+        PilotStateHub.onSettingsChangedListener = null
+        pendingSettingsSyncJob?.cancel()
+        super.onCleared()
     }
 
     fun dismissBanner() {
@@ -193,6 +337,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         val updated = listOf(newRoutine) + _routines.value
         _routines.value = updated
         prefs.saveCustomRoutines(updated)
+        viewModelScope.launch { cloudRepo.saveCustomRoutine(newRoutine) }
         _bannerMessage.value = "Saved custom routine '${newRoutine.title}'!"
     }
 
@@ -200,6 +345,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         val updated = _routines.value.filterNot { it.id == id && !it.isBuiltIn }
         _routines.value = updated
         prefs.saveCustomRoutines(updated)
+        viewModelScope.launch { cloudRepo.deleteCustomRoutine(id) }
     }
 
     fun toggleMute() {
@@ -444,6 +590,85 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         PilotStateHub.updateSettings { it.copy(autoReplyPersona = prompt) }
     }
 
+    fun updateSensitiveQuestionGuard(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(sensitiveQuestionGuardEnabled = enabled) }
+    }
+
+    fun updateHandsFreeVoiceEscalation(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(handsFreeVoiceEscalationEnabled = enabled) }
+    }
+
+    fun deleteModelFromDevice(modelId: String) {
+        val clean = modelId.trim().removePrefix("models/")
+        if (clean.isBlank()) return
+        PilotStateHub.updateSettings { current ->
+            val updatedDeleted = (current.deletedModels + clean).distinct()
+            current.copy(deletedModels = updatedDeleted)
+        }
+        _bannerMessage.value = "মডেল '$clean' এই ডিভাইস থেকে ডিলিট/হাইড করা হয়েছে (Firebase-এ সেভ হয়েছে)।"
+    }
+
+    fun restoreDeletedModel(modelId: String) {
+        val clean = modelId.trim()
+        PilotStateHub.updateSettings { current ->
+            current.copy(deletedModels = current.deletedModels.filterNot { it.equals(clean, ignoreCase = true) })
+        }
+        _bannerMessage.value = "মডেল '$clean' আবার ফিরিয়ে আনা হয়েছে।"
+    }
+
+    fun restoreAllDeletedModels() {
+        PilotStateHub.updateSettings { it.copy(deletedModels = emptyList()) }
+        _bannerMessage.value = "সব ডিলিট করা মডেল ফিরিয়ে আনা হয়েছে।"
+    }
+
+    // --- Personal Data ('আমার ডাটা') Management (Synced per Device in Firebase) ---
+
+    fun savePersonalDataEntry(
+        existingId: String?,
+        title: String,
+        content: String,
+        category: String,
+        shareInAutoReply: Boolean
+    ) {
+        val cleanTitle = title.trim()
+        val cleanContent = content.trim()
+        if (cleanTitle.isBlank() || cleanContent.isBlank()) {
+            _bannerMessage.value = "তথ্যের শিরোনাম এবং বিস্তারিত উভয়ই লিখুন।"
+            return
+        }
+        val entry = PersonalDataItem(
+            id = existingId?.takeIf { it.isNotBlank() } ?: "pd_${UUID.randomUUID().toString().replace("-", "").take(12)}",
+            title = cleanTitle.take(120),
+            content = cleanContent.take(1500),
+            category = category.trim().ifBlank { "পরিচয়" }.take(50),
+            shareInAutoReply = shareInAutoReply,
+            updatedAtMs = System.currentTimeMillis()
+        )
+        PilotStateHub.upsertPersonalDataLocal(entry)
+        viewModelScope.launch {
+            val res = cloudRepo.upsertPersonalData(entry)
+            if (res.isFailure) {
+                _bannerMessage.value = "লোকালি সেভ হয়েছে, Firebase সিঙ্ক পেন্ডিং।"
+            }
+        }
+        _bannerMessage.value = "✓ \"${entry.title}\" আপনার ডাটায় সেভ হয়েছে!"
+    }
+
+    fun togglePersonalDataShare(item: PersonalDataItem) {
+        val updated = item.copy(
+            shareInAutoReply = !item.shareInAutoReply,
+            updatedAtMs = System.currentTimeMillis()
+        )
+        PilotStateHub.upsertPersonalDataLocal(updated)
+        viewModelScope.launch { cloudRepo.upsertPersonalData(updated) }
+    }
+
+    fun deletePersonalDataEntry(entryId: String) {
+        PilotStateHub.removePersonalDataLocal(entryId)
+        viewModelScope.launch { cloudRepo.deletePersonalData(entryId) }
+        _bannerMessage.value = "তথ্যটি ডিলিট করা হয়েছে।"
+    }
+
     fun toggleMessagingApp(app: MessagingApp) {
         PilotStateHub.updateSettings { current ->
             val next = if (app in current.enabledMessagingApps) {
@@ -455,15 +680,44 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // --- Ask AI Multi-Turn Chat & Google Search Grounding ---
+    // --- Ask AI Multi-Turn Chat, Multimodal File/Photo/Video Upload & Google Search Grounding ---
 
     fun toggleSearchGrounding(enabled: Boolean) {
         _askAiState.update { it.copy(searchGroundingEnabled = enabled) }
     }
 
+    fun addAskAiAttachments(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val ctx = getApplication<Application>()
+        val existing = _askAiState.value.pendingAttachments
+        val remainingSlots = (4 - existing.size).coerceAtLeast(0)
+        if (remainingSlots == 0) {
+            _askAiState.update { it.copy(errorText = "একসাথে সর্বোচ্চ ৪টি ছবি/ভিডিও/ফাইল যুক্ত করা যাবে।") }
+            return
+        }
+        val newlyAdded = uris.take(remainingSlots).mapNotNull { uri ->
+            runCatching { MediaAttachmentHelper.inspectUri(ctx, uri) }.getOrNull()
+        }
+        if (newlyAdded.isNotEmpty()) {
+            _askAiState.update {
+                it.copy(
+                    pendingAttachments = it.pendingAttachments + newlyAdded,
+                    errorText = null
+                )
+            }
+        }
+    }
+
+    fun removeAskAiAttachment(attachmentId: String) {
+        _askAiState.update { state ->
+            state.copy(pendingAttachments = state.pendingAttachments.filterNot { it.id == attachmentId })
+        }
+    }
+
     fun sendAskAiPrompt(promptText: String) {
         val clean = promptText.trim()
-        if (clean.isEmpty() || _askAiState.value.isGenerating) return
+        val pending = _askAiState.value.pendingAttachments
+        if ((clean.isEmpty() && pending.isEmpty()) || _askAiState.value.isGenerating) return
 
         val currentSettings = settings.value
         if (!currentSettings.hasAnyApiKey) {
@@ -473,29 +727,66 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val effectivePrompt = clean.ifBlank {
+            "এই ছবি/ভিডিও/ফাইলটি ভালোভাবে বিশ্লেষণ করে বাংলায় পরিষ্কারভাবে উত্তর দাও।"
+        }
+
         val userMsg = AskAiMessage(
             id = chatIdCounter.getAndIncrement(),
             isUser = true,
-            text = clean,
+            text = effectivePrompt,
+            attachments = pending,
             timestamp = PilotStateHub.formatNow()
         )
         val updatedHistory = _askAiState.value.messages + userMsg
         prefs.saveAskAiHistory(updatedHistory)
+        viewModelScope.launch { cloudRepo.saveAskAiMessage(userMsg) }
         _askAiState.update {
             it.copy(
                 messages = updatedHistory,
+                pendingAttachments = emptyList(),
                 isGenerating = true,
+                attachmentStatusText = if (pending.isNotEmpty()) {
+                    "Preparing ${pending.size} file(s) / media for Gemini..."
+                } else null,
                 errorText = null
             )
         }
 
         val searchEnabled = _askAiState.value.searchGroundingEnabled
         viewModelScope.launch {
+            val prepared = mutableListOf<PreparedAttachment>()
+            for (meta in pending) {
+                val prepResult = MediaAttachmentHelper.prepareForGemini(getApplication(), meta)
+                val item = prepResult.getOrElse { err ->
+                    _askAiState.update {
+                        it.copy(
+                            isGenerating = false,
+                            attachmentStatusText = null,
+                            errorText = err.message ?: "Failed to read attachment '${meta.displayName}'."
+                        )
+                    }
+                    return@launch
+                }
+                prepared.add(item)
+            }
+
+            if (prepared.any { it.rawBytesForUpload != null }) {
+                _askAiState.update {
+                    it.copy(attachmentStatusText = "Uploading large video/file to Gemini Files API...")
+                }
+            } else if (prepared.isNotEmpty()) {
+                _askAiState.update {
+                    it.copy(attachmentStatusText = "Analyzing attached media with ${currentSettings.textModel}...")
+                }
+            }
+
             val result = GeminiRestClient.generateChatTurn(
                 apiKey = currentSettings.effectiveApiKey,
                 modelId = currentSettings.textModel,
                 history = updatedHistory,
-                enableGoogleSearch = searchEnabled
+                enableGoogleSearch = searchEnabled,
+                preparedAttachments = prepared
             )
             result.onSuccess { gen ->
                 val modelBadge = if (!gen.keyLabelUsed.isNullOrBlank() && settings.value.apiKeys.size > 1) {
@@ -513,10 +804,12 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 val finalHistory = _askAiState.value.messages + aiMsg
                 prefs.saveAskAiHistory(finalHistory)
+                launch { cloudRepo.saveAskAiMessage(aiMsg) }
                 _askAiState.update {
                     it.copy(
                         messages = finalHistory,
                         isGenerating = false,
+                        attachmentStatusText = null,
                         errorText = null
                     )
                 }
@@ -524,6 +817,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 _askAiState.update {
                     it.copy(
                         isGenerating = false,
+                        attachmentStatusText = null,
                         errorText = err.message ?: "Request failed. Check API keys or select another text model in Settings."
                     )
                 }
@@ -533,7 +827,15 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearAskAiThread() {
         prefs.saveAskAiHistory(emptyList())
-        _askAiState.update { it.copy(messages = emptyList(), errorText = null) }
+        viewModelScope.launch { cloudRepo.clearAskAiMessages() }
+        _askAiState.update {
+            it.copy(
+                messages = emptyList(),
+                pendingAttachments = emptyList(),
+                attachmentStatusText = null,
+                errorText = null
+            )
+        }
     }
 
     // --- Auto-Chat Quick Actions ---
@@ -555,14 +857,62 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun sendOwnerSensitiveAnswer(record: IncomingMessageRecord, ownerAnswer: String) {
+        val clean = ownerAnswer.trim()
+        if (clean.isBlank()) return
+        val handle = PilotStateHub.getNotificationHandleById(record.id)
+        val directAction = handle?.replyAction
+        if (directAction != null) {
+            val sent = IncomingMessageListener.sendDirectReply(
+                context = getApplication(),
+                action = directAction,
+                replyText = clean,
+                packageName = record.packageName,
+                senderName = record.senderName
+            )
+            if (sent) {
+                PilotStateHub.markSensitiveMessageResolved(record.id, clean)
+                _bannerMessage.value = "✓ ${record.senderName}-কে আপনার উত্তর পাঠানো হয়েছে: \"$clean\""
+                return
+            }
+        }
+
+        // Visual Accessibility fallback if Direct Reply handle expired or is unavailable
+        val svc = PilotAccessibilityService.instance
+        if (svc != null) {
+            viewModelScope.launch {
+                IncomingMessageListener.registerSentReply(record.packageName, record.senderName, clean)
+                svc.openNotificationChat(record.senderName)
+                delay(900L)
+                val visualRes = svc.typeText(
+                    index = -1,
+                    x = 0,
+                    y = 0,
+                    text = clean,
+                    pressSend = true
+                )
+                if (visualRes.optString("status") == "ok") {
+                    PilotStateHub.markSensitiveMessageResolved(record.id, clean)
+                    _bannerMessage.value = "✓ ${record.senderName}-কে চ্যাট খুলে উত্তর পাঠানো হয়েছে।"
+                } else {
+                    _bannerMessage.value = "Direct Reply পাওয়া যায়নি; Open Chat চাপ দিয়ে উত্তর পাঠান।"
+                }
+            }
+        } else {
+            _bannerMessage.value = "Direct Reply পাওয়া যায়নি; Open Chat চাপ দিয়ে ${record.senderName}-কে উত্তর পাঠান।"
+        }
+    }
+
     fun sendTemplateDirectReply(record: IncomingMessageRecord, replyText: String) {
         val handle = PilotStateHub.getNotificationHandleById(record.id)
         val directAction = handle?.replyAction
         if (directAction != null) {
             val sent = IncomingMessageListener.sendDirectReply(
-                getApplication(),
-                directAction,
-                replyText
+                context = getApplication(),
+                action = directAction,
+                replyText = replyText,
+                packageName = record.packageName,
+                senderName = record.senderName
             )
             if (sent) {
                 PilotStateHub.markMessageAutoReplied(record.id, replyText)
@@ -596,9 +946,11 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 val directAction = handle?.replyAction
                 if (directAction != null) {
                     val sent = IncomingMessageListener.sendDirectReply(
-                        getApplication(),
-                        directAction,
-                        replyText
+                        context = getApplication(),
+                        action = directAction,
+                        replyText = replyText,
+                        packageName = record.packageName,
+                        senderName = record.senderName
                     )
                     if (sent) {
                         PilotStateHub.markMessageAutoReplied(record.id, replyText)

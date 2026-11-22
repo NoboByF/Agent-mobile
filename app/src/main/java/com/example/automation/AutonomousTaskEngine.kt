@@ -530,6 +530,7 @@ class AutonomousTaskEngine(
         var noChangeStreak = 0
         var actionsExecuted = 0
         var auditorRejections = 0
+        var selfHealAttempts = 0
 
         for (step in 1..MAX_WORKFLOW_STEPS) {
             coroutineContext.ensureActive()
@@ -653,6 +654,26 @@ class AutonomousTaskEngine(
                 repeatCount = 0
             }
 
+            // NON-DESTRUCTIVE GUARD: Never click or confirm irreversible/destructive controls without user approval
+            if (action in setOf("CLICK", "CLICK_NODE", "CLICK_TEXT", "FIND_CLICK", "LONG_PRESS")) {
+                val nodeLabel = resolveNodeLabel(beforeUiDump, plan.optInt("node_index", -1))
+                val targetDescriptor = listOf(
+                    plan.optString("text", ""),
+                    nodeLabel
+                ).filter { it.isNotBlank() }.joinToString(" ")
+
+                if (SafetyGuardrails.isDestructiveAction(targetDescriptor, statusLabel, goal)) {
+                    val safeLabel = targetDescriptor.ifBlank { statusLabel }.take(40)
+                    val msg = SafetyGuardrails.destructiveBlockedMessage(safeLabel)
+                    PilotStateHub.log(LogLevel.SAFETY, "AutoPilot", msg)
+                    updateHudProgress(false, "🛡️ Safe stop: $safeLabel")
+                    notifyLiveVoice(
+                        "[SYSTEM EVENT: Autonomous task PAUSED SAFELY before a potentially destructive action ('$safeLabel'). Nothing was deleted, uninstalled, reset, or paid. Ask the user for explicit confirmation before proceeding.]"
+                    )
+                    return
+                }
+            }
+
             updateHudProgress(true, "🤖 $step: $statusLabel")
             val execResult = executeWorkflowAction(service, action, plan)
             val ok = execResult.optString("status") == "ok"
@@ -698,9 +719,98 @@ class AutonomousTaskEngine(
                 summary = statusLabel,
                 succeeded = ok
             )
+
+            // SAFE SELF-HEALING RECOVERY: When stuck or blocked by a benign popup/overlay, self-recover without risking data
+            if ((!ok || noChangeStreak >= 2 || repeatCount >= 2) && selfHealAttempts < MAX_SELF_HEAL_ATTEMPTS) {
+                val healNote = attemptSafeSelfRecovery(
+                    service = service,
+                    uiDump = afterUiDump,
+                    noChangeStreak = noChangeStreak,
+                    repeatCount = repeatCount,
+                    userGoal = goal
+                )
+                if (healNote != null) {
+                    selfHealAttempts++
+                    noChangeStreak = 0
+                    repeatCount = 0
+                    stepHistory.add("SELF-HEAL #$selfHealAttempts: $healNote")
+                    PilotStateHub.log(LogLevel.TOOL, "SelfHeal", healNote)
+                    delay(650L)
+                }
+            }
         }
 
         notifyLiveVoice("[SYSTEM EVENT: Autonomous task reached $MAX_WORKFLOW_STEPS steps on goal '$goal' without full verification. Honestly tell the user what progress was made and ask if they want to continue.]")
+    }
+
+    /**
+     * Resolves the human-readable text/description of a UI node index from the last UI dump
+     * so Non-Destructive Guard can inspect the actual target button label before tapping.
+     */
+    private fun resolveNodeLabel(uiDump: JSONObject, nodeIndex: Int): String {
+        if (nodeIndex < 0) return ""
+        val arr = uiDump.optJSONArray("elements") ?: return ""
+        for (i in 0 until arr.length()) {
+            val el = arr.optJSONObject(i) ?: continue
+            if (el.optInt("index", i) == nodeIndex) {
+                val t = el.optString("text", "").trim()
+                val d = el.optString("desc", "").trim()
+                return listOf(t, d).filter { it.isNotBlank() }.distinct().joinToString(" ")
+            }
+        }
+        return ""
+    }
+
+    /**
+     * Strictly non-destructive automatic self-healing routine.
+     * Dismisses safe popups/ads/prompts ("Skip", "Not now", "Close", "Later", "Cancel") or gently
+     * navigates BACK if stuck on an unintended overlay — NEVER touches destructive actions.
+     */
+    private suspend fun attemptSafeSelfRecovery(
+        service: PilotAccessibilityService,
+        uiDump: JSONObject,
+        noChangeStreak: Int,
+        repeatCount: Int,
+        userGoal: String
+    ): String? {
+        if (service.isCurrentScreenBlocked()) return null
+        val arr = uiDump.optJSONArray("elements")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val el = arr.optJSONObject(i) ?: continue
+                if (!el.optBoolean("clickable", false)) continue
+                val label = el.optString("text", "").ifBlank { el.optString("desc", "") }.trim()
+                if (label.isBlank() || label.length > 28) continue
+                val lower = label.lowercase()
+                if (SafetyGuardrails.isDestructiveAction(label, label, userGoal)) continue
+
+                val isBenignDismiss = SAFE_POPUP_DISMISS_LABELS.any { kw ->
+                    lower == kw || lower.startsWith("$kw ") || lower.contains("skip ad")
+                }
+                if (isBenignDismiss) {
+                    val nodeIdx = el.optInt("index", i)
+                    val w = uiDump.optInt("screen_width", 1080).coerceAtLeast(1)
+                    val h = uiDump.optInt("screen_height", 2400).coerceAtLeast(1)
+                    val nx = ((el.optInt("cx", 540) * 1000f) / w).toInt().coerceIn(1, 999)
+                    val ny = ((el.optInt("cy", 1200) * 1000f) / h).toInt().coerceIn(1, 999)
+                    updateHudProgress(true, "🛠️ Self-heal: closing '$label'...")
+                    val res = service.clickNodeOrNormalized(nodeIdx, nx, ny, "Dismiss $label")
+                    if (res.optString("status") == "ok") {
+                        return "Dismissed blocking popup/button '$label' safely."
+                    }
+                }
+            }
+        }
+
+        // If still stuck after 3+ unchanged steps or repeated failures, safely step BACK once
+        if (noChangeStreak >= 3 || repeatCount >= 3) {
+            updateHudProgress(true, "🛠️ Self-heal: stepping back safely...")
+            val backRes = service.navigateGlobal("BACK")
+            if (backRes.optString("status") == "ok") {
+                return "Navigated BACK once to recover from stuck screen."
+            }
+        }
+        return null
     }
 
     private data class AuditVerdict(
@@ -944,7 +1054,14 @@ class AutonomousTaskEngine(
     companion object {
         private const val MAX_WORKFLOW_STEPS = 35
         private const val MAX_AUDITOR_VETOES = 3
+        private const val MAX_SELF_HEAL_ATTEMPTS = 3
         private const val MAX_TASK_DURATION_MS = 240_000L // 4 minutes max per autonomous run
+
+        private val SAFE_POPUP_DISMISS_LABELS = listOf(
+            "not now", "skip", "skip ad", "skip ads", "close", "later", "maybe later",
+            "dismiss", "no thanks", "got it", "cancel", "ignore",
+            "পরে", "বাদ দিন", "বন্ধ করুন", "এড়িয়ে যান", "এড়িয়ে যান", "বাতিল"
+        )
 
         fun resolveMode(goal: String, rawMode: String): AutonomousMode {
             val explicit = rawMode.trim().uppercase()
@@ -1013,11 +1130,12 @@ Available actions:
 - NAVIGATE: "text" = BACK | HOME | RECENTS
 - WAIT: wait "duration_ms" (400-3500) for page/app load
 
-CRITICAL ANTI-PREMATURE-COMPLETION RULES:
+CRITICAL ANTI-PREMATURE-COMPLETION & SAFE SELF-HEALING RULES:
 1. Break the goal into concrete sub-steps in "remaining_steps".
 2. NEVER set "done": true while ANY sub-step is still unexecuted or unverified on the screenshot!
 3. Opening an app or typing a search is NOT finishing if the user asked to play a video, open a specific item, toggle a setting, or send a message!
-4. Never touch passwords, OTPs, banking, or payments — set "needs_user_help": true instead.
+4. SELF-HEALING: If an action misses, a popup/ad blocks the screen, or a button doesn't respond, AUTOMATICALLY recover using safe alternate strategies: close benign popups ("Skip", "Not now", "Close"), switch from raw CLICK to CLICK_NODE or FIND_CLICK, SCROLL to reveal hidden elements, or press NAVIGATE(BACK) once if you entered the wrong page.
+5. STRICT NON-DESTRUCTIVE SAFETY: NEVER touch passwords, OTPs, banking, payments, Delete, Uninstall, Factory Reset, Format, Clear Data, or Account Removal — NEVER risk breaking or erasing anything on the phone; set "needs_user_help": true instead!
 
 Always output strict JSON:
 {

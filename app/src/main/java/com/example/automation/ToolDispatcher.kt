@@ -8,6 +8,7 @@ import com.example.data.AgentActivity
 import com.example.data.AskAiMessage
 import com.example.data.LogLevel
 import com.example.data.PilotStateHub
+import com.example.messaging.IncomingMessageListener
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -185,6 +186,14 @@ class ToolDispatcher(
                 autonomousEngine.stopTask("Stopped by voice command")
             }
 
+            "answer_sensitive_message" -> {
+                executeAnswerSensitiveMessage(
+                    senderOrApp = args.optString("sender_or_app", ""),
+                    ownerAnswer = args.optString("owner_answer", ""),
+                    service = service
+                )
+            }
+
             else -> null
         }
 
@@ -345,6 +354,73 @@ class ToolDispatcher(
         )
     }
 
+    private suspend fun executeAnswerSensitiveMessage(
+        senderOrApp: String,
+        ownerAnswer: String,
+        service: PilotAccessibilityService?
+    ): JSONObject {
+        val cleanAnswer = ownerAnswer.trim()
+        if (cleanAnswer.isBlank()) {
+            return JSONObject().put("status", "error").put("message", "Owner answer was empty.")
+        }
+        val pending = PilotStateHub.findPendingSensitiveMessage(senderOrApp)
+            ?: return JSONObject()
+                .put("status", "not_found")
+                .put("message", "No pending sensitive question matched '${senderOrApp.ifBlank { "latest" }}'.")
+
+        val handle = PilotStateHub.getNotificationHandleById(pending.id)
+        val directAction = handle?.replyAction
+        if (directAction != null) {
+            val sent = IncomingMessageListener.sendDirectReply(
+                context = appContext,
+                action = directAction,
+                replyText = cleanAnswer,
+                packageName = pending.packageName,
+                senderName = pending.senderName
+            )
+            if (sent) {
+                PilotStateHub.markSensitiveMessageResolved(pending.id, cleanAnswer)
+                PilotStateHub.log(
+                    LogLevel.TOOL,
+                    "SensitiveReply",
+                    "Voice-forwarded owner's answer to ${pending.senderName} (${pending.app.displayName}): $cleanAnswer"
+                )
+                return JSONObject()
+                    .put("status", "ok")
+                    .put("sender", pending.senderName)
+                    .put("app", pending.app.displayName)
+                    .put("sent_reply", cleanAnswer)
+            }
+        }
+
+        // Fallback: open chat visually via Accessibility if Direct Reply action is unavailable
+        if (service != null) {
+            IncomingMessageListener.registerSentReply(pending.packageName, pending.senderName, cleanAnswer)
+            service.openNotificationChat(pending.senderName)
+            delay(900L)
+            val visualRes = service.typeText(
+                index = -1,
+                x = 0,
+                y = 0,
+                text = cleanAnswer,
+                pressSend = true
+            )
+            if (visualRes.optString("status") == "ok") {
+                PilotStateHub.markSensitiveMessageResolved(pending.id, cleanAnswer)
+                return JSONObject()
+                    .put("status", "ok")
+                    .put("sender", pending.senderName)
+                    .put("app", pending.app.displayName)
+                    .put("sent_reply", cleanAnswer)
+                    .put("method", "visual_accessibility")
+            }
+        }
+
+        return JSONObject()
+            .put("status", "error")
+            .put("message", "Could not send Direct Reply to ${pending.senderName}; please open ${pending.app.displayName} manually or answer from Auto-Chat.")
+    }
+
     private fun restoreListeningState() {
         if (autonomousEngine.isRunning()) return
         PilotStateHub.updateSession {
@@ -377,6 +453,7 @@ class ToolDispatcher(
         "navigate" -> "Navigating ${call.args.optString("action", "")}..."
         "device_control" -> "Control: ${call.args.optString("action", "")}"
         "open_notification_chat" -> "Opening ${call.args.optString("sender_or_app", "chat")}..."
+        "answer_sensitive_message" -> "Sending owner's answer..."
         "start_autonomous_task" -> "🤖 Starting autonomous task..."
         "update_autonomous_task" -> "🤖 Updating task..."
         "stop_autonomous_task" -> "Stopping autonomous task..."
@@ -408,6 +485,7 @@ class ToolDispatcher(
         "navigate" -> "Nav ${call.args.optString("action", "")}"
         "device_control" -> call.args.optString("action", "Device Control")
         "open_notification_chat" -> "Opened Chat"
+        "answer_sensitive_message" -> "Answered Sensitive Msg"
         "start_autonomous_task" -> "AutoPilot: ${call.args.optString("goal", "Task").take(20)}"
         "update_autonomous_task" -> "Updated AutoPilot"
         "stop_autonomous_task" -> "Stopped AutoPilot"

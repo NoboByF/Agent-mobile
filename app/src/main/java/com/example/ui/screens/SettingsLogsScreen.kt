@@ -20,16 +20,22 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.RemoveRedEye
+import androidx.compose.material.icons.filled.Restore
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -65,6 +71,7 @@ import com.example.data.LogLevel
 import com.example.data.PilotSettings
 import com.example.data.SafetyGuardrails
 import com.example.data.VoiceLanguage
+import com.example.firebase.DeviceProfileIdentity
 import com.example.ui.components.ApiKeyPoolCard
 import com.example.ui.components.StatusPillBadge
 import com.example.ui.components.StudioCardContainer
@@ -106,6 +113,9 @@ private val VOICE_PERSONA_PRESETS = listOf(
 @Composable
 fun SettingsLogsScreen(
     settings: PilotSettings,
+    deviceProfile: DeviceProfileIdentity,
+    userEmail: String?,
+    cloudSyncStatus: String,
     discoveredModels: List<DiscoveredModel>,
     isFetchingModels: Boolean,
     modelFetchStatus: String?,
@@ -113,6 +123,8 @@ fun SettingsLogsScreen(
     agentModelTest: ConnectionTestState,
     textModelTest: ConnectionTestState,
     logs: List<DiagnosticLogEntry>,
+    onSyncNow: () -> Unit,
+    onSignOut: () -> Unit,
     onAddApiKeys: (String, String) -> Unit,
     onSetActiveApiKey: (String) -> Unit,
     onToggleApiKeyEnabled: (String) -> Unit,
@@ -126,6 +138,9 @@ fun SettingsLogsScreen(
     onUpdateVerifyTaskCompletion: (Boolean) -> Unit,
     onUpdateTextModel: (String) -> Unit,
     onTestTextModel: () -> Unit,
+    onDeleteModel: (String) -> Unit,
+    onRestoreModel: (String) -> Unit,
+    onRestoreAllModels: () -> Unit,
     onFetchModels: () -> Unit,
     onUpdateVoice: (String) -> Unit,
     onUpdateVoiceLanguage: (VoiceLanguage) -> Unit,
@@ -144,8 +159,12 @@ fun SettingsLogsScreen(
     var logFilter by rememberSaveable { mutableStateOf(LogFilter.ALL) }
     val clipboard = LocalClipboardManager.current
 
-    val liveDiscovered = discoveredModels.filter { it.isLiveCapable }
-    val textDiscovered = discoveredModels.filter { it.supportsGenerateContent }
+    val deletedSet = settings.deletedModels.map { it.lowercase() }.toSet()
+    val liveDiscovered = discoveredModels.filter { it.isLiveCapable && it.id.lowercase() !in deletedSet }
+    val textDiscovered = discoveredModels.filter { it.supportsGenerateContent && it.id.lowercase() !in deletedSet }
+    val visibleLivePresets = PilotSettings.LIVE_MODEL_PRESETS.filter { it.lowercase() !in deletedSet }
+    val visibleAgentPresets = PilotSettings.AGENT_MODEL_PRESETS.filter { it.lowercase() !in deletedSet }
+    val visibleTextPresets = PilotSettings.TEXT_MODEL_PRESETS.filter { it.lowercase() !in deletedSet }
     val filteredLogs = if (logFilter.level == null) {
         logs
     } else {
@@ -242,6 +261,127 @@ fun SettingsLogsScreen(
 
         when (activeSubTab) {
             SettingsSubTab.API_MODELS -> {
+                // 0. Per-Device Firebase Cloud Profile & Isolation Card
+                item {
+                    StudioCardContainer {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.CloudDone,
+                                    contentDescription = "Firebase Cloud Backup",
+                                    tint = palette.emeraldAccent,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = "Firebase ডিভাইস ক্লাউড প্রোফাইল",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = palette.inkPrimary
+                                    )
+                                    Text(
+                                        text = userEmail ?: "Signed in",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = palette.inkSecondary
+                                    )
+                                }
+                            }
+                            StatusPillBadge(
+                                label = "ISOLATED",
+                                accentColor = palette.emeraldAccent,
+                                containerColor = palette.emeraldSoft
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            color = palette.surfaceSubtle,
+                            border = BorderStroke(1.dp, palette.outline)
+                        ) {
+                            Column(modifier = Modifier.padding(10.dp)) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Filled.PhoneAndroid,
+                                        contentDescription = "Device model",
+                                        tint = palette.cobaltAccent,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "মডেল: ${deviceProfile.displayLabel}",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = palette.inkPrimary,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "Device ID: ${deviceProfile.deviceId}",
+                                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFontFamily),
+                                    color = palette.inkMuted
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "$cloudSyncStatus • এই মোবাইলের API Key, ডিলিট করা মডেল ও ডাটা অন্য মোবাইলে যাবে না।",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.inkSecondary
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = onSyncNow,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("settings_cloud_sync_button"),
+                                shape = RoundedCornerShape(12.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Sync,
+                                    contentDescription = "Sync now",
+                                    tint = palette.emeraldAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Sync Now", color = palette.inkPrimary)
+                            }
+                            OutlinedButton(
+                                onClick = onSignOut,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(48.dp)
+                                    .testTag("settings_sign_out_button"),
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, palette.roseAccent.copy(alpha = 0.5f))
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.Logout,
+                                    contentDescription = "Sign out",
+                                    tint = palette.roseAccent,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text("Sign Out", color = palette.roseAccent)
+                            }
+                        }
+                    }
+                }
+
                 // 1. Multi-Gemini API Key Pool & Auto-Failover Card
                 item {
                     ApiKeyPoolCard(
@@ -271,11 +411,23 @@ fun SettingsLogsScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            PilotSettings.LIVE_MODEL_PRESETS.forEach { preset ->
+                            visibleLivePresets.forEach { preset ->
+                                val isSel = settings.liveModel.equals(preset, ignoreCase = true)
                                 FilterChip(
-                                    selected = settings.liveModel.equals(preset, ignoreCase = true),
+                                    selected = isSel,
                                     onClick = { onUpdateLiveModel(preset) },
                                     label = { Text(preset, style = MaterialTheme.typography.labelMedium) },
+                                    trailingIcon = if (!isSel) {
+                                        {
+                                            Icon(
+                                                imageVector = Icons.Filled.Close,
+                                                contentDescription = "Delete model $preset",
+                                                modifier = Modifier
+                                                    .size(16.dp)
+                                                    .clickable { onDeleteModel(preset) }
+                                            )
+                                        }
+                                    } else null,
                                     colors = FilterChipDefaults.filterChipColors(
                                         selectedContainerColor = palette.cobaltSoft,
                                         selectedLabelColor = palette.cobaltAccent
@@ -297,10 +449,22 @@ fun SettingsLogsScreen(
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 liveDiscovered.forEach { model ->
+                                    val isSel = settings.liveModel.equals(model.id, ignoreCase = true)
                                     FilterChip(
-                                        selected = settings.liveModel.equals(model.id, ignoreCase = true),
+                                        selected = isSel,
                                         onClick = { onUpdateLiveModel(model.id) },
                                         label = { Text(model.id, style = MaterialTheme.typography.labelMedium) },
+                                        trailingIcon = if (!isSel) {
+                                            {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Close,
+                                                    contentDescription = "Delete model ${model.id}",
+                                                    modifier = Modifier
+                                                        .size(16.dp)
+                                                        .clickable { onDeleteModel(model.id) }
+                                                )
+                                            }
+                                        } else null,
                                         colors = FilterChipDefaults.filterChipColors(
                                             selectedContainerColor = palette.emeraldSoft,
                                             selectedLabelColor = palette.emeraldAccent
@@ -375,17 +539,29 @@ fun SettingsLogsScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            PilotSettings.AGENT_MODEL_PRESETS.forEach { preset ->
+                            visibleAgentPresets.forEach { preset ->
+                                val isSel = settings.agentModel.equals(preset, ignoreCase = true)
                                 val badge = when (preset) {
                                     "gemini-2.5-pro" -> "$preset (Smartest)"
                                     "gemini-2.5-flash" -> "$preset (Fast)"
                                     else -> preset
                                 }
                                 FilterChip(
-                                    selected = settings.agentModel.equals(preset, ignoreCase = true),
+                                    selected = isSel,
                                     onClick = { onUpdateAgentModel(preset) },
                                     modifier = Modifier.testTag("agent_model_chip_${preset.lowercase()}"),
                                     label = { Text(badge, style = MaterialTheme.typography.labelMedium) },
+                                    trailingIcon = if (!isSel) {
+                                        {
+                                            Icon(
+                                                imageVector = Icons.Filled.Close,
+                                                contentDescription = "Delete model $preset",
+                                                modifier = Modifier
+                                                    .size(16.dp)
+                                                    .clickable { onDeleteModel(preset) }
+                                            )
+                                        }
+                                    } else null,
                                     colors = FilterChipDefaults.filterChipColors(
                                         selectedContainerColor = palette.emeraldSoft,
                                         selectedLabelColor = palette.emeraldAccent
@@ -407,10 +583,22 @@ fun SettingsLogsScreen(
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 agentDiscovered.take(12).forEach { model ->
+                                    val isSel = settings.agentModel.equals(model.id, ignoreCase = true)
                                     FilterChip(
-                                        selected = settings.agentModel.equals(model.id, ignoreCase = true),
+                                        selected = isSel,
                                         onClick = { onUpdateAgentModel(model.id) },
                                         label = { Text(model.id, style = MaterialTheme.typography.labelMedium) },
+                                        trailingIcon = if (!isSel) {
+                                            {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Close,
+                                                    contentDescription = "Delete model ${model.id}",
+                                                    modifier = Modifier
+                                                        .size(16.dp)
+                                                        .clickable { onDeleteModel(model.id) }
+                                                )
+                                            }
+                                        } else null,
                                         colors = FilterChipDefaults.filterChipColors(
                                             selectedContainerColor = palette.emeraldSoft,
                                             selectedLabelColor = palette.emeraldAccent
@@ -478,11 +666,23 @@ fun SettingsLogsScreen(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             verticalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            PilotSettings.TEXT_MODEL_PRESETS.forEach { preset ->
+                            visibleTextPresets.forEach { preset ->
+                                val isSel = settings.textModel.equals(preset, ignoreCase = true)
                                 FilterChip(
-                                    selected = settings.textModel.equals(preset, ignoreCase = true),
+                                    selected = isSel,
                                     onClick = { onUpdateTextModel(preset) },
                                     label = { Text(preset, style = MaterialTheme.typography.labelMedium) },
+                                    trailingIcon = if (!isSel) {
+                                        {
+                                            Icon(
+                                                imageVector = Icons.Filled.Close,
+                                                contentDescription = "Delete model $preset",
+                                                modifier = Modifier
+                                                    .size(16.dp)
+                                                    .clickable { onDeleteModel(preset) }
+                                            )
+                                        }
+                                    } else null,
                                     colors = FilterChipDefaults.filterChipColors(
                                         selectedContainerColor = palette.violetSoft,
                                         selectedLabelColor = palette.violetAccent
@@ -504,10 +704,22 @@ fun SettingsLogsScreen(
                                 verticalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
                                 textDiscovered.take(14).forEach { model ->
+                                    val isSel = settings.textModel.equals(model.id, ignoreCase = true)
                                     FilterChip(
-                                        selected = settings.textModel.equals(model.id, ignoreCase = true),
+                                        selected = isSel,
                                         onClick = { onUpdateTextModel(model.id) },
                                         label = { Text(model.id, style = MaterialTheme.typography.labelMedium) },
+                                        trailingIcon = if (!isSel) {
+                                            {
+                                                Icon(
+                                                    imageVector = Icons.Filled.Close,
+                                                    contentDescription = "Delete model ${model.id}",
+                                                    modifier = Modifier
+                                                        .size(16.dp)
+                                                        .clickable { onDeleteModel(model.id) }
+                                                )
+                                            }
+                                        } else null,
                                         colors = FilterChipDefaults.filterChipColors(
                                             selectedContainerColor = palette.violetSoft,
                                             selectedLabelColor = palette.violetAccent
@@ -542,6 +754,61 @@ fun SettingsLogsScreen(
                             state = textModelTest,
                             onTest = onTestTextModel
                         )
+                    }
+                }
+
+                // 4. Deleted / Hidden Models Card (Saved in Firebase per device!)
+                if (settings.deletedModels.isNotEmpty()) {
+                    item {
+                        StudioCardContainer {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Restore,
+                                        contentDescription = "Deleted models",
+                                        tint = palette.amberAccent,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "ডিলিট করা মডেল (${settings.deletedModels.size})",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = palette.inkPrimary
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = onRestoreAllModels,
+                                    modifier = Modifier.height(38.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("সব ফিরিয়ে আনুন", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "এই ডিভাইস থেকে ডিলিট করা মডেলগুলো Firebase-এ সেভ আছে। ফিরিয়ে আনতে চিপে ট্যাপ করুন:",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = palette.inkSecondary
+                            )
+                            Spacer(modifier = Modifier.height(8.dp))
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                settings.deletedModels.forEach { hiddenModel ->
+                                    FilterChip(
+                                        selected = false,
+                                        onClick = { onRestoreModel(hiddenModel) },
+                                        label = { Text("+ $hiddenModel", style = MaterialTheme.typography.labelSmall) }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }

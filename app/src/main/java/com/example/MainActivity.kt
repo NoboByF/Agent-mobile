@@ -42,10 +42,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -62,34 +65,86 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.PilotRoutine
+import com.example.data.PilotStateHub
+import com.example.firebase.DeviceIdentityHelper
 import com.example.ui.PilotViewModel
 import com.example.ui.components.FloatingPilotBottomBar
 import com.example.ui.components.PilotTab
 import com.example.ui.screens.AskAiScreen
+import com.example.ui.screens.AuthGateScreen
 import com.example.ui.screens.AutoChatScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.SettingsLogsScreen
+import com.example.ui.screens.signOutFromFirebaseAndCredentials
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.LivePilotTheme
 import com.example.ui.theme.StudioTheme
+import com.google.firebase.Firebase
+import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.auth
+import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
+    private val requestedTabState = mutableStateOf<PilotTab?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        consumeTabIntent(intent)
         setContent {
-            LivePilotAppEntry()
+            LivePilotAppEntry(
+                requestedTab = requestedTabState.value,
+                onConsumedRequestedTab = { requestedTabState.value = null }
+            )
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        consumeTabIntent(intent)
+    }
+
+    private fun consumeTabIntent(intent: Intent?) {
+        val tabKey = intent?.getStringExtra(EXTRA_OPEN_TAB)?.uppercase() ?: return
+        requestedTabState.value = when (tabKey) {
+            "AUTO_CHAT" -> PilotTab.AUTO_CHAT
+            "ASK_AI" -> PilotTab.ASK_AI
+            "SETTINGS" -> PilotTab.SETTINGS
+            else -> PilotTab.HOME
+        }
+    }
+
+    companion object {
+        const val EXTRA_OPEN_TAB = "extra_open_tab"
     }
 }
 
 @Composable
 private fun LivePilotAppEntry(
-    viewModel: PilotViewModel = viewModel()
+    requestedTab: PilotTab?,
+    onConsumedRequestedTab: () -> Unit
 ) {
-    val settings by viewModel.settings.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    PilotStateHub.ensureInitialized(context.applicationContext)
+    val hubSettings by PilotStateHub.settings.collectAsStateWithLifecycle()
+    val deviceProfile = remember(context) { DeviceIdentityHelper.resolve(context) }
+    val appScope = rememberCoroutineScope()
 
-    LivePilotTheme(themeMode = settings.themeMode) {
+    var currentUser by remember {
+        mutableStateOf(runCatching { Firebase.auth.currentUser }.getOrNull())
+    }
+
+    DisposableEffect(Unit) {
+        val auth = runCatching { Firebase.auth }.getOrNull()
+        val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
+            currentUser = firebaseAuth.currentUser
+        }
+        auth?.addAuthStateListener(listener)
+        onDispose { auth?.removeAuthStateListener(listener) }
+    }
+
+    LivePilotTheme(themeMode = hubSettings.themeMode) {
         val isDark = StudioTheme.colors.isDark
         val view = LocalView.current
         if (!view.isInEditMode) {
@@ -100,12 +155,41 @@ private fun LivePilotAppEntry(
                 controller.isAppearanceLightNavigationBars = !isDark
             }
         }
-        LivePilotAppRoot(viewModel = viewModel)
+
+        val signedInUser = currentUser
+        if (signedInUser == null) {
+            AuthGateScreen(
+                deviceProfile = deviceProfile,
+                onSignedIn = {
+                    currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+                }
+            )
+        } else {
+            key(signedInUser.uid) {
+                val scopedViewModel: PilotViewModel = viewModel(key = signedInUser.uid)
+                LivePilotAppRoot(
+                    requestedTab = requestedTab,
+                    onConsumedRequestedTab = onConsumedRequestedTab,
+                    userEmail = signedInUser.email ?: signedInUser.displayName,
+                    onSignOut = {
+                        appScope.launch {
+                            signOutFromFirebaseAndCredentials(context)
+                            currentUser = null
+                        }
+                    },
+                    viewModel = scopedViewModel
+                )
+            }
+        }
     }
 }
 
 @Composable
 private fun LivePilotAppRoot(
+    requestedTab: PilotTab?,
+    onConsumedRequestedTab: () -> Unit,
+    userEmail: String?,
+    onSignOut: () -> Unit,
     viewModel: PilotViewModel
 ) {
     val context = LocalContext.current
@@ -113,6 +197,13 @@ private fun LivePilotAppRoot(
     val palette = StudioTheme.colors
 
     var selectedTab by rememberSaveable { mutableStateOf(PilotTab.HOME) }
+
+    LaunchedEffect(requestedTab) {
+        if (requestedTab != null) {
+            selectedTab = requestedTab
+            onConsumedRequestedTab()
+        }
+    }
 
     val settings by viewModel.settings.collectAsStateWithLifecycle()
     val sessionState by viewModel.sessionState.collectAsStateWithLifecycle()
@@ -125,6 +216,8 @@ private fun LivePilotAppRoot(
     val recentToolEvents by viewModel.recentToolEvents.collectAsStateWithLifecycle()
     val routines by viewModel.routines.collectAsStateWithLifecycle()
     val incomingMessages by viewModel.incomingMessages.collectAsStateWithLifecycle()
+    val personalData by viewModel.personalData.collectAsStateWithLifecycle()
+    val cloudSyncStatus by viewModel.cloudSyncStatus.collectAsStateWithLifecycle()
     val discoveredModels by viewModel.discoveredModels.collectAsStateWithLifecycle()
     val isFetchingModels by viewModel.isFetchingModels.collectAsStateWithLifecycle()
     val modelFetchStatus by viewModel.modelFetchStatus.collectAsStateWithLifecycle()
@@ -307,6 +400,8 @@ private fun LivePilotAppRoot(
                             isCallActive = sessionState.isServiceRunning,
                             onSelectTextModel = { viewModel.updateTextModel(it) },
                             onToggleSearchGrounding = { viewModel.toggleSearchGrounding(it) },
+                            onAddAttachments = { viewModel.addAskAiAttachments(it) },
+                            onRemoveAttachment = { viewModel.removeAskAiAttachment(it) },
                             onSendPrompt = { viewModel.sendAskAiPrompt(it) },
                             onSendToLiveCall = { viewModel.sendSilentCommandToCall(it) },
                             onClearThread = { viewModel.clearAskAiThread() }
@@ -316,9 +411,12 @@ private fun LivePilotAppRoot(
                             settings = settings,
                             permissions = permissions,
                             messages = incomingMessages,
+                            personalData = personalData,
                             onUpdateMode = { viewModel.updateAutoChatMode(it) },
                             onUpdateDelivery = { viewModel.updateAutoReplyDelivery(it) },
                             onUpdatePersona = { viewModel.updateAutoReplyPersona(it) },
+                            onToggleSensitiveGuard = { viewModel.updateSensitiveQuestionGuard(it) },
+                            onToggleHandsFreeVoiceEscalation = { viewModel.updateHandsFreeVoiceEscalation(it) },
                             onToggleApp = { viewModel.toggleMessagingApp(it) },
                             onOpenNotificationSettings = {
                                 runCatching {
@@ -330,11 +428,22 @@ private fun LivePilotAppRoot(
                             onTemplateReply = { msg, replyText ->
                                 viewModel.sendTemplateDirectReply(msg, replyText)
                             },
+                            onSendOwnerSensitiveAnswer = { msg, ownerAnswer ->
+                                viewModel.sendOwnerSensitiveAnswer(msg, ownerAnswer)
+                            },
+                            onSavePersonalData = { id, title, content, cat, share ->
+                                viewModel.savePersonalDataEntry(id, title, content, cat, share)
+                            },
+                            onTogglePersonalDataShare = { viewModel.togglePersonalDataShare(it) },
+                            onDeletePersonalData = { viewModel.deletePersonalDataEntry(it) },
                             onClearFeed = { viewModel.clearIncomingFeed() }
                         )
 
                         PilotTab.SETTINGS -> SettingsLogsScreen(
                             settings = settings,
+                            deviceProfile = viewModel.deviceProfile,
+                            userEmail = userEmail,
+                            cloudSyncStatus = cloudSyncStatus,
                             discoveredModels = discoveredModels,
                             isFetchingModels = isFetchingModels,
                             modelFetchStatus = modelFetchStatus,
@@ -342,6 +451,8 @@ private fun LivePilotAppRoot(
                             agentModelTest = agentModelTest,
                             textModelTest = textModelTest,
                             logs = logs,
+                            onSyncNow = { viewModel.syncNowToCloud() },
+                            onSignOut = onSignOut,
                             onAddApiKeys = { raw, label -> viewModel.addApiKeys(raw, label) },
                             onSetActiveApiKey = { viewModel.setActiveApiKey(it) },
                             onToggleApiKeyEnabled = { viewModel.toggleApiKeyEnabled(it) },
@@ -355,6 +466,9 @@ private fun LivePilotAppRoot(
                             onUpdateVerifyTaskCompletion = { viewModel.updateVerifyTaskCompletion(it) },
                             onUpdateTextModel = { viewModel.updateTextModel(it) },
                             onTestTextModel = { viewModel.testTextModelConnection() },
+                            onDeleteModel = { viewModel.deleteModelFromDevice(it) },
+                            onRestoreModel = { viewModel.restoreDeletedModel(it) },
+                            onRestoreAllModels = { viewModel.restoreAllDeletedModels() },
                             onFetchModels = { viewModel.fetchModels() },
                             onUpdateVoice = { viewModel.updateVoiceName(it) },
                             onUpdateVoiceLanguage = { viewModel.updateVoiceLanguage(it) },

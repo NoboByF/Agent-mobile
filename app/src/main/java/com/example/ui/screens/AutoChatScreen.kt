@@ -25,13 +25,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Reply
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.FilterChip
@@ -49,6 +54,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -63,7 +69,10 @@ import com.example.data.AutoReplyDelivery
 import com.example.data.IncomingMessageRecord
 import com.example.data.MessagingApp
 import com.example.data.PermissionSnapshot
+import com.example.data.PersonalDataItem
 import com.example.data.PilotSettings
+import com.example.ui.components.PersonalDataEditorCard
+import com.example.ui.components.PersonalDataItemCard
 import com.example.ui.components.StatusPillBadge
 import com.example.ui.components.StudioCardContainer
 import com.example.ui.theme.AmberDark
@@ -75,6 +84,7 @@ import com.example.ui.theme.StudioTheme
 
 private enum class AutoChatSubTab {
     INBOX,
+    MY_DATA,
     RULES
 }
 
@@ -91,19 +101,29 @@ fun AutoChatScreen(
     settings: PilotSettings,
     permissions: PermissionSnapshot,
     messages: List<IncomingMessageRecord>,
+    personalData: List<PersonalDataItem>,
     onUpdateMode: (AutoChatMode) -> Unit,
     onUpdateDelivery: (AutoReplyDelivery) -> Unit,
     onUpdatePersona: (String) -> Unit,
+    onToggleSensitiveGuard: (Boolean) -> Unit,
+    onToggleHandsFreeVoiceEscalation: (Boolean) -> Unit,
     onToggleApp: (MessagingApp) -> Unit,
     onOpenNotificationSettings: () -> Unit,
     onOpenChat: (IncomingMessageRecord) -> Unit,
     onQuickAiReply: (IncomingMessageRecord) -> Unit,
     onTemplateReply: (IncomingMessageRecord, String) -> Unit,
+    onSendOwnerSensitiveAnswer: (IncomingMessageRecord, String) -> Unit,
+    onSavePersonalData: (existingId: String?, title: String, content: String, category: String, shareInAutoReply: Boolean) -> Unit,
+    onTogglePersonalDataShare: (PersonalDataItem) -> Unit,
+    onDeletePersonalData: (String) -> Unit,
     onClearFeed: () -> Unit
 ) {
     val palette = StudioTheme.colors
     val isFullAuto = settings.autoChatMode == AutoChatMode.FULL_AUTO_REPLY
     var activeSubTab by rememberSaveable { mutableStateOf(AutoChatSubTab.INBOX) }
+    var editingPersonalItem by remember { mutableStateOf<PersonalDataItem?>(null) }
+    val pendingSensitive = messages.filter { it.needsOwnerAnswer }
+    val regularMessages = messages.filterNot { it.needsOwnerAnswer }
     val autoRepliedCount = messages.count { !it.autoRepliedText.isNullOrBlank() }
 
     LazyColumn(
@@ -181,27 +201,38 @@ fun AutoChatScreen(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     SubTabPill(
-                        label = "Live Inbox (${messages.size})",
+                        label = "Inbox (${messages.size})",
                         selected = activeSubTab == AutoChatSubTab.INBOX,
                         accent = palette.roseAccent,
                         softBg = palette.roseSoft,
-                        badgeSuffix = if (autoRepliedCount > 0) "$autoRepliedCount sent" else null,
+                        badgeSuffix = null,
                         modifier = Modifier
                             .weight(1f)
                             .testTag("autochat_tab_inbox"),
                         onClick = { activeSubTab = AutoChatSubTab.INBOX }
                     )
                     SubTabPill(
-                        label = "Rules & Apps",
+                        label = "আমার ডাটা (${personalData.size})",
+                        selected = activeSubTab == AutoChatSubTab.MY_DATA,
+                        accent = palette.cobaltAccent,
+                        softBg = palette.cobaltSoft,
+                        badgeSuffix = null,
+                        modifier = Modifier
+                            .weight(1.1f)
+                            .testTag("autochat_tab_my_data"),
+                        onClick = { activeSubTab = AutoChatSubTab.MY_DATA }
+                    )
+                    SubTabPill(
+                        label = "Rules",
                         selected = activeSubTab == AutoChatSubTab.RULES,
                         accent = palette.violetAccent,
                         softBg = palette.violetSoft,
                         badgeSuffix = null,
                         modifier = Modifier
-                            .weight(1f)
+                            .weight(0.9f)
                             .testTag("autochat_tab_rules"),
                         onClick = { activeSubTab = AutoChatSubTab.RULES }
                     )
@@ -262,6 +293,43 @@ fun AutoChatScreen(
         }
 
         if (activeSubTab == AutoChatSubTab.INBOX) {
+            if (pendingSensitive.isNotEmpty()) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.WarningAmber,
+                            contentDescription = "Sensitive questions needing answer",
+                            tint = palette.amberAccent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = "আপনার উত্তর প্রয়োজন",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = palette.inkPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        StatusPillBadge(
+                            label = "${pendingSensitive.size} SENSITIVE",
+                            accentColor = palette.amberAccent,
+                            containerColor = palette.amberSoft,
+                            leadingDot = false
+                        )
+                    }
+                }
+
+                items(pendingSensitive, key = { "sensitive_${it.id}" }) { msg ->
+                    SensitiveEscalationCard(
+                        record = msg,
+                        onOpenChat = { onOpenChat(msg) },
+                        onSendOwnerAnswer = { answer -> onSendOwnerSensitiveAnswer(msg, answer) }
+                    )
+                }
+            }
+
             item {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -350,12 +418,77 @@ fun AutoChatScreen(
                     }
                 }
             } else {
-                items(messages, key = { it.id }) { msg ->
+                items(regularMessages, key = { it.id }) { msg ->
                     IncomingMessageCard(
                         record = msg,
                         onOpenChat = { onOpenChat(msg) },
                         onQuickReply = { onQuickAiReply(msg) },
                         onTemplateReply = { replyText -> onTemplateReply(msg, replyText) }
+                    )
+                }
+            }
+        } else if (activeSubTab == AutoChatSubTab.MY_DATA) {
+            item {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = palette.emeraldSoft,
+                    border = BorderStroke(1.dp, palette.emeraldAccent.copy(alpha = 0.35f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.CloudDone,
+                            contentDescription = "Firebase backed My Data",
+                            tint = palette.emeraldAccent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "আপনার সম্পর্কে তথ্য এখানে সেভ করুন। কেউ জানতে চাইলে AI এখান থেকেই উত্তর দেবে এবং সব ডাটা এই মোবাইলের Firebase ক্লাউডে সুরক্ষিত থাকবে।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkPrimary
+                        )
+                    }
+                }
+            }
+
+            item {
+                PersonalDataEditorCard(
+                    editingItem = editingPersonalItem,
+                    onCancelEdit = { editingPersonalItem = null },
+                    onSaveEntry = onSavePersonalData
+                )
+            }
+
+            if (personalData.isEmpty()) {
+                item {
+                    StudioCardContainer(containerColor = palette.surfaceSubtle) {
+                        Text(
+                            text = "এখনো কোনো ব্যক্তিগত তথ্য যোগ করা হয়নি",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = palette.inkPrimary
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "উপরের ফর্মে আপনার নাম, পেশা, অফিস সময় বা সাধারণ উত্তর সেভ করলে Auto-Chat এবং Voice AI সেগুলো ব্যবহার করতে পারবে।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                    }
+                }
+            } else {
+                items(personalData, key = { "pd_${it.id}" }) { entry ->
+                    PersonalDataItemCard(
+                        item = entry,
+                        onEdit = { editingPersonalItem = entry },
+                        onToggleShare = { onTogglePersonalDataShare(entry) },
+                        onDelete = {
+                            if (editingPersonalItem?.id == entry.id) editingPersonalItem = null
+                            onDeletePersonalData(entry.id)
+                        }
                     )
                 }
             }
@@ -392,6 +525,114 @@ fun AutoChatScreen(
                         testTag = "mode_full_auto_reply_card",
                         onClick = { onUpdateMode(AutoChatMode.FULL_AUTO_REPLY) }
                     )
+                }
+            }
+
+            // Sensitive Question Guard Toggle Card
+            item {
+                StudioCardContainer {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(palette.amberSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Shield,
+                                    contentDescription = "Sensitive Question Guard",
+                                    tint = palette.amberAccent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "Sensitive Question Guard",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = palette.inkPrimary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "টাকা, OTP, পাসওয়ার্ড, ঠিকানা বা ব্যক্তিগত স্পর্শকাতর প্রশ্নে AI নিজে উত্তর না দিয়ে 'আমি জেনে বলছি।' পাঠাবে এবং সাথে সাথে আপনাকে জিজ্ঞেস করবে।",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.inkSecondary
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = settings.sensitiveQuestionGuardEnabled,
+                            onCheckedChange = onToggleSensitiveGuard,
+                            modifier = Modifier.testTag("sensitive_guard_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = AmberDark
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    // Hands-Free Screen-Off Loud Voice Escalation Switch
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(palette.roseSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.VolumeUp,
+                                    contentDescription = "Hands-free loud voice ask",
+                                    tint = palette.roseAccent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "স্ক্রিন অফ ভয়েস অ্যালার্ট ও দূর থেকে রিপ্লাই",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = palette.inkPrimary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "মোবাইল অফ থাকলেও গুরুত্বপূর্ণ মেসেজ জোরে পড়ে শোনাবে এবং মাইক অন করে দূর থেকে আপনার কথা শুনে অটো রিপ্লাই পাঠাবে।",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.inkSecondary
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = settings.handsFreeVoiceEscalationEnabled,
+                            onCheckedChange = onToggleHandsFreeVoiceEscalation,
+                            modifier = Modifier.testTag("hands_free_voice_escalation_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = RosePink
+                            )
+                        )
+                    }
                 }
             }
 
@@ -673,6 +914,23 @@ private fun IncomingMessageCard(
             }
         }
 
+        if (!record.ownerResolvedReply.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = palette.cobaltSoft,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "✓ আপনার উত্তর পাঠানো হয়েছে: \"${record.ownerResolvedReply}\"",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.cobaltAccent,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+        }
+
         if (record.hasDirectReply) {
             Spacer(modifier = Modifier.height(10.dp))
             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -738,6 +996,153 @@ private fun IncomingMessageCard(
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(if (record.hasDirectReply) "AI Direct Reply" else "Draft AI Reply")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SensitiveEscalationCard(
+    record: IncomingMessageRecord,
+    onOpenChat: () -> Unit,
+    onSendOwnerAnswer: (String) -> Unit
+) {
+    val palette = StudioTheme.colors
+    var draftAnswer by rememberSaveable(record.id) { mutableStateOf("") }
+
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        color = palette.amberSoft.copy(alpha = 0.55f),
+        border = BorderStroke(1.5.dp, palette.amberAccent)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    StatusPillBadge(
+                        label = record.app.displayName,
+                        accentColor = appAccentColor(record.app),
+                        containerColor = appSoftColor(record.app),
+                        leadingDot = false
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = record.senderName,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = palette.inkPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Text(
+                    text = record.formattedTime,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.inkSecondary
+                )
+            }
+
+            if (!record.sensitivityReason.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "কারণ: ${record.sensitivityReason}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = palette.amberAccent,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "\"${record.messageText}\"",
+                style = MaterialTheme.typography.bodyMedium,
+                color = palette.inkPrimary,
+                fontWeight = FontWeight.Medium
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = palette.emeraldSoft,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "✓ স্বয়ংক্রিয়ভাবে পাঠানো হয়েছে: \"${record.autoRepliedText ?: "আমি জেনে বলছি।"}\"",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.emeraldAccent,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = record.ownerQuestion ?: "এখন আপনি সঠিক উত্তর লিখুন — LivePilot সাথে সাথে পাঠিয়ে দেবে:",
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.inkPrimary
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedTextField(
+                value = draftAnswer,
+                onValueChange = { draftAnswer = it },
+                placeholder = { Text("${record.senderName}-কে পাঠানোর উত্তর লিখুন...") },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("sensitive_answer_input_${record.id}"),
+                shape = RoundedCornerShape(14.dp),
+                maxLines = 3,
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = palette.card,
+                    unfocusedContainerColor = palette.card,
+                    focusedBorderColor = palette.amberAccent,
+                    unfocusedBorderColor = palette.outline
+                )
+            )
+
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onOpenChat,
+                    modifier = Modifier
+                        .weight(0.42f)
+                        .height(48.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, palette.outline)
+                ) {
+                    Text("Open Chat", color = palette.inkPrimary)
+                }
+                Button(
+                    onClick = {
+                        val toSend = draftAnswer.trim()
+                        if (toSend.isNotEmpty()) {
+                            draftAnswer = ""
+                            onSendOwnerAnswer(toSend)
+                        }
+                    },
+                    enabled = draftAnswer.isNotBlank(),
+                    modifier = Modifier
+                        .weight(0.58f)
+                        .height(48.dp)
+                        .testTag("sensitive_answer_send_${record.id}"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = AmberDark,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send owner answer",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("উত্তর পাঠান")
+                }
             }
         }
     }

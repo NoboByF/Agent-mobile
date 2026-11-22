@@ -109,6 +109,9 @@ class PilotPreferences(context: Context) {
             rawAgentModel
         }
 
+        val deletedModelsSet = prefs.getStringSet(KEY_DELETED_MODELS, emptySet()).orEmpty()
+        val deletedModels = deletedModelsSet.map { it.trim() }.filter { it.isNotBlank() }.sorted()
+
         return PilotSettings(
             apiKey = effectiveKey,
             apiKeys = migratedKeys,
@@ -117,6 +120,7 @@ class PilotPreferences(context: Context) {
             liveModel = migratedLiveModel,
             agentModel = migratedAgentModel,
             textModel = migratedTextModel,
+            deletedModels = deletedModels,
             verifyTaskCompletion = prefs.getBoolean(KEY_VERIFY_TASK_COMPLETION, true),
             voiceName = prefs.getString(KEY_VOICE_NAME, PilotSettings.DEFAULT_VOICE)
                 .orEmpty()
@@ -135,6 +139,8 @@ class PilotPreferences(context: Context) {
                 KEY_AUTO_REPLY_PERSONA,
                 PilotSettings.DEFAULT_AUTO_REPLY_PERSONA
             ).orEmpty().ifBlank { PilotSettings.DEFAULT_AUTO_REPLY_PERSONA },
+            sensitiveQuestionGuardEnabled = prefs.getBoolean(KEY_SENSITIVE_GUARD_ENABLED, true),
+            handsFreeVoiceEscalationEnabled = prefs.getBoolean(KEY_HANDS_FREE_VOICE_ESCALATION, true),
             enabledMessagingApps = enabledApps
         )
     }
@@ -167,6 +173,7 @@ class PilotPreferences(context: Context) {
             .putString(KEY_LIVE_MODEL, settings.liveModel.trim().removePrefix("models/"))
             .putString(KEY_AGENT_MODEL, settings.agentModel.trim().removePrefix("models/"))
             .putString(KEY_TEXT_MODEL, settings.textModel.trim().removePrefix("models/"))
+            .putStringSet(KEY_DELETED_MODELS, settings.deletedModels.map { it.trim() }.filter { it.isNotBlank() }.toSet())
             .putBoolean(KEY_VERIFY_TASK_COMPLETION, settings.verifyTaskCompletion)
             .putString(KEY_VOICE_NAME, settings.voiceName.trim())
             .putString(KEY_VOICE_LANGUAGE, settings.voiceLanguage.name)
@@ -180,31 +187,36 @@ class PilotPreferences(context: Context) {
             .putString(KEY_AUTO_CHAT_MODE, settings.autoChatMode.name)
             .putString(KEY_AUTO_REPLY_DELIVERY, settings.autoReplyDelivery.name)
             .putString(KEY_AUTO_REPLY_PERSONA, settings.autoReplyPersona.trim())
+            .putBoolean(KEY_SENSITIVE_GUARD_ENABLED, settings.sensitiveQuestionGuardEnabled)
+            .putBoolean(KEY_HANDS_FREE_VOICE_ESCALATION, settings.handsFreeVoiceEscalationEnabled)
             .putStringSet(KEY_ENABLED_APPS, settings.enabledMessagingApps.map { it.name }.toSet())
             .apply()
     }
 
     private fun loadApiKeysJson(): List<GeminiApiKeyEntry> {
         val raw = prefs.getString(KEY_API_KEYS_JSON, null)
+        return parseApiKeysJson(raw)
+    }
+
+    fun loadPersonalData(): List<PersonalDataItem> {
+        val raw = prefs.getString(KEY_PERSONAL_DATA_JSON, null)
         if (raw.isNullOrBlank()) return emptyList()
         return runCatching {
             val arr = JSONArray(raw)
             buildList {
                 for (i in 0 until arr.length()) {
                     val obj = arr.optJSONObject(i) ?: continue
-                    val key = obj.optString("key", "").trim()
-                    if (key.isBlank()) continue
+                    val title = obj.optString("title", "").trim()
+                    val content = obj.optString("content", "").trim()
+                    if (title.isBlank() || content.isBlank()) continue
                     add(
-                        GeminiApiKeyEntry(
-                            id = obj.optString("id", "key_$i").ifBlank { "key_$i" },
-                            label = obj.optString("label", "Key ${i + 1}").ifBlank { "Key ${i + 1}" },
-                            key = key,
-                            enabled = obj.optBoolean("enabled", true),
-                            cooldownUntilMs = obj.optLong("cooldownUntilMs", 0L),
-                            isInvalid = obj.optBoolean("isInvalid", false),
-                            lastError = obj.optString("lastError", "").ifBlank { null },
-                            totalRequests = obj.optInt("totalRequests", 0),
-                            lastUsedAtMs = obj.optLong("lastUsedAtMs", 0L)
+                        PersonalDataItem(
+                            id = obj.optString("id", "pd_$i").ifBlank { "pd_$i" },
+                            title = title,
+                            content = content,
+                            category = obj.optString("category", "পরিচয়").ifBlank { "পরিচয়" },
+                            shareInAutoReply = obj.optBoolean("shareInAutoReply", true),
+                            updatedAtMs = obj.optLong("updatedAtMs", System.currentTimeMillis())
                         )
                     )
                 }
@@ -212,24 +224,24 @@ class PilotPreferences(context: Context) {
         }.getOrDefault(emptyList())
     }
 
-    private fun serializeApiKeysJson(keys: List<GeminiApiKeyEntry>): String {
+    fun savePersonalData(items: List<PersonalDataItem>) {
         val arr = JSONArray()
-        keys.forEach { entry ->
+        items.forEach { item ->
             arr.put(
                 JSONObject()
-                    .put("id", entry.id)
-                    .put("label", entry.label)
-                    .put("key", entry.key.trim())
-                    .put("enabled", entry.enabled)
-                    .put("cooldownUntilMs", entry.cooldownUntilMs)
-                    .put("isInvalid", entry.isInvalid)
-                    .put("lastError", entry.lastError.orEmpty())
-                    .put("totalRequests", entry.totalRequests)
-                    .put("lastUsedAtMs", entry.lastUsedAtMs)
+                    .put("id", item.id)
+                    .put("title", item.title)
+                    .put("content", item.content)
+                    .put("category", item.category)
+                    .put("shareInAutoReply", item.shareInAutoReply)
+                    .put("updatedAtMs", item.updatedAtMs)
             )
         }
-        return arr.toString()
+        prefs.edit().putString(KEY_PERSONAL_DATA_JSON, arr.toString()).apply()
     }
+        // Helper methods moved to companion object for reuse by CloudSyncRepository.
+    private fun serializeApiKeysJson(keys: List<GeminiApiKeyEntry>): String =
+        Companion.serializeApiKeysJson(keys)
 
     fun loadRoutines(): List<PilotRoutine> {
         val raw = prefs.getString(KEY_CUSTOM_ROUTINES, null)
@@ -295,12 +307,32 @@ class PilotPreferences(context: Context) {
                             )
                         }
                     }
+                    val attachmentsArr = obj.optJSONArray("attachments") ?: JSONArray()
+                    val attachments = buildList {
+                        for (a in 0 until attachmentsArr.length()) {
+                            val aObj = attachmentsArr.optJSONObject(a) ?: continue
+                            val kind = runCatching {
+                                AttachmentKind.valueOf(aObj.optString("kind", AttachmentKind.OTHER.name))
+                            }.getOrDefault(AttachmentKind.OTHER)
+                            add(
+                                ChatAttachmentMeta(
+                                    id = aObj.optString("id", "att_$a"),
+                                    displayName = aObj.optString("displayName", "file"),
+                                    mimeType = aObj.optString("mimeType", "application/octet-stream"),
+                                    sizeBytes = aObj.optLong("sizeBytes", 0L),
+                                    kind = kind,
+                                    uriString = aObj.optString("uriString", "")
+                                )
+                            )
+                        }
+                    }
                     add(
                         AskAiMessage(
                             id = obj.optLong("id"),
                             isUser = obj.optBoolean("isUser"),
                             text = obj.optString("text"),
                             citations = citations,
+                            attachments = attachments,
                             modelUsed = obj.optString("modelUsed").ifBlank { null },
                             timestamp = obj.optString("timestamp")
                         )
@@ -317,12 +349,25 @@ class PilotPreferences(context: Context) {
             msg.citations.forEach { cit ->
                 citationsArr.put(JSONObject().put("title", cit.title).put("url", cit.url))
             }
+            val attachmentsArr = JSONArray()
+            msg.attachments.forEach { att ->
+                attachmentsArr.put(
+                    JSONObject()
+                        .put("id", att.id)
+                        .put("displayName", att.displayName)
+                        .put("mimeType", att.mimeType)
+                        .put("sizeBytes", att.sizeBytes)
+                        .put("kind", att.kind.name)
+                        .put("uriString", att.uriString)
+                )
+            }
             arr.put(
                 JSONObject()
                     .put("id", msg.id)
                     .put("isUser", msg.isUser)
                     .put("text", msg.text)
                     .put("citations", citationsArr)
+                    .put("attachments", attachmentsArr)
                     .put("modelUsed", msg.modelUsed ?: "")
                     .put("timestamp", msg.timestamp)
             )
@@ -352,6 +397,10 @@ class PilotPreferences(context: Context) {
         private const val KEY_AUTO_CHAT_MODE = "auto_chat_mode"
         private const val KEY_AUTO_REPLY_DELIVERY = "auto_reply_delivery"
         private const val KEY_AUTO_REPLY_PERSONA = "auto_reply_persona"
+        private const val KEY_SENSITIVE_GUARD_ENABLED = "sensitive_question_guard_enabled"
+        private const val KEY_HANDS_FREE_VOICE_ESCALATION = "hands_free_voice_escalation_enabled"
+        private const val KEY_DELETED_MODELS = "deleted_models_set"
+        private const val KEY_PERSONAL_DATA_JSON = "personal_data_json"
         private const val KEY_ENABLED_APPS = "enabled_messaging_apps"
         private const val KEY_ASK_AI_HISTORY = "ask_ai_history_json"
         private const val KEY_CUSTOM_ROUTINES = "custom_routines_json"
@@ -361,5 +410,51 @@ class PilotPreferences(context: Context) {
             "gemini-4-hydrogen",
             "gemini-4-carbon"
         )
+
+        fun parseApiKeysJson(raw: String?): List<GeminiApiKeyEntry> {
+            if (raw.isNullOrBlank()) return emptyList()
+            return runCatching {
+                val arr = JSONArray(raw)
+                buildList {
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val key = obj.optString("key", "").trim()
+                        if (key.isBlank()) continue
+                        add(
+                            GeminiApiKeyEntry(
+                                id = obj.optString("id", "key_$i").ifBlank { "key_$i" },
+                                label = obj.optString("label", "Key ${i + 1}").ifBlank { "Key ${i + 1}" },
+                                key = key,
+                                enabled = obj.optBoolean("enabled", true),
+                                cooldownUntilMs = obj.optLong("cooldownUntilMs", 0L),
+                                isInvalid = obj.optBoolean("isInvalid", false),
+                                lastError = obj.optString("lastError", "").ifBlank { null },
+                                totalRequests = obj.optInt("totalRequests", 0),
+                                lastUsedAtMs = obj.optLong("lastUsedAtMs", 0L)
+                            )
+                        )
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
+
+        fun serializeApiKeysJson(keys: List<GeminiApiKeyEntry>): String {
+            val arr = JSONArray()
+            keys.forEach { entry ->
+                arr.put(
+                    JSONObject()
+                        .put("id", entry.id)
+                        .put("label", entry.label)
+                        .put("key", entry.key.trim())
+                        .put("enabled", entry.enabled)
+                        .put("cooldownUntilMs", entry.cooldownUntilMs)
+                        .put("isInvalid", entry.isInvalid)
+                        .put("lastError", entry.lastError.orEmpty())
+                        .put("totalRequests", entry.totalRequests)
+                        .put("lastUsedAtMs", entry.lastUsedAtMs)
+                )
+            }
+            return arr.toString()
+        }
     }
 }

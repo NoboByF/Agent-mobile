@@ -9,6 +9,7 @@ import com.example.data.AskAiMessage
 import com.example.data.DiscoveredModel
 import com.example.data.GeminiApiKeyEntry
 import com.example.data.LogLevel
+import com.example.data.PersonalDataItem
 import com.example.data.PilotStateHub
 import com.example.data.WebCitation
 import kotlinx.coroutines.Dispatchers
@@ -31,6 +32,13 @@ data class ChatGenerationResult(
     val keyLabelUsed: String? = null
 )
 
+data class SmartAutoReplyResult(
+    val isSensitive: Boolean,
+    val sensitivityReason: String? = null,
+    val replyText: String,
+    val questionForOwner: String = ""
+)
+
 private class GeminiHttpException(
     val httpCode: Int,
     override val message: String
@@ -39,12 +47,13 @@ private class GeminiHttpException(
 object GeminiRestClient {
 
     private const val REST_BASE = "https://generativelanguage.googleapis.com/v1beta"
+    private const val UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta/files"
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
 
     private val client: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(65, TimeUnit.SECONDS)
-        .writeTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(25, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
     /**
@@ -230,6 +239,7 @@ object GeminiRestClient {
 
     /**
      * Multi-turn Gemini chat with Google Search Grounding, strict role alternation sanitizer,
+     * Multimodal Photo/Video/Audio/PDF/File attachments (inline + Gemini Files API upload),
      * and automatic Multi-API-Key failover.
      */
     suspend fun generateChatTurn(
@@ -237,34 +247,23 @@ object GeminiRestClient {
         modelId: String,
         history: List<AskAiMessage>,
         enableGoogleSearch: Boolean,
-        allowModelFallback: Boolean = true
+        allowModelFallback: Boolean = true,
+        preparedAttachments: List<PreparedAttachment> = emptyList()
     ): Result<ChatGenerationResult> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
             val sanitizedTurns = buildSanitizedContents(history.takeLast(20))
-            require(sanitizedTurns.length() > 0) { "Prompt cannot be empty." }
+            require(sanitizedTurns.length() > 0 || preparedAttachments.isNotEmpty()) { "Prompt cannot be empty." }
 
             val systemInstruction = JSONObject().put(
                 "parts",
                 JSONArray().put(
                     JSONObject().put(
                         "text",
-                        "You are LivePilot AI's intelligent bilingual assistant (Bengali & English). Give accurate, clear, well-structured answers. Respond in Bengali if the user writes in Bengali or Banglish, and English otherwise. When Google Search results are available, synthesize up-to-date facts clearly."
+                        "You are LivePilot AI's intelligent multimodal bilingual assistant (Bengali & English). Analyze attached photos, videos, audio, PDFs, and files thoroughly and accurately. Give clear, well-structured answers. Respond in Bengali if the user writes in Bengali or Banglish, and English otherwise. When Google Search results are available, synthesize up-to-date facts clearly."
                     )
                 )
             )
-
-            val payload = JSONObject()
-                .put("system_instruction", systemInstruction)
-                .put("contents", sanitizedTurns)
-
-            if (enableGoogleSearch) {
-                payload.put(
-                    "tools",
-                    JSONArray().put(JSONObject().put("google_search", JSONObject()))
-                )
-            }
-            val bodyJson = payload.toString()
 
             val modelsToTry = if (allowModelFallback && cleanModel != "gemini-2.5-flash") {
                 listOf(cleanModel, "gemini-2.5-flash")
@@ -280,6 +279,28 @@ object GeminiRestClient {
                         tag = "AskAI",
                         penalizeKeyOnQuota = !hasNextModel
                     ) { entry, activeKey ->
+                        // Build per-key contents because Gemini Files API URIs are scoped to the uploading API key/project
+                        val turnContents = JSONArray(sanitizedTurns.toString())
+                        if (preparedAttachments.isNotEmpty()) {
+                            attachPreparedMediaToLatestUserTurn(
+                                contents = turnContents,
+                                attachments = preparedAttachments,
+                                activeApiKey = activeKey
+                            )
+                        }
+
+                        val payload = JSONObject()
+                            .put("system_instruction", systemInstruction)
+                            .put("contents", turnContents)
+
+                        if (enableGoogleSearch) {
+                            payload.put(
+                                "tools",
+                                JSONArray().put(JSONObject().put("google_search", JSONObject()))
+                            )
+                        }
+                        val bodyJson = payload.toString()
+
                         val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
                         val url = "$REST_BASE/models/$targetModel:generateContent?key=$encodedKey"
                         val request = Request.Builder()
@@ -288,10 +309,11 @@ object GeminiRestClient {
                             .build()
 
                         val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
+                        val attNote = if (preparedAttachments.isNotEmpty()) ", ${preparedAttachments.size} attachment(s)" else ""
                         PilotStateHub.log(
                             LogLevel.INFO,
                             "AskAI",
-                            "Calling $targetModel$labelSuffix (searchGrounding=$enableGoogleSearch)..."
+                            "Calling $targetModel$labelSuffix (searchGrounding=$enableGoogleSearch$attNote)..."
                         )
 
                         client.newCall(request).execute().use { response ->
@@ -354,29 +376,243 @@ object GeminiRestClient {
         }
     }
 
+    private fun attachPreparedMediaToLatestUserTurn(
+        contents: JSONArray,
+        attachments: List<PreparedAttachment>,
+        activeApiKey: String
+    ) {
+        val lastTurn = if (contents.length() > 0) {
+            contents.optJSONObject(contents.length() - 1)
+        } else {
+            null
+        }
+        val targetParts = if (lastTurn != null && lastTurn.optString("role") == "user") {
+            lastTurn.optJSONArray("parts") ?: JSONArray().also { lastTurn.put("parts", it) }
+        } else {
+            val newParts = JSONArray()
+            contents.put(JSONObject().put("role", "user").put("parts", newParts))
+            newParts
+        }
+
+        val mediaParts = mutableListOf<JSONObject>()
+        for (att in attachments) {
+            when {
+                !att.extractedText.isNullOrBlank() -> {
+                    mediaParts.add(JSONObject().put("text", att.extractedText))
+                }
+                !att.inlineBase64.isNullOrBlank() && !att.inlineMimeType.isNullOrBlank() -> {
+                    mediaParts.add(
+                        JSONObject().put(
+                            "inline_data",
+                            JSONObject()
+                                .put("mime_type", att.inlineMimeType)
+                                .put("data", att.inlineBase64)
+                        )
+                    )
+                }
+                att.rawBytesForUpload != null && !att.inlineMimeType.isNullOrBlank() -> {
+                    val fileUri = uploadFileToGeminiFilesApi(
+                        activeApiKey = activeApiKey,
+                        bytes = att.rawBytesForUpload,
+                        mimeType = att.inlineMimeType,
+                        displayName = att.meta.displayName
+                    )
+                    mediaParts.add(
+                        JSONObject().put(
+                            "file_data",
+                            JSONObject()
+                                .put("mime_type", att.inlineMimeType)
+                                .put("file_uri", fileUri)
+                        )
+                    )
+                }
+            }
+        }
+
+        // Prepend media parts before the user's text prompt for best Gemini multimodal accuracy
+        if (mediaParts.isNotEmpty()) {
+            val combined = JSONArray()
+            mediaParts.forEach { combined.put(it) }
+            for (i in 0 until targetParts.length()) {
+                combined.put(targetParts.get(i))
+            }
+            val turnObj = contents.getJSONObject(contents.length() - 1)
+            turnObj.put("parts", combined)
+        }
+    }
+
     /**
-     * Generates a concise, natural auto-reply for incoming messages with automatic Multi-API-Key failover.
+     * Uploads larger video/audio/PDF files (10MB..45MB) using Gemini Files API resumable upload
+     * and waits briefly for video processing to become ACTIVE.
      */
-    suspend fun generateAutoReply(
+    private fun uploadFileToGeminiFilesApi(
+        activeApiKey: String,
+        bytes: ByteArray,
+        mimeType: String,
+        displayName: String
+    ): String {
+        val encodedKey = URLEncoder.encode(activeApiKey.trim(), "UTF-8")
+        PilotStateHub.log(
+            LogLevel.INFO,
+            "Attachments",
+            "Uploading $displayName (${bytes.size / 1024}KB, $mimeType) to Gemini Files API..."
+        )
+
+        // Step 1: Initiate resumable upload
+        val initMeta = JSONObject().put("file", JSONObject().put("display_name", displayName.take(80)))
+        val initReq = Request.Builder()
+            .url("$UPLOAD_BASE?key=$encodedKey")
+            .header("X-Goog-Upload-Protocol", "resumable")
+            .header("X-Goog-Upload-Command", "start")
+            .header("X-Goog-Upload-Header-Content-Length", bytes.size.toString())
+            .header("X-Goog-Upload-Header-Content-Type", mimeType)
+            .post(initMeta.toString().toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+
+        val uploadUrl = client.newCall(initReq).execute().use { resp ->
+            val bodyStr = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                throw GeminiHttpException(resp.code, extractApiError(bodyStr, resp.code))
+            }
+            resp.header("X-Goog-Upload-URL")
+                ?: error("Gemini Files API did not return upload URL.")
+        }
+
+        // Step 2: Upload raw bytes and finalize
+        val uploadReq = Request.Builder()
+            .url(uploadUrl)
+            .header("X-Goog-Upload-Offset", "0")
+            .header("X-Goog-Upload-Command", "upload, finalize")
+            .post(bytes.toRequestBody(mimeType.toMediaType()))
+            .build()
+
+        val fileObj = client.newCall(uploadReq).execute().use { resp ->
+            val bodyStr = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                throw GeminiHttpException(resp.code, extractApiError(bodyStr, resp.code))
+            }
+            val root = JSONObject(bodyStr)
+            root.optJSONObject("file") ?: root
+        }
+
+        val fileName = fileObj.optString("name", "")
+        var fileUri = fileObj.optString("uri", "")
+        var state = fileObj.optString("state", "ACTIVE")
+
+        // Step 3: Poll until video/media processing finishes (up to ~24s)
+        var attempts = 0
+        while (state.equals("PROCESSING", ignoreCase = true) && fileName.isNotBlank() && attempts < 12) {
+            attempts++
+            Thread.sleep(2000L)
+            val statusReq = Request.Builder()
+                .url("$REST_BASE/$fileName?key=$encodedKey")
+                .get()
+                .build()
+            client.newCall(statusReq).execute().use { resp ->
+                if (resp.isSuccessful) {
+                    val statusJson = JSONObject(resp.body?.string().orEmpty())
+                    state = statusJson.optString("state", "ACTIVE")
+                    statusJson.optString("uri", "").takeIf { it.isNotBlank() }?.let { fileUri = it }
+                }
+            }
+        }
+
+        if (state.equals("FAILED", ignoreCase = true)) {
+            error("Gemini could not process uploaded file '$displayName'.")
+        }
+        require(fileUri.isNotBlank()) { "Gemini Files API returned empty file URI." }
+        PilotStateHub.log(LogLevel.INFO, "Attachments", "Upload ready ($state): $displayName")
+        return fileUri
+    }
+
+    /**
+     * Smart Context-Aware Auto-Reply + Sensitive Question Classifier.
+     * Detects private/financial/sensitive/unknown-personal questions and defers them safely
+     * with "আমি জেনে বলছি।" while formulating a clear question for the phone owner.
+     */
+    suspend fun generateSmartAutoReply(
         apiKey: String = "",
         modelId: String,
         personaPrompt: String,
         appName: String,
         senderName: String,
         incomingText: String,
-        screenContext: String? = null
-    ): Result<String> = withContext(Dispatchers.IO) {
+        conversationHistory: List<String> = emptyList(),
+        screenContext: String? = null,
+        sensitiveGuardEnabled: Boolean = true,
+        personalDataFacts: List<PersonalDataItem> = PilotStateHub.personalData.value
+    ): Result<SmartAutoReplyResult> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
+            val defaultDeferral = com.example.messaging.SensitiveMessageGuard.defaultDeferralReply(incomingText)
+            val shareableFacts = personalDataFacts.filter {
+                it.shareInAutoReply && it.title.isNotBlank() && it.content.isNotBlank()
+            }
 
             val promptText = buildString {
                 append("Messaging App: ").append(appName).append('\n')
                 append("Sender: ").append(senderName).append('\n')
-                append("Incoming Message: \"").append(incomingText).append("\"\n")
+                if (conversationHistory.isNotEmpty()) {
+                    append("Recent Conversation History (oldest to newest):\n")
+                    conversationHistory.takeLast(6).forEach { append("- ").append(it).append('\n') }
+                }
+                append("LATEST Incoming Message from ").append(senderName).append(": \"").append(incomingText).append("\"\n")
                 if (!screenContext.isNullOrBlank()) {
                     append("Visible Chat Screen Context: ").append(screenContext.take(700)).append('\n')
                 }
-                append("Write ONLY the exact short reply message text to send back (no quotes, no explanations).")
+                append("Output strict JSON only.")
+            }
+
+            val systemPrompt = buildString {
+                append(personaPrompt.trim()).append("\n\n")
+                if (shareableFacts.isNotEmpty()) {
+                    append("OWNER'S SAVED PERSONAL DATA (\"আমার ডাটা\" — TRUSTED FACTS YOU ARE ALLOWED TO SHARE):\n")
+                    shareableFacts.take(30).forEach { fact ->
+                        append("- [").append(fact.category).append("] ")
+                            .append(fact.title).append(": ")
+                            .append(fact.content).append('\n')
+                    }
+                    append("\n")
+                }
+                append(
+                    """
+                    STRICT AUTO-REPLY RULES:
+                    1. Reply ONLY ONCE to the sender's LATEST message in 1 short, natural, human-like sentence matching the sender's language (Bengali, Banglish, or English).
+                    2. NEVER repeat a greeting or phrase you already said in the Recent Conversation History.
+                    3. If the sender asks about something EXPLICITLY answered in the OWNER'S SAVED PERSONAL DATA ("আমার ডাটা") above, answer accurately using ONLY those saved facts and set "is_sensitive": false!
+                    4. NEVER invent facts, promises, schedules, prices, addresses, or personal answers that are NOT in the saved personal data!
+                    """.trimIndent()
+                )
+                if (sensitiveGuardEnabled) {
+                    append(
+                        """
+
+                        5. SENSITIVE / PERSONAL QUESTION GUARD (HIGHEST PRIORITY WHEN NOT IN SAVED DATA):
+                           Set "is_sensitive": true if the sender's latest message asks ANYTHING sensitive, private, financial, or requiring the phone owner's personal decision/knowledge that is NOT explicitly answered in OWNER'S SAVED PERSONAL DATA above — including:
+                           - Passwords, PINs, OTPs, CVV, NID, passport (ALWAYS sensitive!)
+                           - Money, loans, bKash/Nagad/bank numbers, salary, payments, or prices (unless explicitly listed in Saved Personal Data)
+                           - Exact live location, home address, personal secrets, relationship/family/medical matters (unless explicitly listed in Saved Personal Data)
+                           - Commitments, meeting times, promises, approvals, or specific personal questions you do NOT genuinely know the answer to.
+                           When "is_sensitive": true:
+                           - DO NOT answer or guess the sensitive question!
+                           - Set "reply" to EXACTLY: "$defaultDeferral"
+                           - Set "sensitivity_reason" to a short 2-4 word label (e.g. "আর্থিক প্রশ্ন", "ব্যক্তিগত তথ্য", "সাক্ষাতের সিদ্ধান্ত").
+                           - Set "question_for_owner" to a concise, direct question in Bengali asking the phone owner what exact answer to send back to $senderName.
+                        """.trimIndent()
+                    )
+                }
+                append(
+                    """
+
+                    Return ONLY valid JSON:
+                    {
+                      "is_sensitive": false,
+                      "sensitivity_reason": "",
+                      "reply": "exact short message text to send back",
+                      "question_for_owner": ""
+                    }
+                    """.trimIndent()
+                )
             }
 
             val payload = JSONObject()
@@ -384,12 +620,7 @@ object GeminiRestClient {
                     "system_instruction",
                     JSONObject().put(
                         "parts",
-                        JSONArray().put(
-                            JSONObject().put(
-                                "text",
-                                "$personaPrompt Keep replies short (1-2 sentences max), warm, and directly ready to send."
-                            )
-                        )
+                        JSONArray().put(JSONObject().put("text", systemPrompt))
                     )
                 )
                 .put(
@@ -399,6 +630,12 @@ object GeminiRestClient {
                             .put("role", "user")
                             .put("parts", JSONArray().put(JSONObject().put("text", promptText)))
                     )
+                )
+                .put(
+                    "generationConfig",
+                    JSONObject()
+                        .put("temperature", 0.3)
+                        .put("responseMimeType", "application/json")
                 )
             val bodyJson = payload.toString()
 
@@ -432,15 +669,42 @@ object GeminiRestClient {
                                 ?.optJSONObject(0)
                                 ?.optJSONObject("content")
                                 ?.optJSONArray("parts")
-                            val reply = buildString {
+                            val rawText = buildString {
                                 if (parts != null) {
                                     for (i in 0 until parts.length()) {
-                                        append(parts.optJSONObject(i)?.optString("text", "").orEmpty())
+                                        val p = parts.optJSONObject(i) ?: continue
+                                        if (p.optBoolean("thought", false)) continue
+                                        append(p.optString("text", ""))
                                     }
                                 }
-                            }.trim().removeSurrounding("\"")
-                            require(reply.isNotBlank()) { "Empty auto-reply returned." }
-                            reply
+                            }.trim()
+
+                            val parsedJson = runCatching { extractCleanJsonObject(rawText) }.getOrNull()
+                            if (parsedJson != null) {
+                                val isSensitive = sensitiveGuardEnabled && parsedJson.optBoolean("is_sensitive", false)
+                                val reason = parsedJson.optString("sensitivity_reason", "").trim().ifBlank { null }
+                                val reply = if (isSensitive) {
+                                    defaultDeferral
+                                } else {
+                                    parsedJson.optString("reply", "").trim().removeSurrounding("\"")
+                                }
+                                require(reply.isNotBlank()) { "Empty auto-reply returned." }
+                                val ownerQ = parsedJson.optString("question_for_owner", "").trim()
+                                    .ifBlank { "$senderName জিজ্ঞেস করেছে: \"${incomingText.take(120)}\" — কী উত্তর পাঠাবো?" }
+                                SmartAutoReplyResult(
+                                    isSensitive = isSensitive,
+                                    sensitivityReason = reason,
+                                    replyText = reply,
+                                    questionForOwner = if (isSensitive) ownerQ else ""
+                                )
+                            } else {
+                                val plain = rawText.removeSurrounding("\"").trim()
+                                require(plain.isNotBlank()) { "Empty auto-reply returned." }
+                                SmartAutoReplyResult(
+                                    isSensitive = false,
+                                    replyText = plain
+                                )
+                            }
                         }
                     }
                 } catch (e: Throwable) {
@@ -460,6 +724,28 @@ object GeminiRestClient {
             throw lastAutoError ?: IllegalStateException("Auto-reply generation failed.")
         }
     }
+
+    /**
+     * Generates a concise, natural auto-reply for incoming messages (compat wrapper).
+     */
+    suspend fun generateAutoReply(
+        apiKey: String = "",
+        modelId: String,
+        personaPrompt: String,
+        appName: String,
+        senderName: String,
+        incomingText: String,
+        screenContext: String? = null
+    ): Result<String> = generateSmartAutoReply(
+        apiKey = apiKey,
+        modelId = modelId,
+        personaPrompt = personaPrompt,
+        appName = appName,
+        senderName = senderName,
+        incomingText = incomingText,
+        screenContext = screenContext,
+        sensitiveGuardEnabled = PilotStateHub.settings.value.sensitiveQuestionGuardEnabled
+    ).map { it.replyText }
 
     /**
      * Ensures Gemini REST contents strictly alternate user/model turns and start with a user turn.

@@ -1,0 +1,217 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny catch-all (zero-trust baseline)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Core Helper Functions ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 80 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidTimestamp(ts) {
+      return ts is timestamp && ts <= request.time;
+    }
+
+    // --- Entity Validators (standalone, safe for both create & update) ---
+
+    function isValidDeviceConfig(data, deviceId) {
+      return data.deviceId is string && data.deviceId == deviceId && data.deviceId.size() >= 1 && data.deviceId.size() <= 80
+        && data.deviceModel is string && data.deviceModel.size() >= 1 && data.deviceModel.size() <= 100
+        && data.deviceManufacturer is string && data.deviceManufacturer.size() <= 80
+        && data.apiKeysJson is string && data.apiKeysJson.size() <= 32000
+        && data.activeApiKeyId is string && data.activeApiKeyId.size() <= 80
+        && data.autoRotateApiKeys is bool
+        && data.liveModel is string && data.liveModel.size() <= 120
+        && data.agentModel is string && data.agentModel.size() <= 120
+        && data.textModel is string && data.textModel.size() <= 120
+        && data.deletedModels is list && data.deletedModels.size() <= 100
+        && data.verifyTaskCompletion is bool
+        && data.voiceName is string && data.voiceName.size() <= 40
+        && data.voiceLanguage is string && data.voiceLanguage.size() <= 40
+        && data.speakerphoneOn is bool
+        && data.autoVisionDefaultOn is bool
+        && data.autoVisionIntervalSec is number && data.autoVisionIntervalSec >= 2 && data.autoVisionIntervalSec <= 10
+        && data.showTouchVisualizer is bool
+        && data.showFloatingCaptions is bool
+        && data.themeMode is string && data.themeMode.size() <= 20
+        && data.customVoiceInstructions is string && data.customVoiceInstructions.size() <= 2000
+        && data.autoChatMode is string && data.autoChatMode.size() <= 40
+        && data.autoReplyDelivery is string && data.autoReplyDelivery.size() <= 40
+        && data.autoReplyPersona is string && data.autoReplyPersona.size() <= 1500
+        && data.sensitiveQuestionGuardEnabled is bool
+        && data.handsFreeVoiceEscalationEnabled is bool
+        && data.enabledMessagingApps is list && data.enabledMessagingApps.size() <= 10
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidPersonalData(data) {
+      return data.title is string && data.title.size() >= 1 && data.title.size() <= 120
+        && data.content is string && data.content.size() >= 1 && data.content.size() <= 1500
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 50
+        && data.shareInAutoReply is bool
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidRoutine(data) {
+      return data.title is string && data.title.size() >= 1 && data.title.size() <= 100
+        && data.subtitle is string && data.subtitle.size() <= 160
+        && data.prompt is string && data.prompt.size() >= 1 && data.prompt.size() <= 2000
+        && data.accent is string && data.accent.size() >= 1 && data.accent.size() <= 30
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    function isValidAskAiMessage(data) {
+      return data.clientId is number && data.clientId >= 0
+        && data.senderRole is string && (data.senderRole == 'user' || data.senderRole == 'assistant')
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 16000
+        && data.modelUsed is string && data.modelUsed.size() <= 120
+        && data.timestampLabel is string && data.timestampLabel.size() <= 40
+        && data.citationsJson is string && data.citationsJson.size() <= 8000
+        && isValidTimestamp(data.createdAt)
+        && isValidTimestamp(data.updatedAt);
+    }
+
+    // --- Per-User, Per-Device Isolated Collections ---
+    match /users/{userId}/devices/{deviceId} {
+      allow list: if isOwner(userId);
+      allow get: if isOwner(userId) && isValidId(deviceId);
+
+      allow create: if isOwner(userId)
+        && isValidId(deviceId)
+        && incoming().keys().hasAll([
+          'deviceId', 'deviceModel', 'deviceManufacturer', 'apiKeysJson',
+          'activeApiKeyId', 'autoRotateApiKeys', 'liveModel', 'agentModel',
+          'textModel', 'deletedModels', 'verifyTaskCompletion', 'voiceName',
+          'voiceLanguage', 'speakerphoneOn', 'autoVisionDefaultOn',
+          'autoVisionIntervalSec', 'showTouchVisualizer', 'showFloatingCaptions',
+          'themeMode', 'customVoiceInstructions', 'autoChatMode',
+          'autoReplyDelivery', 'autoReplyPersona', 'sensitiveQuestionGuardEnabled',
+          'handsFreeVoiceEscalationEnabled', 'enabledMessagingApps',
+          'createdAt', 'updatedAt'
+        ])
+        && incoming().keys().hasOnly([
+          'deviceId', 'deviceModel', 'deviceManufacturer', 'apiKeysJson',
+          'activeApiKeyId', 'autoRotateApiKeys', 'liveModel', 'agentModel',
+          'textModel', 'deletedModels', 'verifyTaskCompletion', 'voiceName',
+          'voiceLanguage', 'speakerphoneOn', 'autoVisionDefaultOn',
+          'autoVisionIntervalSec', 'showTouchVisualizer', 'showFloatingCaptions',
+          'themeMode', 'customVoiceInstructions', 'autoChatMode',
+          'autoReplyDelivery', 'autoReplyPersona', 'sensitiveQuestionGuardEnabled',
+          'handsFreeVoiceEscalationEnabled', 'enabledMessagingApps',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidDeviceConfig(incoming(), deviceId);
+
+      allow update: if isOwner(userId)
+        && isValidId(deviceId)
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'deviceModel', 'deviceManufacturer', 'apiKeysJson',
+          'activeApiKeyId', 'autoRotateApiKeys', 'liveModel', 'agentModel',
+          'textModel', 'deletedModels', 'verifyTaskCompletion', 'voiceName',
+          'voiceLanguage', 'speakerphoneOn', 'autoVisionDefaultOn',
+          'autoVisionIntervalSec', 'showTouchVisualizer', 'showFloatingCaptions',
+          'themeMode', 'customVoiceInstructions', 'autoChatMode',
+          'autoReplyDelivery', 'autoReplyPersona', 'sensitiveQuestionGuardEnabled',
+          'handsFreeVoiceEscalationEnabled', 'enabledMessagingApps',
+          'updatedAt'
+        ])
+        && incoming().deviceId == existing().deviceId
+        && incoming().createdAt == existing().createdAt
+        && isValidDeviceConfig(incoming(), deviceId);
+
+      allow delete: if isOwner(userId) && isValidId(deviceId);
+
+      // Personal Data ('আমার ডাটা') scoped to this device
+      match /personalData/{entryId} {
+        allow list: if isOwner(userId) && isValidId(deviceId);
+        allow get: if isOwner(userId) && isValidId(deviceId) && isValidId(entryId);
+
+        allow create: if isOwner(userId)
+          && isValidId(deviceId)
+          && isValidId(entryId)
+          && incoming().keys().hasAll(['title', 'content', 'category', 'shareInAutoReply', 'createdAt', 'updatedAt'])
+          && incoming().keys().hasOnly(['title', 'content', 'category', 'shareInAutoReply', 'createdAt', 'updatedAt'])
+          && isValidPersonalData(incoming());
+
+        allow update: if isOwner(userId)
+          && isValidId(deviceId)
+          && isValidId(entryId)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'content', 'category', 'shareInAutoReply', 'updatedAt'])
+          && incoming().createdAt == existing().createdAt
+          && isValidPersonalData(incoming());
+
+        allow delete: if isOwner(userId) && isValidId(deviceId) && isValidId(entryId);
+      }
+
+      // Custom Routines scoped to this device
+      match /routines/{routineId} {
+        allow list: if isOwner(userId) && isValidId(deviceId);
+        allow get: if isOwner(userId) && isValidId(deviceId) && isValidId(routineId);
+
+        allow create: if isOwner(userId)
+          && isValidId(deviceId)
+          && isValidId(routineId)
+          && incoming().keys().hasAll(['title', 'subtitle', 'prompt', 'accent', 'createdAt', 'updatedAt'])
+          && incoming().keys().hasOnly(['title', 'subtitle', 'prompt', 'accent', 'createdAt', 'updatedAt'])
+          && isValidRoutine(incoming());
+
+        allow update: if isOwner(userId)
+          && isValidId(deviceId)
+          && isValidId(routineId)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'subtitle', 'prompt', 'accent', 'updatedAt'])
+          && incoming().createdAt == existing().createdAt
+          && isValidRoutine(incoming());
+
+        allow delete: if isOwner(userId) && isValidId(deviceId) && isValidId(routineId);
+      }
+
+      // Ask AI Messages scoped to this device
+      match /askAiMessages/{messageId} {
+        allow list: if isOwner(userId) && isValidId(deviceId);
+        allow get: if isOwner(userId) && isValidId(deviceId) && isValidId(messageId);
+
+        allow create: if isOwner(userId)
+          && isValidId(deviceId)
+          && isValidId(messageId)
+          && incoming().keys().hasAll(['clientId', 'senderRole', 'text', 'modelUsed', 'timestampLabel', 'citationsJson', 'createdAt', 'updatedAt'])
+          && incoming().keys().hasOnly(['clientId', 'senderRole', 'text', 'modelUsed', 'timestampLabel', 'citationsJson', 'createdAt', 'updatedAt'])
+          && isValidAskAiMessage(incoming());
+
+        allow update: if isOwner(userId)
+          && isValidId(deviceId)
+          && isValidId(messageId)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['text', 'modelUsed', 'timestampLabel', 'citationsJson', 'updatedAt'])
+          && incoming().clientId == existing().clientId
+          && incoming().senderRole == existing().senderRole
+          && incoming().createdAt == existing().createdAt
+          && isValidAskAiMessage(incoming());
+
+        allow delete: if isOwner(userId) && isValidId(deviceId) && isValidId(messageId);
+      }
+    }
+  }
+}

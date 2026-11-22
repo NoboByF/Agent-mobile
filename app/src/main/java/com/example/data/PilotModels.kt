@@ -62,6 +62,26 @@ data class PilotRoutine(
     val isBuiltIn: Boolean = false
 )
 
+data class PersonalDataItem(
+    val id: String,
+    val title: String,
+    val content: String,
+    val category: String = "পরিচয়",
+    val shareInAutoReply: Boolean = true,
+    val updatedAtMs: Long = System.currentTimeMillis()
+) {
+    companion object {
+        val CATEGORIES = listOf(
+            "পরিচয়",
+            "কাজ / পেশা",
+            "ঠিকানা / অফিস",
+            "সময়সূচি",
+            "সাধারণ উত্তর",
+            "অন্যান্য"
+        )
+    }
+}
+
 data class RecentToolEvent(
     val id: Long,
     val toolName: String,
@@ -141,7 +161,12 @@ data class IncomingMessageRecord(
     val timestampMs: Long,
     val formattedTime: String,
     val hasDirectReply: Boolean,
-    val autoRepliedText: String? = null
+    val autoRepliedText: String? = null,
+    val isSensitive: Boolean = false,
+    val sensitivityReason: String? = null,
+    val needsOwnerAnswer: Boolean = false,
+    val ownerQuestion: String? = null,
+    val ownerResolvedReply: String? = null
 )
 
 data class WebCitation(
@@ -149,11 +174,30 @@ data class WebCitation(
     val url: String
 )
 
+enum class AttachmentKind {
+    IMAGE,
+    VIDEO,
+    AUDIO,
+    DOCUMENT,
+    TEXT,
+    OTHER
+}
+
+data class ChatAttachmentMeta(
+    val id: String,
+    val displayName: String,
+    val mimeType: String,
+    val sizeBytes: Long = 0L,
+    val kind: AttachmentKind = AttachmentKind.OTHER,
+    val uriString: String = ""
+)
+
 data class AskAiMessage(
     val id: Long,
     val isUser: Boolean,
     val text: String,
     val citations: List<WebCitation> = emptyList(),
+    val attachments: List<ChatAttachmentMeta> = emptyList(),
     val modelUsed: String? = null,
     val timestamp: String
 )
@@ -265,6 +309,7 @@ data class PilotSettings(
     val liveModel: String = DEFAULT_LIVE_MODEL,
     val agentModel: String = DEFAULT_AGENT_MODEL,
     val textModel: String = DEFAULT_TEXT_MODEL,
+    val deletedModels: List<String> = emptyList(),
     val verifyTaskCompletion: Boolean = true,
     val voiceName: String = DEFAULT_VOICE,
     val voiceLanguage: VoiceLanguage = VoiceLanguage.BENGALI_BD,
@@ -278,6 +323,8 @@ data class PilotSettings(
     val autoChatMode: AutoChatMode = AutoChatMode.LIVE_VOICE_ALERT,
     val autoReplyDelivery: AutoReplyDelivery = AutoReplyDelivery.SILENT_DIRECT_REPLY,
     val autoReplyPersona: String = DEFAULT_AUTO_REPLY_PERSONA,
+    val sensitiveQuestionGuardEnabled: Boolean = true,
+    val handsFreeVoiceEscalationEnabled: Boolean = true,
     val enabledMessagingApps: Set<MessagingApp> = setOf(
         MessagingApp.IMO,
         MessagingApp.WHATSAPP,

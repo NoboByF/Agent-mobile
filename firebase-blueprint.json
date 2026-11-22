@@ -1,0 +1,134 @@
+{
+  "entities": {
+    "DeviceCloudConfig": {
+      "title": "DeviceCloudConfig",
+      "description": "Per-device isolated configuration, API key pool, model selections, deleted models, and voice/auto-chat preferences.",
+      "type": "object",
+      "properties": {
+        "deviceId": { "type": "string", "description": "Deterministic sanitized per-device identifier (manufacturer_model_hash)" },
+        "deviceModel": { "type": "string", "description": "Hardware device model name" },
+        "deviceManufacturer": { "type": "string", "description": "Hardware manufacturer name" },
+        "apiKeysJson": { "type": "string", "description": "Device-scoped JSON array of Gemini API keys (never shared across devices)" },
+        "activeApiKeyId": { "type": "string", "description": "Currently active API key entry ID for this device" },
+        "autoRotateApiKeys": { "type": "boolean", "description": "Whether multi-key auto failover is enabled" },
+        "liveModel": { "type": "string", "description": "Selected Gemini Live audio model ID" },
+        "agentModel": { "type": "string", "description": "Selected Gemini Vision/Action agent model ID" },
+        "textModel": { "type": "string", "description": "Selected Gemini text/auto-reply model ID" },
+        "deletedModels": { "type": "array", "items": { "type": "string" }, "description": "Model IDs hidden/deleted by user on this device" },
+        "verifyTaskCompletion": { "type": "boolean" },
+        "voiceName": { "type": "string" },
+        "voiceLanguage": { "type": "string" },
+        "speakerphoneOn": { "type": "boolean" },
+        "autoVisionDefaultOn": { "type": "boolean" },
+        "autoVisionIntervalSec": { "type": "number" },
+        "showTouchVisualizer": { "type": "boolean" },
+        "showFloatingCaptions": { "type": "boolean" },
+        "themeMode": { "type": "string" },
+        "customVoiceInstructions": { "type": "string" },
+        "autoChatMode": { "type": "string" },
+        "autoReplyDelivery": { "type": "string" },
+        "autoReplyPersona": { "type": "string" },
+        "sensitiveQuestionGuardEnabled": { "type": "boolean" },
+        "handsFreeVoiceEscalationEnabled": { "type": "boolean" },
+        "enabledMessagingApps": { "type": "array", "items": { "type": "string" } },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": [
+        "deviceId",
+        "deviceModel",
+        "deviceManufacturer",
+        "apiKeysJson",
+        "activeApiKeyId",
+        "autoRotateApiKeys",
+        "liveModel",
+        "agentModel",
+        "textModel",
+        "deletedModels",
+        "verifyTaskCompletion",
+        "voiceName",
+        "voiceLanguage",
+        "speakerphoneOn",
+        "autoVisionDefaultOn",
+        "autoVisionIntervalSec",
+        "showTouchVisualizer",
+        "showFloatingCaptions",
+        "themeMode",
+        "customVoiceInstructions",
+        "autoChatMode",
+        "autoReplyDelivery",
+        "autoReplyPersona",
+        "sensitiveQuestionGuardEnabled",
+        "handsFreeVoiceEscalationEnabled",
+        "enabledMessagingApps",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PersonalDataEntry": {
+      "title": "PersonalDataEntry",
+      "description": "User-saved personal facts ('আমার ডাটা') used by Auto-Chat and Voice AI when answering questions about the owner.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "description": "Short topic or label (e.g. আমার নাম, ঠিকানা, পেশা)" },
+        "content": { "type": "string", "description": "Detailed personal fact or preferred answer" },
+        "category": { "type": "string", "description": "Category label" },
+        "shareInAutoReply": { "type": "boolean", "description": "Allow Auto-Reply AI to share this fact when asked" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "content", "category", "shareInAutoReply", "createdAt", "updatedAt"]
+    },
+    "CloudRoutine": {
+      "title": "CloudRoutine",
+      "description": "User-authored custom voice automation routine scoped to this device.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "subtitle": { "type": "string" },
+        "prompt": { "type": "string" },
+        "accent": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["title", "subtitle", "prompt", "accent", "createdAt", "updatedAt"]
+    },
+    "CloudAskAiMessage": {
+      "title": "CloudAskAiMessage",
+      "description": "Saved Ask AI conversation message scoped to this device.",
+      "type": "object",
+      "properties": {
+        "clientId": { "type": "number" },
+        "senderRole": { "type": "string", "enum": ["user", "assistant"] },
+        "text": { "type": "string" },
+        "modelUsed": { "type": "string" },
+        "timestampLabel": { "type": "string" },
+        "citationsJson": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["clientId", "senderRole", "text", "modelUsed", "timestampLabel", "citationsJson", "createdAt", "updatedAt"]
+    }
+  },
+  "auth": {
+    "providers": ["google.com"]
+  },
+  "firestore": {
+    "/users/{userId}/devices/{deviceId}": {
+      "schema": { "$ref": "#/entities/DeviceCloudConfig" },
+      "description": "Device-isolated settings, API key pool, and deleted model list for a specific mobile device."
+    },
+    "/users/{userId}/devices/{deviceId}/personalData/{entryId}": {
+      "schema": { "$ref": "#/entities/PersonalDataEntry" },
+      "description": "Personal knowledge base entries ('আমার ডাটা') for this device."
+    },
+    "/users/{userId}/devices/{deviceId}/routines/{routineId}": {
+      "schema": { "$ref": "#/entities/CloudRoutine" },
+      "description": "Custom automation routines for this device."
+    },
+    "/users/{userId}/devices/{deviceId}/askAiMessages/{messageId}": {
+      "schema": { "$ref": "#/entities/CloudAskAiMessage" },
+      "description": "Saved Ask AI chat history messages for this device."
+    }
+  }
+}

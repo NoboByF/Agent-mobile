@@ -45,10 +45,11 @@ CONTINUOUS SCROLLING RULE:
 INCOMING MESSAGES & AUTO-CHAT:
 - When asked "কোনো মেসেজ আসছে?" or "check my messages", call read_recent_notifications(limit=5) to read recent imo, WhatsApp, Messenger, and Telegram messages aloud.
 - When you receive a [SYSTEM EVENT: New message on ...] notice, announce the sender and app in 1 short sentence and ask if the user wants to open the chat and reply.
-- If confirmed, call open_notification_chat(sender_or_app), inspect with get_screen_ui(), type with type_text(..., press_send=true), and confirm once sent.
+- When you receive an [URGENT SENSITIVE MESSAGE ESCALATION] notice, someone sent a sensitive/private/financial question and Auto-Chat already sent "আমি জেনে বলছি।". Immediately ask the phone owner clearly in Bengali what reply they want to send back. As soon as the user tells you the answer, call answer_sensitive_message(sender_or_app="...", owner_answer="...") to send their exact answer back to that contact!
+- If confirmed for a regular message, call open_notification_chat(sender_or_app), inspect with get_screen_ui(), type with type_text(..., press_send=true), and confirm once sent.
 
 SAFETY GUARDRAILS:
-- If any tool returns SAFETY_BLOCKED, stop immediately and politely inform the user by voice that protected financial, banking, authenticator, and password manager apps are blocked for their safety.
+- If any tool returns SAFETY_BLOCKED or NON_DESTRUCTIVE_GUARD, stop immediately and politely inform the user by voice that protected apps and destructive actions (delete/uninstall/reset/payment) are blocked for their safety.
 """
 
     fun buildLanguageLockHeader(language: VoiceLanguage): String = when (language) {
@@ -78,11 +79,22 @@ LANGUAGE & SPEECH LOCK — ENGLISH (en-US):
     ): String {
         val langHeader = buildLanguageLockHeader(voiceLanguage)
         val base = "$langHeader\n\n${LIVE_SYSTEM_INSTRUCTION.trim()}"
+        val personalFacts = com.example.data.PilotStateHub.personalData.value
+            .filter { it.title.isNotBlank() && it.content.isNotBlank() }
         val extra = customUserInstructions.trim()
-        return if (extra.isBlank()) {
-            base
-        } else {
-            "$base\n\nUSER PERSONAL PREFERENCES:\n$extra"
+        return buildString {
+            append(base)
+            if (personalFacts.isNotEmpty()) {
+                append("\n\nOWNER'S SAVED PERSONAL DATA (\"আমার ডাটা\"):\n")
+                personalFacts.take(25).forEach { fact ->
+                    append("- [").append(fact.category).append("] ")
+                        .append(fact.title).append(": ")
+                        .append(fact.content).append('\n')
+                }
+            }
+            if (extra.isNotBlank()) {
+                append("\n\nUSER PERSONAL PREFERENCES:\n").append(extra)
+            }
         }
     }
 
@@ -340,6 +352,18 @@ LANGUAGE & SPEECH LOCK — ENGLISH (en-US):
                     "sender_or_app" to prop("STRING", "Sender name (e.g. Rahim) or app name (e.g. imo, WhatsApp)")
                 ),
                 required = listOf("sender_or_app")
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "answer_sensitive_message",
+                description = "Forward the phone owner's approved answer to a pending sensitive incoming message (after Auto-Chat sent 'আমি জেনে বলছি।' and asked the owner).",
+                properties = mapOf(
+                    "sender_or_app" to prop("STRING", "Sender name or app name of the pending sensitive message (or empty string for the latest pending sensitive question)"),
+                    "owner_answer" to prop("STRING", "The exact polite reply approved by the phone owner to send back")
+                ),
+                required = listOf("sender_or_app", "owner_answer")
             )
         )
 

@@ -2,6 +2,9 @@ package com.example.ui.screens
 
 import android.content.Intent
 import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -21,6 +24,7 @@ import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
@@ -30,12 +34,21 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.PermMedia
 import androidx.compose.material.icons.filled.PhoneInTalk
+import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -58,6 +71,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -67,7 +81,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.ai.MediaAttachmentHelper
 import com.example.data.AskAiMessage
+import com.example.data.AttachmentKind
+import com.example.data.ChatAttachmentMeta
 import com.example.data.PilotSettings
 import com.example.ui.AskAiUiState
 import com.example.ui.components.StatusPillBadge
@@ -84,6 +101,8 @@ fun AskAiScreen(
     isCallActive: Boolean,
     onSelectTextModel: (String) -> Unit,
     onToggleSearchGrounding: (Boolean) -> Unit,
+    onAddAttachments: (List<Uri>) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onSendPrompt: (String) -> Unit,
     onSendToLiveCall: (String) -> Unit,
     onClearThread: () -> Unit
@@ -94,7 +113,22 @@ fun AskAiScreen(
     val context = LocalContext.current
     val clipboard = LocalClipboardManager.current
 
+    // Zero-permission Android Photo Picker (Photos & Videos) — Play Policy compliant
+    val mediaPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickMultipleVisualMedia(maxItems = 4)
+    ) { uris ->
+        if (uris.isNotEmpty()) onAddAttachments(uris)
+    }
+
+    // Zero-permission Storage Access Framework picker (PDF, Audio, Code, Text, Any File)
+    val documentPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris ->
+        if (uris.isNotEmpty()) onAddAttachments(uris)
+    }
+
     val selectableModels = rememberSelectableModels(settings.textModel)
+    val canSend = (inputText.isNotBlank() || uiState.pendingAttachments.isNotEmpty()) && !uiState.isGenerating
 
     LaunchedEffect(uiState.messages.size, uiState.isGenerating) {
         if (uiState.messages.isNotEmpty()) {
@@ -128,7 +162,7 @@ fun AskAiScreen(
                     color = palette.inkPrimary
                 )
                 Text(
-                    text = "Saved multi-turn chat + Google Search Grounding",
+                    text = "Photos, videos, PDFs, files & live Google Search",
                     style = MaterialTheme.typography.bodySmall,
                     color = palette.inkSecondary
                 )
@@ -278,13 +312,13 @@ fun AskAiScreen(
                 }
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Ask Anything with Live Search",
+                    text = "Ask Anything + Upload Files & Media",
                     style = MaterialTheme.typography.titleLarge,
                     color = palette.inkPrimary
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Ask in Bengali or English. Answers stay saved and can be pushed to your Live Call.",
+                    text = "ছবি, ভিডিও, PDF বা যেকোনো ফাইল আপলোড করে প্রশ্ন করুন — অথবা লাইভ গুগল সার্চ ব্যবহার করুন।",
                     style = MaterialTheme.typography.bodySmall,
                     color = palette.inkSecondary
                 )
@@ -357,7 +391,7 @@ fun AskAiScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = if (uiState.searchGroundingEnabled) {
+                                text = uiState.attachmentStatusText ?: if (uiState.searchGroundingEnabled) {
                                     "Searching Google & composing reply..."
                                 } else {
                                     "Thinking with ${settings.textModel}..."
@@ -371,18 +405,134 @@ fun AskAiScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
-        // Composer Bar
+        // Pending Attachment Preview Strip
+        if (uiState.pendingAttachments.isNotEmpty()) {
+            LazyRow(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(uiState.pendingAttachments, key = { it.id }) { att ->
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = palette.violetSoft,
+                        border = BorderStroke(1.dp, palette.violetAccent.copy(alpha = 0.35f))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = attachmentIcon(att.kind),
+                                contentDescription = att.kind.name,
+                                tint = palette.violetAccent,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Column(modifier = Modifier.widthIn(max = 150.dp)) {
+                                Text(
+                                    text = att.displayName,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = palette.inkPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                val sizeStr = MediaAttachmentHelper.formatFileSize(att.sizeBytes)
+                                if (sizeStr.isNotBlank()) {
+                                    Text(
+                                        text = "${att.kind.name} • $sizeStr",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = palette.inkSecondary
+                                    )
+                                }
+                            }
+                            IconButton(
+                                onClick = { onRemoveAttachment(att.id) },
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .testTag("remove_attachment_${att.id}")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Remove ${att.displayName}",
+                                    tint = palette.inkSecondary,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Composer Bar with Zero-Permission Photo/Video & File Upload Buttons
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
+            Surface(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .clickable(enabled = !uiState.isGenerating) {
+                        mediaPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)
+                        )
+                    }
+                    .testTag("ask_ai_pick_media_button"),
+                color = palette.surfaceSubtle,
+                border = BorderStroke(1.dp, palette.outline)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Filled.PermMedia,
+                        contentDescription = "Attach photos or videos",
+                        tint = palette.violetAccent,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            Surface(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .clickable(enabled = !uiState.isGenerating) {
+                        documentPickerLauncher.launch(arrayOf("*/*"))
+                    }
+                    .testTag("ask_ai_pick_file_button"),
+                color = palette.surfaceSubtle,
+                border = BorderStroke(1.dp, palette.outline)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Filled.AttachFile,
+                        contentDescription = "Attach files or documents",
+                        tint = palette.cobaltAccent,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
             OutlinedTextField(
                 value = inputText,
                 onValueChange = { inputText = it },
-                placeholder = { Text("Ask in Bengali or English...", color = palette.inkMuted) },
+                placeholder = {
+                    Text(
+                        text = if (uiState.pendingAttachments.isNotEmpty()) {
+                            "ফাইল সম্পর্কে প্রশ্ন লিখুন..."
+                        } else {
+                            "Ask or attach photo/video/file..."
+                        },
+                        color = palette.inkMuted,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
                 modifier = Modifier
                     .weight(1f)
                     .testTag("ask_ai_input"),
@@ -391,7 +541,7 @@ fun AskAiScreen(
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                 keyboardActions = KeyboardActions(
                     onSend = {
-                        if (inputText.isNotBlank() && !uiState.isGenerating) {
+                        if (canSend) {
                             val toSend = inputText
                             inputText = ""
                             onSendPrompt(toSend)
@@ -407,22 +557,22 @@ fun AskAiScreen(
             )
             Surface(
                 modifier = Modifier
-                    .size(52.dp)
+                    .size(50.dp)
                     .clip(CircleShape)
-                    .clickable(enabled = inputText.isNotBlank() && !uiState.isGenerating) {
+                    .clickable(enabled = canSend) {
                         val toSend = inputText
                         inputText = ""
                         onSendPrompt(toSend)
                     }
                     .testTag("ask_ai_send_button"),
-                color = if (inputText.isNotBlank() && !uiState.isGenerating) RoyalViolet else palette.surfaceSubtle
+                color = if (canSend) RoyalViolet else palette.surfaceSubtle
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send prompt",
-                        tint = if (inputText.isNotBlank() && !uiState.isGenerating) Color.White else palette.inkMuted,
-                        modifier = Modifier.size(22.dp)
+                        tint = if (canSend) Color.White else palette.inkMuted,
+                        modifier = Modifier.size(21.dp)
                     )
                 }
             }
@@ -457,6 +607,42 @@ private fun ChatMessageBubble(
             border = if (message.isUser) null else BorderStroke(1.dp, palette.outline)
         ) {
             Column(modifier = Modifier.padding(14.dp)) {
+                if (message.attachments.isNotEmpty()) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    ) {
+                        message.attachments.forEach { att ->
+                            Surface(
+                                shape = RoundedCornerShape(10.dp),
+                                color = if (message.isUser) Color.White.copy(alpha = 0.18f) else palette.violetSoft
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = attachmentIcon(att.kind),
+                                        contentDescription = att.kind.name,
+                                        tint = if (message.isUser) Color.White else palette.violetAccent,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = att.displayName,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (message.isUser) Color.White else palette.inkPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.widthIn(max = 140.dp)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
                 if (message.isUser) {
                     Text(
                         text = message.text,
@@ -614,9 +800,19 @@ private fun rememberSelectableModels(currentTextModel: String): List<String> {
     }
 }
 
+private fun attachmentIcon(kind: AttachmentKind): ImageVector = when (kind) {
+    AttachmentKind.IMAGE -> Icons.Filled.Image
+    AttachmentKind.VIDEO -> Icons.Filled.Videocam
+    AttachmentKind.AUDIO -> Icons.Filled.AudioFile
+    AttachmentKind.DOCUMENT -> Icons.Filled.PictureAsPdf
+    AttachmentKind.TEXT -> Icons.Filled.Description
+    AttachmentKind.OTHER -> Icons.AutoMirrored.Filled.InsertDriveFile
+}
+
 private fun modelChipLabel(modelId: String): String = when (modelId) {
-    "gemini-4-hydrogen" -> "Hydrogen (Search)"
-    "gemini-4-carbon" -> "Carbon (Deep)"
-    "gemini-3.1-flash-lite" -> "Flash-Lite (Fast)"
+    "gemini-2.5-flash" -> "2.5 Flash (Balanced)"
+    "gemini-2.5-pro" -> "2.5 Pro (Deep)"
+    "gemini-2.0-flash" -> "2.0 Flash"
+    "gemini-2.5-flash-lite" -> "2.5 Flash-Lite (Fast)"
     else -> modelId
 }
