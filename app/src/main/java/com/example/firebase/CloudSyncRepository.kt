@@ -14,8 +14,6 @@ import com.example.data.PilotSettings
 import com.example.data.RoutineAccent
 import com.example.data.VoiceLanguage
 import com.example.data.WebCitation
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.FirebaseFirestore
@@ -35,12 +33,11 @@ class CloudSyncRepository(context: Context) {
     private val appContext = context.applicationContext
     val deviceProfile: DeviceProfileIdentity = DeviceIdentityHelper.resolve(appContext)
 
-    private val db: FirebaseFirestore by lazy {
-        FirebaseFirestore.getInstance(appContext.getString(R.string.firestore_database_id))
-    }
+    private val db: FirebaseFirestore
+        get() = FirebaseRuntimeConfig.firestore(appContext)
 
     private fun requireUserId(): String =
-        Firebase.auth.currentUser?.uid
+        FirebaseRuntimeConfig.auth(appContext).currentUser?.uid
             ?: throw IllegalStateException("User must be signed in to access cloud storage")
 
     private fun accountConfigPath(uid: String): String =
@@ -107,7 +104,7 @@ class CloudSyncRepository(context: Context) {
         val uid = runCatching { requireUserId() }.getOrElse { return Result.failure(it) }
         val path = accountConfigPath(uid)
         return try {
-            val currentUser = Firebase.auth.currentUser
+            val currentUser = FirebaseRuntimeConfig.auth(appContext).currentUser
             val docRef = accountConfigRef(uid)
             val exists = docRef.get().await().exists()
             val serializedKeys = PilotPreferences.serializeApiKeysJson(settings.apiKeys).take(31500)

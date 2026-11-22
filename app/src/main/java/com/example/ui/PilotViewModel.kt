@@ -37,11 +37,10 @@ import com.example.data.RoutineAccent
 import com.example.data.VoiceLanguage
 import com.example.firebase.CloudSyncRepository
 import com.example.firebase.DeviceProfileIdentity
+import com.example.firebase.FirebaseRuntimeConfig
 import com.example.messaging.ChatModerationEngine
 import com.example.messaging.IncomingMessageListener
 import com.example.service.FloatingCallOverlayService
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -120,7 +119,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startCloudSyncIfAuthenticated() {
-        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+        val currentUser = runCatching { FirebaseRuntimeConfig.auth(getApplication()).currentUser }.getOrNull()
         if (currentUser == null) {
             _cloudSyncStatus.value = "লোকাল মোড চালু (অফলাইন সেভ) • ${deviceProfile.displayLabel}"
             return
@@ -215,7 +214,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun scheduleAccountConfigCloudSave(settingsSnapshot: PilotSettings) {
-        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull() ?: return
+        val currentUser = runCatching { FirebaseRuntimeConfig.auth(getApplication()).currentUser }.getOrNull() ?: return
         val accountLabel = currentUser.email?.takeIf { it.isNotBlank() } ?: "Firebase"
         pendingSettingsSyncJob?.cancel()
         pendingSettingsSyncJob = viewModelScope.launch {
@@ -231,7 +230,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun syncNowToCloud() {
-        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull() ?: return
+        val currentUser = runCatching { FirebaseRuntimeConfig.auth(getApplication()).currentUser }.getOrNull() ?: return
         val accountLabel = currentUser.email?.takeIf { it.isNotBlank() } ?: "Firebase"
         viewModelScope.launch {
             _cloudSyncStatus.value = "Syncing account data..."
@@ -268,7 +267,7 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             }
             _askAiState.update { it.copy(messages = restoredChat) }
             _bannerMessage.value = summary
-            if (runCatching { Firebase.auth.currentUser }.getOrNull() != null) {
+            if (runCatching { FirebaseRuntimeConfig.auth(getApplication()).currentUser }.getOrNull() != null) {
                 syncNowToCloud()
             }
         }.onFailure { err ->

@@ -1,6 +1,9 @@
 package com.example.ui.screens
 
+import android.content.Context
 import android.util.Log
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -28,20 +31,25 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -58,6 +66,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
@@ -67,19 +76,20 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.PilotStateHub
 import com.example.firebase.DeviceProfileIdentity
+import com.example.firebase.FirebaseRuntimeConfig
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.EmeraldGreen
 import com.example.ui.theme.StudioTheme
-import com.google.firebase.Firebase
+import com.example.ui.theme.WarmAmber
 import com.google.firebase.FirebaseNetworkException
 import com.google.firebase.auth.FirebaseAuthException
 import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.auth.FirebaseAuthUserCollisionException
 import com.google.firebase.auth.FirebaseAuthWeakPasswordException
-import com.google.firebase.auth.auth
 import com.google.firebase.auth.userProfileChangeRequest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
@@ -128,7 +138,12 @@ object AuthInputValidator {
 
     fun mapFirebaseAuthError(err: Throwable): String {
         val code = (err as? FirebaseAuthException)?.errorCode.orEmpty()
+        val msg = err.message.orEmpty()
         return when {
+            msg.contains("API key not valid", ignoreCase = true) ||
+                msg.contains("API_KEY_INVALID", ignoreCase = true) ||
+                msg.contains("CI_PLACEHOLDER", ignoreCase = true) ->
+                "এই APK-তে Firebase-এর আসল google-services.json যুক্ত নেই। উপরের \"google-services.json যুক্ত করুন\" বাটনে ক্লিক করে আপনার Firebase Console থেকে ডাউনলোড করা google-services.json ফাইল সিলেক্ট করুন (অথবা GitHub Secrets-এ GOOGLE_SERVICES_JSON যোগ করুন)।"
             err is FirebaseAuthUserCollisionException || code == "ERROR_EMAIL_ALREADY_IN_USE" ->
                 "এই জিমেইল দিয়ে আগে থেকেই অ্যাকাউন্ট তৈরি করা আছে। 'লগইন' ট্যাব থেকে লগইন করুন।"
             err is FirebaseAuthInvalidUserException || code == "ERROR_USER_NOT_FOUND" ->
@@ -143,7 +158,7 @@ object AuthInputValidator {
             err is FirebaseNetworkException ->
                 "ইন্টারনেট সংযোগ পাওয়া যাচ্ছে না। নেটওয়ার্ক চেক করে আবার চেষ্টা করুন।"
             code == "ERROR_OPERATION_NOT_ALLOWED" ->
-                "Firebase Console-এ Email/Password অপশন চালু আছে কিনা যাচাই করুন।"
+                "আপনার Firebase প্রোজেক্টের Authentication → Sign-in method থেকে Email/Password চালু আছে কিনা যাচাই করুন।"
             code == "ERROR_TOO_MANY_REQUESTS" ->
                 "অনেকবার ভুল চেষ্টা হয়েছে। কিছুক্ষণ পর আবার চেষ্টা করুন।"
             else ->
@@ -152,9 +167,9 @@ object AuthInputValidator {
     }
 }
 
-suspend fun signOutFromFirebase() {
+suspend fun signOutFromFirebase(context: Context) {
     withContext(NonCancellable) {
-        runCatching { Firebase.auth.signOut() }
+        runCatching { FirebaseRuntimeConfig.auth(context).signOut() }
     }
 }
 
@@ -163,8 +178,18 @@ fun AuthGateScreen(
     deviceProfile: DeviceProfileIdentity,
     onSignedIn: () -> Unit
 ) {
+    val context = LocalContext.current
     val palette = StudioTheme.colors
     val scope = rememberCoroutineScope()
+
+    val configRevision by FirebaseRuntimeConfig.configRevision.collectAsStateWithLifecycle()
+    val isFirebaseReady = remember(configRevision) { FirebaseRuntimeConfig.isReady(context) }
+    val activeProjectId = remember(configRevision) { FirebaseRuntimeConfig.activeProjectId(context) }
+    val isCustomFirebase = remember(configRevision) { FirebaseRuntimeConfig.isUsingCustomConfig(context) }
+
+    var showFirebaseConfigPanel by rememberSaveable(isFirebaseReady) { mutableStateOf(!isFirebaseReady) }
+    var pasteJsonExpanded by rememberSaveable { mutableStateOf(false) }
+    var pastedJsonDraft by rememberSaveable { mutableStateOf("") }
 
     var mode by rememberSaveable { mutableStateOf(AuthFormMode.LOGIN) }
     var accountName by rememberSaveable { mutableStateOf("") }
@@ -177,8 +202,43 @@ fun AuthGateScreen(
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var infoMessage by remember { mutableStateOf<String?>(null) }
 
+    fun applyImportedJson(rawJson: String) {
+        val result = FirebaseRuntimeConfig.importAndActivate(context, rawJson)
+        result.onSuccess { cfg ->
+            errorMessage = null
+            pastedJsonDraft = ""
+            pasteJsonExpanded = false
+            showFirebaseConfigPanel = false
+            infoMessage = "✓ Firebase প্রোজেক্ট \"${cfg.projectId}\" সফলভাবে যুক্ত হয়েছে! এখন জিমেইল ও পাসওয়ার্ড দিয়ে অ্যাকাউন্ট তৈরি বা লগইন করুন।"
+        }.onFailure { err ->
+            infoMessage = null
+            errorMessage = err.message ?: "সঠিক google-services.json ফাইল সিলেক্ট করুন।"
+        }
+    }
+
+    val pickGoogleServicesLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                ?: error("ফাইল পড়া সম্ভব হয়নি।")
+        }.onSuccess { rawJson ->
+            applyImportedJson(rawJson)
+        }.onFailure { err ->
+            errorMessage = "ফাইল পড়া ব্যর্থ: ${err.localizedMessage ?: "আবার চেষ্টা করুন"}"
+        }
+    }
+
     fun submitAuth() {
         if (isLoading) return
+        if (!FirebaseRuntimeConfig.isReady(context)) {
+            showFirebaseConfigPanel = true
+            errorMessage = "আগে উপরের \"google-services.json সিলেক্ট করুন\" বাটনে ক্লিক করে আপনার Firebase ফাইলটি যুক্ত করুন।"
+            infoMessage = null
+            return
+        }
+
         val cleanEmail = email.trim()
         val cleanName = accountName.trim().take(80)
 
@@ -198,14 +258,15 @@ fun AuthGateScreen(
             errorMessage = null
             infoMessage = null
             try {
+                val auth = FirebaseRuntimeConfig.auth(context)
                 if (mode == AuthFormMode.LOGIN) {
-                    Firebase.auth.signInWithEmailAndPassword(cleanEmail, password).await()
-                    val signedInName = Firebase.auth.currentUser?.displayName?.trim().orEmpty()
+                    auth.signInWithEmailAndPassword(cleanEmail, password).await()
+                    val signedInName = auth.currentUser?.displayName?.trim().orEmpty()
                     if (signedInName.isNotBlank() && PilotStateHub.settings.value.ownerDisplayName.isBlank()) {
                         PilotStateHub.updateSettings { it.copy(ownerDisplayName = signedInName.take(80)) }
                     }
                 } else {
-                    val result = Firebase.auth.createUserWithEmailAndPassword(cleanEmail, password).await()
+                    val result = auth.createUserWithEmailAndPassword(cleanEmail, password).await()
                     val user = result.user
                     if (user != null && cleanName.isNotBlank()) {
                         runCatching {
@@ -224,7 +285,11 @@ fun AuthGateScreen(
                 throw e
             } catch (e: Exception) {
                 Log.w("AuthGate", "Email/password auth failed: ${e.javaClass.simpleName}")
-                errorMessage = AuthInputValidator.mapFirebaseAuthError(e)
+                val mapped = AuthInputValidator.mapFirebaseAuthError(e)
+                if (e.message.orEmpty().contains("API key not valid", ignoreCase = true)) {
+                    showFirebaseConfigPanel = true
+                }
+                errorMessage = mapped
             } finally {
                 isLoading = false
             }
@@ -233,6 +298,11 @@ fun AuthGateScreen(
 
     fun sendPasswordReset() {
         if (isLoading) return
+        if (!FirebaseRuntimeConfig.isReady(context)) {
+            showFirebaseConfigPanel = true
+            errorMessage = "আগে উপরের কার্ড থেকে আপনার Firebase google-services.json ফাইলটি যুক্ত করুন।"
+            return
+        }
         val cleanEmail = email.trim()
         val err = AuthInputValidator.validateResetEmail(cleanEmail)
         if (err != null) {
@@ -245,7 +315,7 @@ fun AuthGateScreen(
             errorMessage = null
             infoMessage = null
             try {
-                Firebase.auth.sendPasswordResetEmail(cleanEmail).await()
+                FirebaseRuntimeConfig.auth(context).sendPasswordResetEmail(cleanEmail).await()
                 infoMessage = "✓ $cleanEmail ঠিকানায় পাসওয়ার্ড রিসেট লিংক পাঠানো হয়েছে। ইনবক্স বা স্প্যাম ফোল্ডার চেক করুন।"
             } catch (e: CancellationException) {
                 throw e
@@ -273,12 +343,12 @@ fun AuthGateScreen(
                 .fillMaxWidth()
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             // Brand Header
             Box(
                 modifier = Modifier
-                    .size(68.dp)
+                    .size(64.dp)
                     .clip(CircleShape)
                     .background(palette.cobaltSoft),
                 contentAlignment = Alignment.Center
@@ -287,7 +357,7 @@ fun AuthGateScreen(
                     imageVector = Icons.Filled.CloudDone,
                     contentDescription = "LivePilot AI Account",
                     tint = CobaltBlue,
-                    modifier = Modifier.size(34.dp)
+                    modifier = Modifier.size(32.dp)
                 )
             }
 
@@ -305,6 +375,165 @@ fun AuthGateScreen(
                     color = palette.inkSecondary,
                     textAlign = TextAlign.Center
                 )
+            }
+
+            // Firebase Project Status / One-Tap google-services.json Connector
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = if (isFirebaseReady) palette.card else palette.amberSoft,
+                border = BorderStroke(
+                    1.dp,
+                    if (isFirebaseReady) palette.outline else WarmAmber.copy(alpha = 0.7f)
+                )
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showFirebaseConfigPanel = !showFirebaseConfigPanel },
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = if (isFirebaseReady) Icons.Filled.CheckCircle else Icons.Filled.Warning,
+                                contentDescription = "Firebase config status",
+                                tint = if (isFirebaseReady) EmeraldGreen else WarmAmber,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = if (isFirebaseReady) {
+                                        "Firebase যুক্ত: $activeProjectId"
+                                    } else {
+                                        "Firebase কনফিগ (`google-services.json`) যুক্ত করুন"
+                                    },
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = palette.inkPrimary,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Text(
+                                    text = if (isFirebaseReady) {
+                                        if (isCustomFirebase) "আপনার ইম্পোর্ট করা Firebase প্রোজেক্ট চালু আছে" else "অ্যাপের বিল্ট-ইন Firebase কনফিগ চালু আছে"
+                                    } else {
+                                        "GitHub Actions APK-তে আসল google-services.json না থাকায় API key পাওয়া যায়নি।"
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.inkSecondary
+                                )
+                            }
+                        }
+                        Icon(
+                            imageVector = Icons.Filled.Settings,
+                            contentDescription = "Toggle Firebase config",
+                            tint = palette.inkSecondary,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+
+                    AnimatedVisibility(visible = showFirebaseConfigPanel) {
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Text(
+                                text = "Firebase Console → Project Settings → Your Apps থেকে google-services.json ডাউনলোড করে এখানে সিলেক্ট করুন (১ বার দিলেই স্থায়ীভাবে সেভ থাকবে):",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = palette.inkSecondary
+                            )
+                            Button(
+                                onClick = {
+                                    pickGoogleServicesLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(48.dp)
+                                    .testTag("auth_import_google_services_button"),
+                                shape = RoundedCornerShape(12.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = CobaltBlue,
+                                    contentColor = Color.White
+                                )
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.UploadFile,
+                                    contentDescription = "Select google-services.json",
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("google-services.json ফাইল সিলেক্ট করুন", fontWeight = FontWeight.SemiBold)
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                TextButton(
+                                    onClick = { pasteJsonExpanded = !pasteJsonExpanded },
+                                    modifier = Modifier.testTag("auth_toggle_paste_json_button")
+                                ) {
+                                    Text(
+                                        text = if (pasteJsonExpanded) "পেস্ট বক্স বন্ধ করুন" else "অথবা JSON টেক্সট পেস্ট করুন",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = CobaltBlue
+                                    )
+                                }
+                                if (isCustomFirebase && FirebaseRuntimeConfig.isBundledConfigValid(context)) {
+                                    TextButton(
+                                        onClick = {
+                                            FirebaseRuntimeConfig.clearCustomConfig(context)
+                                            infoMessage = "ডিফল্ট Firebase কনফিগে ফিরে যাওয়া হয়েছে।"
+                                        }
+                                    ) {
+                                        Text(
+                                            text = "ডিফল্টে ফিরুন",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = palette.roseAccent
+                                        )
+                                    }
+                                }
+                            }
+
+                            AnimatedVisibility(visible = pasteJsonExpanded) {
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedTextField(
+                                        value = pastedJsonDraft,
+                                        onValueChange = { pastedJsonDraft = it },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .testTag("auth_paste_google_services_input"),
+                                        minLines = 3,
+                                        maxLines = 6,
+                                        label = { Text("google-services.json এর পুরো টেক্সট পেস্ট করুন") },
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedContainerColor = palette.surfaceSubtle,
+                                            unfocusedContainerColor = palette.surfaceSubtle,
+                                            focusedBorderColor = CobaltBlue,
+                                            unfocusedBorderColor = palette.outline
+                                        )
+                                    )
+                                    OutlinedButton(
+                                        onClick = { applyImportedJson(pastedJsonDraft) },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(48.dp)
+                                            .testTag("auth_save_pasted_json_button"),
+                                        shape = RoundedCornerShape(12.dp)
+                                    ) {
+                                        Text("JSON সেভ ও কানেক্ট করুন", color = CobaltBlue, fontWeight = FontWeight.SemiBold)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // Main Email & Password Auth Card

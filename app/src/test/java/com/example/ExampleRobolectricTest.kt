@@ -722,6 +722,50 @@ class ExampleRobolectricTest {
         )
         assertNull(com.example.ui.screens.AuthInputValidator.validateResetEmail("fahim@gmail.com"))
         assertNotNull(com.example.ui.screens.AuthInputValidator.validateResetEmail("bad"))
+
+        val apiKeyErr = com.example.ui.screens.AuthInputValidator.mapFirebaseAuthError(
+            RuntimeException("An internal error has occurred. [ API key not valid. Please pass a valid API key. ]")
+        )
+        assertTrue(apiKeyErr.contains("google-services.json"))
+    }
+
+    @Test
+    fun `firebase runtime config parses real google-services json and rejects CI placeholders`() {
+        val sampleValid = """
+            {
+              "project_info": {
+                "project_id": "jorashop-12345",
+                "storage_bucket": "jorashop-12345.firebasestorage.app"
+              },
+              "client": [
+                {
+                  "client_info": {
+                    "mobilesdk_app_id": "1:1234567890:android:abcdef123456",
+                    "android_client_info": { "package_name": "com.aistudio.livepilotai.k7m2x9" }
+                  },
+                  "api_key": [{ "current_key": "AIzaSyTestRuntimeFirebaseKey1234567890" }]
+                }
+              ]
+            }
+        """.trimIndent()
+
+        val parsed = com.example.firebase.FirebaseRuntimeConfig.parseGoogleServicesJson(
+            rawJson = sampleValid,
+            targetPackage = "com.aistudio.livepilotai.k7m2x9",
+            defaultAiStudioDbId = "ai-studio-db"
+        ).getOrThrow()
+        assertEquals("jorashop-12345", parsed.projectId)
+        assertEquals("1:1234567890:android:abcdef123456", parsed.applicationId)
+        assertEquals("(default)", parsed.databaseId)
+
+        val placeholderJson = sampleValid
+            .replace("jorashop-12345", "livepilot-ci-placeholder")
+            .replace("AIzaSyTestRuntimeFirebaseKey1234567890", "CI_PLACEHOLDER_ADD_GOOGLE_SERVICES_JSON_SECRET")
+        val failed = com.example.firebase.FirebaseRuntimeConfig.parseGoogleServicesJson(
+            rawJson = placeholderJson,
+            targetPackage = "com.aistudio.livepilotai.k7m2x9"
+        )
+        assertTrue(failed.isFailure)
     }
 }
 

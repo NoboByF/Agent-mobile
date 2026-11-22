@@ -215,7 +215,7 @@ jobs:
             echo "- **Certificate SHA-256:** \`${{ steps.prepare-keystore.outputs.sha256 }}\`"
             if [ "${{ steps.prepare-firebase.outputs.is_placeholder }}" = "true" ]; then
               echo ""
-              echo "> **Ready to Install:** This Release APK works immediately without login or secrets (all API keys, My Data, and settings are saved locally with 1-tap JSON backup/restore). Optional: add \`GOOGLE_SERVICES_JSON\` secret + SHA-1 in Firebase Console only if you also want cloud sync."
+              echo "> **Action Required for Firebase Login & Cloud Sync:** \`GOOGLE_SERVICES_JSON\` GitHub Secret is not set yet, so a compile-only placeholder was used. Add your Firebase \`google-services.json\` to **Settings → Secrets and variables → Actions → \`GOOGLE_SERVICES_JSON\`** (or select your \`google-services.json\` file directly inside the app's login screen)."
             fi
             if [ "${{ steps.prepare-keystore.outputs.newly_generated }}" = "true" ]; then
               echo ""

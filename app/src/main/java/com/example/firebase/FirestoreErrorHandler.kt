@@ -1,8 +1,6 @@
 package com.example.firebase
 
 import android.util.Log
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -22,7 +20,7 @@ object FirestoreErrorHandler {
         operationType: OperationType,
         path: String?
     ) {
-        val currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+        val currentUser = FirebaseRuntimeConfig.currentUserOrNull()
         val providerArray = JSONArray()
         currentUser?.providerData?.forEach { info ->
             providerArray.put(

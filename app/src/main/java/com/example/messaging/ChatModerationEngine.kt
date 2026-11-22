@@ -2,8 +2,7 @@ package com.example.messaging
 
 import com.example.data.PersonalDataItem
 import com.example.data.PilotSettings
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
+import com.example.firebase.FirebaseRuntimeConfig
 import java.util.concurrent.ConcurrentHashMap
 
 enum class ModerationAction {
@@ -292,7 +291,7 @@ object ChatModerationEngine {
         val explicit = settings.ownerDisplayName.trim()
         if (explicit.isNotBlank()) return explicit
 
-        val firebaseUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+        val firebaseUser = FirebaseRuntimeConfig.currentUserOrNull()
         val fbName = firebaseUser?.displayName?.trim().orEmpty()
         if (fbName.isNotBlank()) return fbName
 

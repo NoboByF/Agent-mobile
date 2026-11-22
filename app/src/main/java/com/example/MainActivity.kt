@@ -67,6 +67,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.data.PilotRoutine
 import com.example.data.PilotStateHub
 import com.example.firebase.DeviceIdentityHelper
+import com.example.firebase.FirebaseRuntimeConfig
 import com.example.ui.PilotViewModel
 import com.example.ui.components.FloatingPilotBottomBar
 import com.example.ui.components.PilotTab
@@ -79,9 +80,7 @@ import com.example.ui.screens.signOutFromFirebase
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.LivePilotTheme
 import com.example.ui.theme.StudioTheme
-import com.google.firebase.Firebase
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.auth.auth
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -128,15 +127,16 @@ private fun LivePilotAppEntry(
     val context = LocalContext.current
     PilotStateHub.ensureInitialized(context.applicationContext)
     val hubSettings by PilotStateHub.settings.collectAsStateWithLifecycle()
+    val firebaseConfigRev by FirebaseRuntimeConfig.configRevision.collectAsStateWithLifecycle()
     val deviceProfile = remember(context) { DeviceIdentityHelper.resolve(context) }
     val appScope = rememberCoroutineScope()
 
-    var currentUser by remember {
-        mutableStateOf(runCatching { Firebase.auth.currentUser }.getOrNull())
+    var currentUser by remember(firebaseConfigRev) {
+        mutableStateOf(runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull())
     }
 
-    DisposableEffect(Unit) {
-        val auth = runCatching { Firebase.auth }.getOrNull()
+    DisposableEffect(firebaseConfigRev) {
+        val auth = runCatching { FirebaseRuntimeConfig.auth(context) }.getOrNull()
         val listener = FirebaseAuth.AuthStateListener { firebaseAuth ->
             currentUser = firebaseAuth.currentUser
         }
@@ -161,11 +161,11 @@ private fun LivePilotAppEntry(
             AuthGateScreen(
                 deviceProfile = deviceProfile,
                 onSignedIn = {
-                    currentUser = runCatching { Firebase.auth.currentUser }.getOrNull()
+                    currentUser = runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull()
                 }
             )
         } else {
-            val sessionKey = signedInUser.uid
+            val sessionKey = "${firebaseConfigRev}_${signedInUser.uid}"
             key(sessionKey) {
                 val scopedViewModel: PilotViewModel = viewModel(key = sessionKey)
                 LivePilotAppRoot(
@@ -175,7 +175,7 @@ private fun LivePilotAppEntry(
                     isCloudSignedIn = true,
                     onSignOut = {
                         appScope.launch {
-                            signOutFromFirebase()
+                            signOutFromFirebase(context)
                             currentUser = null
                         }
                     },
