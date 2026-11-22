@@ -35,12 +35,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import kotlin.coroutines.coroutineContext
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -506,15 +508,21 @@ class PilotAccessibilityService : AccessibilityService() {
             .put("elements", elements)
     }
 
-    suspend fun captureScreenVisionAndStream(): JSONObject {
-        checkSafetyGuardrail()?.let { return it }
+    /**
+     * Captures the current screen as a JPEG byte array, hiding our floating overlay briefly.
+     * When [withCoordinateGrid] is true, draws a subtle 0..1000 coordinate ruler grid onto the
+     * in-memory JPEG copy (never shown on screen) so Gemini Vision targets coordinates accurately.
+     */
+    suspend fun captureVisionJpegBytes(
+        withCoordinateGrid: Boolean = true,
+        maxWidth: Int = 896
+    ): ByteArray? {
+        if (SafetyGuardrails.isPackageBlocked(currentForegroundPackage())) return null
 
-        val dm = resources.displayMetrics
         val controller = PilotStateHub.activeController
-
         controller?.setOverlayTemporarilyHidden(true)
-        val jpegBytes = try {
-            delay(110)
+        return try {
+            delay(115)
 
             val jpegResult = CompletableDeferred<ByteArray?>()
             try {
@@ -534,12 +542,20 @@ class PilotAccessibilityService : AccessibilityService() {
                                 val softBitmap = rawBitmap.copy(Bitmap.Config.ARGB_8888, false)
                                 rawBitmap.recycle()
 
-                                val scaled = scaleBitmapToMaxWidth(softBitmap, 768)
+                                val scaled = scaleBitmapToMaxWidth(softBitmap, maxWidth)
                                 if (scaled !== softBitmap) softBitmap.recycle()
 
+                                val finalBitmap = if (withCoordinateGrid) {
+                                    val gridded = DrawingGestureHelper.drawCoordinateGridOverlay(scaled)
+                                    scaled.recycle()
+                                    gridded
+                                } else {
+                                    scaled
+                                }
+
                                 val baos = ByteArrayOutputStream()
-                                scaled.compress(Bitmap.CompressFormat.JPEG, 70, baos)
-                                scaled.recycle()
+                                finalBitmap.compress(Bitmap.CompressFormat.JPEG, 74, baos)
+                                finalBitmap.recycle()
                                 jpegResult.complete(baos.toByteArray())
                             } catch (t: Throwable) {
                                 PilotStateHub.log(LogLevel.ERROR, "Vision", "Bitmap encode error: ${t.message}")
@@ -564,6 +580,14 @@ class PilotAccessibilityService : AccessibilityService() {
         } finally {
             controller?.setOverlayTemporarilyHidden(false)
         }
+    }
+
+    suspend fun captureScreenVisionAndStream(): JSONObject {
+        checkSafetyGuardrail()?.let { return it }
+
+        val dm = resources.displayMetrics
+        val controller = PilotStateHub.activeController
+        val jpegBytes = captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 768)
 
         if (jpegBytes == null) {
             return JSONObject()
@@ -578,7 +602,7 @@ class PilotAccessibilityService : AccessibilityService() {
             .put("screen_width", dm.widthPixels)
             .put("screen_height", dm.heightPixels)
             .put("jpeg_kb", jpegBytes.size / 1024)
-            .put("note", "Screenshot streamed into live vision context. Use exact screen_width/screen_height coordinates for taps and drags.")
+            .put("note", "Screenshot streamed with 0..1000 coordinate ruler overlay. For drawing or complex multi-step tasks, prefer start_autonomous_task or draw_strokes.")
     }
 
     fun startContinuousScroll(direction: String, speed: String): JSONObject {
@@ -698,12 +722,18 @@ class PilotAccessibilityService : AccessibilityService() {
     ): JSONObject {
         checkSafetyGuardrail()?.let { return it }
         val dur = durationMs.coerceIn(150, 3000).toLong()
+        val controller = PilotStateHub.activeController
         emitTouchRipple(startX, startY, "Drag")
         val path = Path().apply {
             moveTo(startX.toFloat(), startY.toFloat())
             lineTo(endX.toFloat(), endY.toFloat())
         }
-        val ok = dispatchPathGesture(path, dur)
+        val ok = try {
+            controller?.setOverlayPassThrough(true)
+            dispatchPathGesture(path, dur)
+        } finally {
+            controller?.setOverlayPassThrough(false)
+        }
         emitTouchRipple(endX, endY, "")
         PilotStateHub.log(LogLevel.TOOL, "Drag", "($startX,$startY)->($endX,$endY) ${dur}ms ok=$ok")
         return JSONObject()
@@ -711,6 +741,209 @@ class PilotAccessibilityService : AccessibilityService() {
             .put("from", "$startX,$startY")
             .put("to", "$endX,$endY")
             .put("duration_ms", dur)
+    }
+
+    /**
+     * Dispatches a multi-stroke freehand drawing sequence using smooth quadratic Bezier Paths.
+     * Checks SafetyGuardrails and coroutine cancellation before every stroke.
+     */
+    suspend fun dispatchDrawStrokes(
+        strokes: List<DrawStrokeSpec>,
+        normalizedSpace: Boolean = true,
+        canvasBoundsNorm: IntArray? = null,
+        onStrokeProgress: ((completed: Int, total: Int, label: String) -> Unit)? = null
+    ): JSONObject {
+        checkSafetyGuardrail()?.let { return it }
+        if (strokes.isEmpty()) {
+            return JSONObject().put("status", "error").put("message", "No valid drawing strokes provided.")
+        }
+
+        val dm = resources.displayMetrics
+        val controller = PilotStateHub.activeController
+        var completed = 0
+        var failed = 0
+        val total = strokes.size
+
+        for ((idx, stroke) in strokes.withIndex()) {
+            coroutineContext.ensureActive()
+            checkSafetyGuardrail()?.let { blocked ->
+                return blocked.put("completed_strokes", completed)
+            }
+
+            val screenPts = stroke.points.map { (x, y) ->
+                DrawingGestureHelper.mapPointToScreen(
+                    x = x,
+                    y = y,
+                    screenWidth = dm.widthPixels,
+                    screenHeight = dm.heightPixels,
+                    normalizedSpace = normalizedSpace,
+                    canvasBoundsNorm = canvasBoundsNorm
+                )
+            }
+            if (screenPts.isEmpty()) continue
+
+            val path = DrawingGestureHelper.buildSmoothAndroidPath(screenPts)
+            val durMs = DrawingGestureHelper.computeRecommendedDurationMs(screenPts, stroke.durationMs)
+            val label = stroke.label.ifBlank { "Stroke ${idx + 1}" }
+            onStrokeProgress?.invoke(idx + 1, total, label)
+
+            val ok = try {
+                controller?.setOverlayPassThrough(true)
+                dispatchPathGesture(path, durMs)
+            } finally {
+                controller?.setOverlayPassThrough(false)
+            }
+
+            if (ok) completed++ else failed++
+            // Small natural lift pause between strokes so web/native canvases separate strokes cleanly
+            delay(55L)
+        }
+
+        PilotStateHub.log(
+            LogLevel.TOOL,
+            "DrawStrokes",
+            "Completed $completed/$total strokes (failed=$failed)"
+        )
+        return JSONObject()
+            .put("status", if (completed > 0) "ok" else "error")
+            .put("completed_strokes", completed)
+            .put("total_strokes", total)
+            .put("failed_strokes", failed)
+    }
+
+    suspend fun clickNormalized(nx: Int, ny: Int, label: String = "Tap"): JSONObject {
+        checkSafetyGuardrail()?.let { return it }
+        val dm = resources.displayMetrics
+        val (px, py) = DrawingGestureHelper.mapPointToScreen(
+            x = nx.toFloat(),
+            y = ny.toFloat(),
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            normalizedSpace = true
+        )
+        val controller = PilotStateHub.activeController
+        emitTouchRipple(px.toInt(), py.toInt(), label)
+        val ok = try {
+            controller?.setOverlayPassThrough(true)
+            dispatchTapGesture(px, py, 65L)
+        } finally {
+            controller?.setOverlayPassThrough(false)
+        }
+        PilotStateHub.log(LogLevel.TOOL, "ClickNorm", "($nx,$ny) -> (${px.toInt()},${py.toInt()}) ok=$ok")
+        return JSONObject()
+            .put("status", if (ok) "ok" else "error")
+            .put("x", px.toInt())
+            .put("y", py.toInt())
+    }
+
+    suspend fun longPressNormalized(nx: Int, ny: Int, durationMs: Int = 700): JSONObject {
+        val dm = resources.displayMetrics
+        val (px, py) = DrawingGestureHelper.mapPointToScreen(
+            x = nx.toFloat(),
+            y = ny.toFloat(),
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            normalizedSpace = true
+        )
+        return longPress(px.toInt(), py.toInt(), durationMs)
+    }
+
+    suspend fun dragNormalized(
+        startNx: Int,
+        startNy: Int,
+        endNx: Int,
+        endNy: Int,
+        durationMs: Int = 420
+    ): JSONObject {
+        val dm = resources.displayMetrics
+        val (sx, sy) = DrawingGestureHelper.mapPointToScreen(
+            x = startNx.toFloat(),
+            y = startNy.toFloat(),
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            normalizedSpace = true
+        )
+        val (ex, ey) = DrawingGestureHelper.mapPointToScreen(
+            x = endNx.toFloat(),
+            y = endNy.toFloat(),
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            normalizedSpace = true
+        )
+        return dragGesture(sx.toInt(), sy.toInt(), ex.toInt(), ey.toInt(), durationMs)
+    }
+
+    suspend fun typeTextNormalized(
+        nx: Int,
+        ny: Int,
+        text: String,
+        pressSend: Boolean
+    ): JSONObject {
+        val dm = resources.displayMetrics
+        val (px, py) = DrawingGestureHelper.mapPointToScreen(
+            x = nx.toFloat(),
+            y = ny.toFloat(),
+            screenWidth = dm.widthPixels,
+            screenHeight = dm.heightPixels,
+            normalizedSpace = true
+        )
+        return typeText(index = -1, x = px.toInt(), y = py.toInt(), text = text, pressSend = pressSend)
+    }
+
+    suspend fun pinchZoomNormalized(
+        centerNx: Int,
+        centerNy: Int,
+        zoomIn: Boolean,
+        spreadNorm: Int = 180,
+        durationMs: Int = 420
+    ): JSONObject {
+        checkSafetyGuardrail()?.let { return it }
+        val dm = resources.displayMetrics
+        val cx = (centerNx.coerceIn(150, 850) / 1000f) * dm.widthPixels
+        val cy = (centerNy.coerceIn(150, 850) / 1000f) * dm.heightPixels
+        val halfMin = (dm.widthPixels * 0.05f)
+        val halfMax = (dm.widthPixels * (spreadNorm.coerceIn(80, 360) / 1000f))
+        val dur = durationMs.coerceIn(220, 1200).toLong()
+
+        val startOffset = if (zoomIn) halfMin else halfMax
+        val endOffset = if (zoomIn) halfMax else halfMin
+
+        val path1 = Path().apply {
+            moveTo((cx - startOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
+            lineTo((cx - endOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
+        }
+        val path2 = Path().apply {
+            moveTo((cx + startOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
+            lineTo((cx + endOffset).coerceIn(10f, dm.widthPixels - 10f), cy)
+        }
+
+        val controller = PilotStateHub.activeController
+        val ok = try {
+            controller?.setOverlayPassThrough(true)
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path1, 0L, dur))
+                .addStroke(GestureDescription.StrokeDescription(path2, 0L, dur))
+                .build()
+            val deferred = CompletableDeferred<Boolean>()
+            val dispatched = dispatchGesture(
+                gesture,
+                object : GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        deferred.complete(true)
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        deferred.complete(false)
+                    }
+                },
+                null
+            )
+            if (!dispatched) false else (withTimeoutOrNull(dur + 2000L) { deferred.await() } ?: false)
+        } finally {
+            controller?.setOverlayPassThrough(false)
+        }
+        PilotStateHub.log(LogLevel.TOOL, "PinchZoom", "zoomIn=$zoomIn at ($centerNx,$centerNy) ok=$ok")
+        return JSONObject().put("status", if (ok) "ok" else "error").put("zoom_in", zoomIn)
     }
 
     suspend fun typeText(

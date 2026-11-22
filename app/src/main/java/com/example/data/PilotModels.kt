@@ -14,6 +14,7 @@ enum class AgentActivity {
     LISTENING,
     SPEAKING,
     EXECUTING_TOOL,
+    AUTONOMOUS_TASK,
     SCROLLING,
     MUTED
 }
@@ -233,6 +234,8 @@ data class LiveSessionState(
     val isSpeakerOn: Boolean = true,
     val isScrollingActive: Boolean = false,
     val isAutoVisionActive: Boolean = false,
+    val isAutonomousTaskRunning: Boolean = false,
+    val autonomousTaskProgress: String? = null,
     val micLevel: Float = 0f,
     val aiAudioLevel: Float = 0f,
     val callStartedAtMs: Long? = null,

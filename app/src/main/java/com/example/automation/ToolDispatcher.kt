@@ -26,6 +26,7 @@ class ToolDispatcher(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val autonomousEngine = AutonomousTaskEngine(appContext, liveClientProvider)
 
     fun dispatchCalls(calls: List<LiveToolCall>) {
         for (call in calls) {
@@ -56,14 +57,24 @@ class ToolDispatcher(
         PilotAccessibilityService.instance?.stopContinuousScroll()
     }
 
-    fun cancelAllActiveActions() {
+    fun cancelAllActiveActions(includeAutonomous: Boolean = false) {
         activeJobs.values.forEach { it.cancel() }
         activeJobs.clear()
         PilotAccessibilityService.instance?.stopContinuousScroll()
+        if (includeAutonomous) {
+            autonomousEngine.stopTask("Emergency STOP pressed")
+        }
     }
 
+    fun stopAutonomousTask(reason: String = "Stopped by user") {
+        autonomousEngine.stopTask(reason)
+    }
+
+    fun isAutonomousTaskRunning(): Boolean = autonomousEngine.isRunning()
+
     fun shutdown() {
-        cancelAllActiveActions()
+        cancelAllActiveActions(includeAutonomous = true)
+        autonomousEngine.shutdown()
         scope.cancel()
     }
 
@@ -157,6 +168,23 @@ class ToolDispatcher(
                 )
             }
 
+            "start_autonomous_task" -> {
+                autonomousEngine.startTask(
+                    goal = args.optString("goal", ""),
+                    rawMode = args.optString("mode", "AUTO")
+                )
+            }
+
+            "update_autonomous_task" -> {
+                autonomousEngine.updateInstruction(
+                    instruction = args.optString("instruction", "")
+                )
+            }
+
+            "stop_autonomous_task" -> {
+                autonomousEngine.stopTask("Stopped by voice command")
+            }
+
             else -> null
         }
 
@@ -224,6 +252,30 @@ class ToolDispatcher(
                 )
                 "navigate" -> service.navigateGlobal(args.optString("action", "BACK"))
                 "open_notification_chat" -> service.openNotificationChat(args.optString("sender_or_app", ""))
+                "draw_strokes" -> {
+                    val left = args.optInt("canvas_left", 0)
+                    val top = args.optInt("canvas_top", 0)
+                    val right = args.optInt("canvas_right", 1000)
+                    val bottom = args.optInt("canvas_bottom", 1000)
+                    val box = if (right > left + 20 && bottom > top + 20) {
+                        intArrayOf(left, top, right, bottom)
+                    } else {
+                        null
+                    }
+                    val strokes = DrawingGestureHelper.parseStrokesFromJson(args.optString("strokes_json", ""))
+                    service.dispatchDrawStrokes(
+                        strokes = strokes,
+                        normalizedSpace = true,
+                        canvasBoundsNorm = box
+                    ) { done, total, lbl ->
+                        PilotStateHub.updateSession {
+                            it.copy(
+                                activity = AgentActivity.AUTONOMOUS_TASK,
+                                statusTicker = "🎨 $done/$total: $lbl"
+                            )
+                        }
+                    }
+                }
                 else -> JSONObject()
                     .put("status", "error")
                     .put("message", "Unknown tool: ${call.name}")
@@ -235,7 +287,7 @@ class ToolDispatcher(
             JSONObject().put("status", "error").put("message", err.message ?: "Tool execution failed")
         }
 
-        if (call.name != "start_continuous_scroll") {
+        if (call.name != "start_continuous_scroll" && !autonomousEngine.isRunning()) {
             restoreListeningState()
         }
         return result
@@ -282,6 +334,7 @@ class ToolDispatcher(
     }
 
     private fun restoreListeningState() {
+        if (autonomousEngine.isRunning()) return
         PilotStateHub.updateSession {
             it.copy(
                 activity = if (it.isMuted) AgentActivity.MUTED else AgentActivity.LISTENING,
@@ -312,6 +365,10 @@ class ToolDispatcher(
         "navigate" -> "Navigating ${call.args.optString("action", "")}..."
         "device_control" -> "Control: ${call.args.optString("action", "")}"
         "open_notification_chat" -> "Opening ${call.args.optString("sender_or_app", "chat")}..."
+        "start_autonomous_task" -> "🤖 Starting autonomous task..."
+        "update_autonomous_task" -> "🤖 Updating task..."
+        "stop_autonomous_task" -> "Stopping autonomous task..."
+        "draw_strokes" -> "🎨 Drawing strokes..."
         "wait_ms" -> "Waiting..."
         else -> "Executing ${call.name}..."
     }
@@ -337,6 +394,10 @@ class ToolDispatcher(
         "navigate" -> "Nav ${call.args.optString("action", "")}"
         "device_control" -> call.args.optString("action", "Device Control")
         "open_notification_chat" -> "Opened Chat"
+        "start_autonomous_task" -> "AutoPilot: ${call.args.optString("goal", "Task").take(20)}"
+        "update_autonomous_task" -> "Updated AutoPilot"
+        "stop_autonomous_task" -> "Stopped AutoPilot"
+        "draw_strokes" -> "Drew Vector Strokes"
         else -> call.name
     }
 }

@@ -7,6 +7,9 @@ import com.example.ai.ApiKeyPoolManager
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.ai.GeminiToolSchemas
+import com.example.automation.AutonomousMode
+import com.example.automation.AutonomousTaskEngine
+import com.example.automation.DrawingGestureHelper
 import com.example.data.AppThemeMode
 import com.example.data.AskAiMessage
 import com.example.data.GeminiApiKeyEntry
@@ -69,7 +72,7 @@ class ExampleRobolectricTest {
         assertTrue(systemText.contains("Speak short Bengali"))
 
         val declarations = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
-        assertEquals(22, declarations.length())
+        assertEquals(26, declarations.length())
     }
 
     @Test
@@ -255,5 +258,44 @@ class ExampleRobolectricTest {
         )
         assertEquals("model", contents.getJSONObject(1).getString("role"))
         assertEquals("user", contents.getJSONObject(2).getString("role"))
+    }
+
+    @Test
+    fun `autonomous mode resolves Bengali and English drawing vs workflow goals accurately`() {
+        assertEquals(AutonomousMode.DRAWING, AutonomousTaskEngine.resolveMode("এখানে একটি পাখির ছবি আকেন", "AUTO"))
+        assertEquals(AutonomousMode.DRAWING, AutonomousTaskEngine.resolveMode("Draw a bird on this canvas", "AUTO"))
+        assertEquals(AutonomousMode.UI_WORKFLOW, AutonomousTaskEngine.resolveMode("Open Chrome and fill out the registration form", "AUTO"))
+        assertEquals(AutonomousMode.DRAWING, AutonomousTaskEngine.resolveMode("Anything", "DRAWING"))
+    }
+
+    @Test
+    fun `drawing helper parses curved stroke JSON and maps canvas coordinates safely`() {
+        val json = """
+            [
+              {"label": "Head", "points": [[400, 300], [500, 220], [600, 300]]},
+              {"label": "Eye", "points": [[520, 260]]}
+            ]
+        """.trimIndent()
+        val strokes = DrawingGestureHelper.parseStrokesFromJson(json)
+        assertEquals(2, strokes.size)
+        assertEquals("Head", strokes[0].label)
+        assertEquals(3, strokes[0].points.size)
+        assertEquals(1, strokes[1].points.size)
+
+        // Canvas box [350, 500, 730, 600] on 1080x2400 screen -> center (500,500) maps inside box
+        val (px, py) = DrawingGestureHelper.mapPointToScreen(
+            x = 500f,
+            y = 500f,
+            screenWidth = 1080,
+            screenHeight = 2400,
+            normalizedSpace = true,
+            canvasBoundsNorm = intArrayOf(350, 500, 730, 600)
+        )
+        assertTrue(px in 570f..600f)
+        assertTrue(py in 1300f..1340f)
+
+        val cleanedJson = GeminiRestClient.extractCleanJsonObject("```json\n{\"done\": true, \"action\": \"CLICK\"}\n```")
+        assertTrue(cleanedJson.getBoolean("done"))
+        assertEquals("CLICK", cleanedJson.getString("action"))
     }
 }

@@ -1,5 +1,6 @@
 package com.example.ai
 
+import android.util.Base64
 import com.example.data.AskAiMessage
 import com.example.data.DiscoveredModel
 import com.example.data.GeminiApiKeyEntry
@@ -412,6 +413,120 @@ object GeminiRestClient {
             }
         }
         return seen.values.take(6)
+    }
+
+    /**
+     * Multimodal Vision + Structured JSON call for AutonomousTaskEngine (screen understanding,
+     * multi-step UI planning, and multi-stroke vector drawing) with automatic Multi-Key failover.
+     */
+    suspend fun generateVisionJson(
+        apiKey: String = "",
+        modelId: String,
+        systemPrompt: String,
+        userPrompt: String,
+        jpegBytes: ByteArray?,
+        temperature: Double = 0.25,
+        maxOutputTokens: Int = 4096
+    ): Result<JSONObject> = withContext(Dispatchers.IO) {
+        runCatching {
+            val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-4-hydrogen" }
+            val userParts = JSONArray()
+            if (jpegBytes != null && jpegBytes.isNotEmpty()) {
+                val b64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
+                userParts.put(
+                    JSONObject().put(
+                        "inline_data",
+                        JSONObject()
+                            .put("mime_type", "image/jpeg")
+                            .put("data", b64)
+                    )
+                )
+            }
+            userParts.put(JSONObject().put("text", userPrompt))
+
+            val payload = JSONObject()
+                .put(
+                    "system_instruction",
+                    JSONObject().put(
+                        "parts",
+                        JSONArray().put(JSONObject().put("text", systemPrompt))
+                    )
+                )
+                .put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("role", "user")
+                            .put("parts", userParts)
+                    )
+                )
+                .put(
+                    "generationConfig",
+                    JSONObject()
+                        .put("temperature", temperature)
+                        .put("maxOutputTokens", maxOutputTokens)
+                        .put("responseMimeType", "application/json")
+                )
+
+            val bodyJson = payload.toString()
+
+            executeWithPoolFailover(apiKey, "AutoPilot") { entry, activeKey ->
+                val encodedKey = URLEncoder.encode(activeKey.trim(), "UTF-8")
+                val url = "$REST_BASE/models/$cleanModel:generateContent?key=$encodedKey"
+                val request = Request.Builder()
+                    .url(url)
+                    .post(bodyJson.toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                val labelSuffix = entry?.let { " [${it.label}]" }.orEmpty()
+                PilotStateHub.log(
+                    LogLevel.INFO,
+                    "AutoPilot",
+                    "Vision plan request via $cleanModel$labelSuffix (${(jpegBytes?.size ?: 0) / 1024}KB)"
+                )
+
+                client.newCall(request).execute().use { response ->
+                    val bodyStr = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        val errMsg = extractApiError(bodyStr, response.code)
+                        PilotStateHub.log(LogLevel.ERROR, "AutoPilot", "Vision error$labelSuffix: $errMsg")
+                        throw GeminiHttpException(response.code, errMsg)
+                    }
+
+                    val root = JSONObject(bodyStr)
+                    val parts = root.optJSONArray("candidates")
+                        ?.optJSONObject(0)
+                        ?.optJSONObject("content")
+                        ?.optJSONArray("parts")
+                    val rawText = buildString {
+                        if (parts != null) {
+                            for (i in 0 until parts.length()) {
+                                val t = parts.optJSONObject(i)?.optString("text", "").orEmpty()
+                                if (t.isNotBlank()) append(t)
+                            }
+                        }
+                    }.trim()
+
+                    extractCleanJsonObject(rawText)
+                }
+            }
+        }
+    }
+
+    internal fun extractCleanJsonObject(rawText: String): JSONObject {
+        val stripped = rawText
+            .removePrefix("```json")
+            .removePrefix("```JSON")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        runCatching { return JSONObject(stripped) }
+        val firstBrace = stripped.indexOf('{')
+        val lastBrace = stripped.lastIndexOf('}')
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+            return JSONObject(stripped.substring(firstBrace, lastBrace + 1))
+        }
+        error("Vision planner returned non-JSON response.")
     }
 
     private fun extractApiError(body: String, httpCode: Int): String {

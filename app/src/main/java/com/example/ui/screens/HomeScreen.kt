@@ -143,6 +143,7 @@ fun HomeScreen(
     val (orbPrimary, orbSecondary) = when (sessionState.activity) {
         AgentActivity.LISTENING -> CobaltBlue to CyanBright
         AgentActivity.SPEAKING -> EmeraldGreen to EmeraldBright
+        AgentActivity.AUTONOMOUS_TASK -> RoyalViolet to CyanBright
         AgentActivity.EXECUTING_TOOL, AgentActivity.SCROLLING -> WarmAmber to Color(0xFFFDE047)
         AgentActivity.MUTED -> Color(0xFF64748B) to Color(0xFF94A3B8)
         AgentActivity.IDLE -> RoyalViolet to CobaltBlue
@@ -366,6 +367,7 @@ fun HomeScreen(
                                 text = if (isLive) {
                                     when (sessionState.activity) {
                                         AgentActivity.SPEAKING -> "LivePilot Speaking"
+                                        AgentActivity.AUTONOMOUS_TASK -> "Autonomous AutoPilot"
                                         AgentActivity.EXECUTING_TOOL -> "Executing Action"
                                         AgentActivity.SCROLLING -> "Auto-Scrolling"
                                         AgentActivity.MUTED -> "Microphone Muted"

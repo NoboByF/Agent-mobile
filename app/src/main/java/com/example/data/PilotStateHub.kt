@@ -29,6 +29,7 @@ interface OverlaySessionController {
     fun emergencyStopActions()
     fun endCallSession()
     fun setOverlayTemporarilyHidden(hidden: Boolean)
+    fun setOverlayPassThrough(passThrough: Boolean)
     fun showTouchIndicator(x: Int, y: Int, label: String = "")
     fun pushIncomingMessageAlert(alertText: String)
     fun sendUserTextCommand(commandText: String): Boolean

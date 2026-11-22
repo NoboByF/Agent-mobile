@@ -13,11 +13,18 @@ LANGUAGE & VOICE STYLE:
 - Keep spoken responses crisp, confident, friendly, and concise (1-2 short sentences) while acting—just like an expert human co-pilot on a phone call.
 
 STRICT TOOL-FIRST RULE:
-- NEVER pretend or claim you tapped, opened, searched, checked battery/time, toggled flashlight, set a timer, copied text, or sent a message unless you actually called the real tool and received a successful result.
+- NEVER pretend or claim you tapped, opened, drew, searched, checked battery/time, toggled flashlight, set a timer, copied text, or sent a message unless you actually called the real tool and received a successful result.
 
-FAST & ACCURATE UI ACTION STRATEGY:
-- To tap a labeled button, tab, icon, or menu item (like "Subscribe", "Play", "Export", "Skip", "Next", "Allow", "পাঠান"), prefer click_by_text(query="...") first!
-- For visual/canvas apps (CapCut, InShot, Canva, timelines, sliders, video frames), call capture_screen_vision() to see the real pixels, then use click_element(index=-1, x=..., y=...) or drag_gesture(start_x, start_y, end_x, end_y, duration_ms).
+AUTONOMOUS MULTI-STEP & DRAWING SUPERPOWER (CRITICAL):
+- Whenever the user asks you to DRAW/SKETCH/PAINT anything on screen ("পাখির ছবি আকেন", "এখানে আঁকো", "draw a bird/flower/house/cat", "ড্র করো") OR complete ANY multi-step task inside a browser, web app, canvas app (FlipaCreate, FlipaClip, Canva, ibisPaint, CapCut, Chrome, Forms, Settings), NEVER ask "কীভাবে করবো?" or "চাচ্ছেন?" or claim you cannot draw!
+- Instead, IMMEDIATELY call start_autonomous_task(goal="clear full description of what to accomplish", mode="DRAWING" for art/drawing or "AUTO" for everything else)!
+- start_autonomous_task runs in the background for as long as needed (even 2-3 minutes!) while our live voice call stays 100% open. Tell the user warmly in 1 short sentence that you have started doing it step-by-step and they can keep chatting with you while you work!
+- While an autonomous task is running: if the user asks for any tweak or addition ("ডানাটা বড় করো", "একটা গাছের ডাল দাও", "নিচের বাটনটা চাপো"), call update_autonomous_task(instruction="..."). If the user says "থামো", "stop", or "বাদ দাও", call stop_autonomous_task() immediately.
+- When you receive a [SYSTEM EVENT: Autonomous ... COMPLETED] message, warmly report the result to the user in 1-2 natural sentences!
+
+FAST & ACCURATE SINGLE-STEP UI ACTION STRATEGY:
+- For quick 1-tap actions on labeled buttons/tabs ("Subscribe", "Play", "Export", "Skip", "Next", "Allow", "পাঠান"), prefer click_by_text(query="...") first!
+- For quick single visual taps/drags, call capture_screen_vision() (which includes a 0..1000 coordinate ruler grid) or use click_element / drag_gesture / draw_strokes.
 - After opening an app or tapping navigation, call wait_ms(700) if the screen needs a moment to load, then inspect with get_screen_ui() or capture_screen_vision().
 
 LIVE WEB SEARCH, DEVICE STATUS & HARDWARE SUPERPOWERS:
@@ -304,6 +311,53 @@ SAFETY GUARDRAILS:
                     "sender_or_app" to prop("STRING", "Sender name (e.g. Rahim) or app name (e.g. imo, WhatsApp)")
                 ),
                 required = listOf("sender_or_app")
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "start_autonomous_task",
+                description = "Launch LivePilot's non-blocking Autonomous Vision Agent to independently complete complex multi-step tasks in ANY app or browser (forms, editing, settings, multi-screen workflows) OR draw detailed multi-stroke artwork (birds, flowers, houses, sketches) on any drawing app/web canvas (FlipaCreate, FlipaClip, ibisPaint, Canva, Notes) while keeping the live voice call active.",
+                properties = mapOf(
+                    "goal" to prop("STRING", "Complete clear goal description of what to draw or accomplish autonomously"),
+                    "mode" to prop("STRING", "One of: AUTO, DRAWING, or UI_WORKFLOW")
+                ),
+                required = listOf("goal", "mode")
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "update_autonomous_task",
+                description = "Send a live mid-task voice instruction or tweak to the currently running autonomous drawing or workflow task without stopping it.",
+                properties = mapOf(
+                    "instruction" to prop("STRING", "Additional guidance, tweak, or next instruction from the user")
+                ),
+                required = listOf("instruction")
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "stop_autonomous_task",
+                description = "Immediately stop and cancel any currently running autonomous drawing or multi-step browser/app task.",
+                properties = emptyMap(),
+                required = emptyList()
+            )
+        )
+
+        declarations.put(
+            declareTool(
+                name = "draw_strokes",
+                description = "Directly draw one or more smooth curved freehand strokes on the current screen or inside a specified 0..1000 canvas box.",
+                properties = mapOf(
+                    "canvas_left" to prop("INTEGER", "Canvas left edge in 0..1000 screen coordinates (0 for full screen)"),
+                    "canvas_top" to prop("INTEGER", "Canvas top edge in 0..1000 screen coordinates (0 for full screen)"),
+                    "canvas_right" to prop("INTEGER", "Canvas right edge in 0..1000 screen coordinates (1000 for full screen)"),
+                    "canvas_bottom" to prop("INTEGER", "Canvas bottom edge in 0..1000 screen coordinates (1000 for full screen)"),
+                    "strokes_json" to prop("STRING", "JSON array of stroke objects: [{\"label\":\"Wing\",\"points\":[[x,y],[x,y],...]}] with 0..1000 coordinates inside the canvas box")
+                ),
+                required = listOf("canvas_left", "canvas_top", "canvas_right", "canvas_bottom", "strokes_json")
             )
         )
 

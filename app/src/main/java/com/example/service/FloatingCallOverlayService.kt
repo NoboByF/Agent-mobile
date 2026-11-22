@@ -238,7 +238,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     override fun onAudioOutput(pcm24kBytes: ByteArray) {
         audioEngine?.enqueueAudioOutput(pcm24kBytes)
         PilotStateHub.updateSession { state ->
-            if (state.activity != AgentActivity.SPEAKING && !state.isScrollingActive) {
+            if (state.activity != AgentActivity.SPEAKING && !state.isScrollingActive && !state.isAutonomousTaskRunning) {
                 state.copy(activity = AgentActivity.SPEAKING, statusTicker = "Speaking...")
             } else {
                 state
@@ -247,15 +247,19 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     override fun onInterrupted() {
+        // Only interrupt AI voice playback when the user speaks (barge-in).
+        // Do NOT cancel a running AutonomousTaskEngine job so the user can chat freely while drawing/automating!
         audioEngine?.interruptPlayback()
-        toolDispatcher?.cancelAllActiveActions()
-        PilotAccessibilityService.instance?.stopContinuousScroll()
-        PilotStateHub.updateSession {
-            it.copy(
-                activity = if (it.isMuted) AgentActivity.MUTED else AgentActivity.LISTENING,
-                isScrollingActive = false,
-                statusTicker = "Interrupted • Listening"
-            )
+        if (toolDispatcher?.isAutonomousTaskRunning() != true) {
+            toolDispatcher?.cancelAllActiveActions(includeAutonomous = false)
+            PilotAccessibilityService.instance?.stopContinuousScroll()
+            PilotStateHub.updateSession {
+                it.copy(
+                    activity = if (it.isMuted) AgentActivity.MUTED else AgentActivity.LISTENING,
+                    isScrollingActive = false,
+                    statusTicker = "Listening..."
+                )
+            }
         }
     }
 
@@ -287,19 +291,27 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
 
     override fun onInputTranscript(text: String) {
         PilotStateHub.updateSession {
-            it.copy(
-                activity = AgentActivity.LISTENING,
-                statusTicker = "You: ${text.take(36)}"
-            )
+            if (it.isAutonomousTaskRunning) {
+                it
+            } else {
+                it.copy(
+                    activity = AgentActivity.LISTENING,
+                    statusTicker = "You: ${text.take(36)}"
+                )
+            }
         }
     }
 
     override fun onOutputTranscript(text: String) {
         PilotStateHub.updateSession {
-            it.copy(
-                activity = AgentActivity.SPEAKING,
-                statusTicker = text.take(40)
-            )
+            if (it.isAutonomousTaskRunning) {
+                it
+            } else {
+                it.copy(
+                    activity = AgentActivity.SPEAKING,
+                    statusTicker = text.take(40)
+                )
+            }
         }
     }
 
@@ -371,13 +383,15 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         autoVisionJob?.cancel()
         autoVisionJob = null
         audioEngine?.interruptPlayback()
-        toolDispatcher?.cancelAllActiveActions()
+        toolDispatcher?.cancelAllActiveActions(includeAutonomous = true)
         PilotAccessibilityService.instance?.stopContinuousScroll()
-        PilotStateHub.log(LogLevel.TOOL, "STOP", "Emergency STOP pressed — halted scroll, auto-vision & active gestures.")
+        PilotStateHub.log(LogLevel.TOOL, "STOP", "Emergency STOP pressed — halted autonomous task, scroll, auto-vision & gestures.")
         PilotStateHub.updateSession {
             it.copy(
                 isScrollingActive = false,
                 isAutoVisionActive = false,
+                isAutonomousTaskRunning = false,
+                autonomousTaskProgress = null,
                 activity = if (it.isMuted) AgentActivity.MUTED else AgentActivity.LISTENING,
                 statusTicker = "Stopped actions • Call active"
             )
@@ -413,6 +427,8 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 isMuted = false,
                 isScrollingActive = false,
                 isAutoVisionActive = false,
+                isAutonomousTaskRunning = false,
+                autonomousTaskProgress = null,
                 micLevel = 0f,
                 aiAudioLevel = 0f,
                 callStartedAtMs = null,
@@ -433,7 +449,25 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             } else {
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
             }
-            runCatching { windowManager?.updateViewLayout(view, params) }
+            if (view.isAttachedToWindow) {
+                runCatching { windowManager?.updateViewLayout(view, params) }
+            }
+        }
+    }
+
+    override fun setOverlayPassThrough(passThrough: Boolean) {
+        mainHandler.post {
+            val view = overlayView ?: return@post
+            val params = overlayParams ?: return@post
+            params.flags = if (passThrough) {
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+            } else {
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            }
+            view.alpha = if (passThrough) 0.55f else 1.0f
+            if (view.isAttachedToWindow) {
+                runCatching { windowManager?.updateViewLayout(view, params) }
+            }
         }
     }
 
@@ -804,6 +838,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                 val orbColor = when (state.activity) {
                     AgentActivity.LISTENING -> Color.parseColor("#3B82F6")
                     AgentActivity.SPEAKING -> Color.parseColor("#10B981")
+                    AgentActivity.AUTONOMOUS_TASK -> Color.parseColor("#A855F7")
                     AgentActivity.EXECUTING_TOOL, AgentActivity.SCROLLING -> Color.parseColor("#F59E0B")
                     AgentActivity.MUTED -> Color.parseColor("#64748B")
                     AgentActivity.IDLE -> Color.parseColor("#7C3AED")
