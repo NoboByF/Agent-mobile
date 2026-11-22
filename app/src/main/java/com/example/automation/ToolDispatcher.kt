@@ -252,6 +252,18 @@ class ToolDispatcher(
                 )
                 "navigate" -> service.navigateGlobal(args.optString("action", "BACK"))
                 "open_notification_chat" -> service.openNotificationChat(args.optString("sender_or_app", ""))
+                "search_on_screen" -> SmartSearchAndFinder.searchOnScreen(
+                    service = service,
+                    appContext = appContext,
+                    rawQuery = args.optString("query", ""),
+                    openInGoogleIfNeeded = args.optBoolean("open_in_google_if_needed", false)
+                )
+                "find_and_interact" -> SmartSearchAndFinder.findAndInteract(
+                    service = service,
+                    rawTarget = args.optString("target", ""),
+                    rawAction = args.optString("action", "CLICK"),
+                    maxScrolls = args.optInt("max_scrolls", 4)
+                )
                 "draw_strokes" -> {
                     val left = args.optInt("canvas_left", 0)
                     val top = args.optInt("canvas_top", 0)
@@ -369,6 +381,8 @@ class ToolDispatcher(
         "update_autonomous_task" -> "🤖 Updating task..."
         "stop_autonomous_task" -> "Stopping autonomous task..."
         "draw_strokes" -> "🎨 Drawing strokes..."
+        "search_on_screen" -> "🔍 Searching '${call.args.optString("query", "").take(18)}'..."
+        "find_and_interact" -> "🔎 Finding '${call.args.optString("target", "").take(18)}'..."
         "wait_ms" -> "Waiting..."
         else -> "Executing ${call.name}..."
     }
@@ -398,6 +412,8 @@ class ToolDispatcher(
         "update_autonomous_task" -> "Updated AutoPilot"
         "stop_autonomous_task" -> "Stopped AutoPilot"
         "draw_strokes" -> "Drew Vector Strokes"
+        "search_on_screen" -> "Search: ${call.args.optString("query", "").take(20)}"
+        "find_and_interact" -> "Found: ${call.args.optString("target", "").take(20)}"
         else -> call.name
     }
 }

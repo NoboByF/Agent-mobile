@@ -58,6 +58,7 @@ import com.example.data.DiscoveredModel
 import com.example.data.LogLevel
 import com.example.data.PilotSettings
 import com.example.data.SafetyGuardrails
+import com.example.data.VoiceLanguage
 import com.example.ui.components.ApiKeyPoolCard
 import com.example.ui.components.StatusPillBadge
 import com.example.ui.components.StudioCardContainer
@@ -113,6 +114,7 @@ fun SettingsLogsScreen(
     onUpdateTextModel: (String) -> Unit,
     onFetchModels: () -> Unit,
     onUpdateVoice: (String) -> Unit,
+    onUpdateVoiceLanguage: (VoiceLanguage) -> Unit,
     onUpdateSpeakerphone: (Boolean) -> Unit,
     onUpdateAutoVisionDefault: (Boolean) -> Unit,
     onUpdateAutoVisionInterval: (Int) -> Unit,
@@ -473,6 +475,42 @@ fun SettingsLogsScreen(
                                     colors = FilterChipDefaults.filterChipColors(
                                         selectedContainerColor = palette.violetSoft,
                                         selectedLabelColor = palette.violetAccent
+                                    )
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(12.dp))
+
+                        Text(
+                            text = "Speech Language Lock (কথা শোনার ভাষা)",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = palette.inkPrimary
+                        )
+                        Text(
+                            text = "Locks Gemini Live & the floating BN mic to prevent Hindi/Urdu mishearing.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            VoiceLanguage.entries.forEach { lang ->
+                                FilterChip(
+                                    selected = settings.voiceLanguage == lang,
+                                    onClick = { onUpdateVoiceLanguage(lang) },
+                                    modifier = Modifier.testTag("voice_lang_chip_${lang.name.lowercase()}"),
+                                    label = {
+                                        Text(
+                                            text = lang.displayLabel,
+                                            style = MaterialTheme.typography.labelMedium
+                                        )
+                                    },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = palette.emeraldSoft,
+                                        selectedLabelColor = palette.emeraldAccent
                                     )
                                 )
                             }

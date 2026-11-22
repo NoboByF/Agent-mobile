@@ -315,37 +315,36 @@ class PilotAccessibilityService : AccessibilityService() {
         if (query.isBlank()) {
             return JSONObject().put("status", "error").put("message", "Query text cannot be empty.")
         }
-
-        val candidateTerms = expandUiSynonyms(query)
-        var hit = findBestMatchingNode(rootInActiveWindow, candidateTerms, exact)
-        if (hit == null) {
-            performSwipeGesture("DOWN", distancePercent = 45, durationMs = 300L)
-            delay(450)
-            hit = findBestMatchingNode(rootInActiveWindow, candidateTerms, exact)
+        if (!exact) {
+            return SmartSearchAndFinder.findAndInteract(
+                service = this,
+                rawTarget = query,
+                rawAction = "CLICK",
+                maxScrolls = 3
+            )
         }
-
+        val hit = SmartSearchAndFinder.findBestMatchingNodeEnhanced(
+            root = rootInActiveWindow,
+            rawQuery = query,
+            exact = true
+        )
         if (hit == null) {
-            return JSONObject()
-                .put("status", "not_found")
-                .put("message", "No visible element matching '$query' found on screen.")
+            return SmartSearchAndFinder.findAndInteract(
+                service = this,
+                rawTarget = query,
+                rawAction = "CLICK",
+                maxScrolls = 2
+            )
         }
-
         val rect = Rect()
         hit.getBoundsInScreen(rect)
         val label = (hit.text ?: hit.contentDescription ?: query).toString().take(80)
         emitTouchRipple(rect.centerX(), rect.centerY(), label)
-
-        val clicked = tryClickNodeOrParent(hit)
-        if (clicked) {
+        if (tryClickNodeOrParent(hit)) {
             PilotStateHub.log(LogLevel.TOOL, "click_by_text", "Clicked '$label' via ACTION_CLICK")
-            return JSONObject()
-                .put("status", "ok")
-                .put("matched", label)
-                .put("method", "accessibility_click")
+            return JSONObject().put("status", "ok").put("matched", label).put("method", "accessibility_click")
         }
-
         val tapOk = dispatchTapGesture(rect.centerX().toFloat(), rect.centerY().toFloat(), 60L)
-        PilotStateHub.log(LogLevel.TOOL, "click_by_text", "Tapped '$label' at (${rect.centerX()},${rect.centerY()}) ok=$tapOk")
         return JSONObject()
             .put("status", if (tapOk) "ok" else "error")
             .put("matched", label)
@@ -460,7 +459,7 @@ class PilotAccessibilityService : AccessibilityService() {
         val queue = ArrayDeque<AccessibilityNodeInfo>()
         queue.add(root)
 
-        val maxNodes = 95
+        val maxNodes = 150
         while (queue.isNotEmpty() && newNodes.size < maxNodes) {
             val node = queue.removeFirst()
             for (i in 0 until node.childCount) {
@@ -470,15 +469,23 @@ class PilotAccessibilityService : AccessibilityService() {
             if (!node.isVisibleToUser) continue
             val text = node.text?.toString()?.trim().orEmpty()
             val desc = node.contentDescription?.toString()?.trim().orEmpty()
+            val hint = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+                node.hintText?.toString()?.trim().orEmpty()
+            } else {
+                ""
+            }
+            val shortId = node.viewIdResourceName?.substringAfterLast('/').orEmpty()
             val clickable = node.isClickable
             val editable = node.isEditable
             val scrollable = node.isScrollable
-            val meaningful = clickable || editable || text.isNotEmpty() || desc.isNotEmpty()
+            val meaningful = clickable || editable || text.isNotEmpty() || desc.isNotEmpty() || hint.isNotEmpty()
             if (!meaningful) continue
 
             val rect = Rect()
             node.getBoundsInScreen(rect)
             if (rect.width() <= 2 || rect.height() <= 2) continue
+            // Skip elements completely outside the visible viewport
+            if (rect.bottom < 0 || rect.top > dm.heightPixels || rect.right < 0 || rect.left > dm.widthPixels) continue
 
             val idx = newNodes.size
             newNodes.add(node)
@@ -495,6 +502,10 @@ class PilotAccessibilityService : AccessibilityService() {
             if (node.isFocused) item.put("focused", true)
             if (text.isNotEmpty()) item.put("text", text.take(100))
             if (desc.isNotEmpty()) item.put("desc", desc.take(100))
+            if (hint.isNotEmpty()) item.put("hint", hint.take(60))
+            if (shortId.isNotEmpty() && (editable || shortId.contains("search", true) || shortId.contains("url", true))) {
+                item.put("id", shortId.take(40))
+            }
             elements.put(item)
         }
         lastIndexedNodes = newNodes.toList()
@@ -994,13 +1005,22 @@ class PilotAccessibilityService : AccessibilityService() {
 
         var sentAction = "none"
         if (pressSend) {
-            delay(180)
-            val sendBtn = findSendOrSearchButton(rootInActiveWindow)
-            if (sendBtn != null && tryClickNodeOrParent(sendBtn)) {
-                sentAction = "clicked_send_button"
+            delay(240)
+            // Always re-query FRESH focused input after typing so ACTION_IME_ENTER succeeds in Chrome & apps
+            val freshRoot = rootInActiveWindow
+            val freshFocused = freshRoot?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+                ?: findFirstEditableNode(freshRoot)
+                ?: focusedEdit
+            val imeSent = freshFocused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            if (imeSent) {
+                sentAction = "ime_enter"
             } else {
-                val imeSent = focusedEdit.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
-                sentAction = if (imeSent) "ime_enter" else "send_button_not_found"
+                val sendBtn = findSendOrSearchButton(rootInActiveWindow)
+                if (sendBtn != null && !sendBtn.isEditable && tryClickNodeOrParent(sendBtn)) {
+                    sentAction = "clicked_send_button"
+                } else {
+                    sentAction = "send_button_not_found"
+                }
             }
         }
 

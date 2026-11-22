@@ -347,6 +347,7 @@ private fun LivePilotAppRoot(
                             onUpdateTextModel = { viewModel.updateTextModel(it) },
                             onFetchModels = { viewModel.fetchModels() },
                             onUpdateVoice = { viewModel.updateVoiceName(it) },
+                            onUpdateVoiceLanguage = { viewModel.updateVoiceLanguage(it) },
                             onUpdateSpeakerphone = { viewModel.updateSpeakerphone(it) },
                             onUpdateAutoVisionDefault = { viewModel.updateAutoVisionDefault(it) },
                             onUpdateAutoVisionInterval = { viewModel.updateAutoVisionInterval(it) },

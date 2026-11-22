@@ -10,6 +10,7 @@ import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import com.example.data.LogLevel
@@ -23,6 +24,7 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class LiveAudioEngine(
@@ -36,6 +38,7 @@ class LiveAudioEngine(
     private var audioRecord: AudioRecord? = null
     private var echoCanceler: AcousticEchoCanceler? = null
     private var noiseSuppressor: NoiseSuppressor? = null
+    private var gainControl: AutomaticGainControl? = null
     private var audioTrack: AudioTrack? = null
 
     private var captureJob: Job? = null
@@ -55,11 +58,18 @@ class LiveAudioEngine(
     @Volatile
     private var lastAiUiPushMs = 0L
 
+    @Volatile
+    private var lastAiPlaybackActiveMs = 0L
+
+    @Volatile
+    private var speechHangoverFrames = 0
+
     @SuppressLint("MissingPermission")
     fun start(speakerphone: Boolean) {
         if (!isRunning.compareAndSet(false, true)) return
         isSpeakerOn.set(speakerphone)
         isMuted.set(false)
+        speechHangoverFrames = 0
         playbackQueue.clear()
 
         configureAudioRouting(speakerphone)
@@ -71,7 +81,7 @@ class LiveAudioEngine(
         PilotStateHub.log(
             LogLevel.AUDIO,
             "AudioEngine",
-            "Full-duplex 16kHz/24kHz audio started (speaker=$speakerphone)."
+            "Full-duplex 16kHz/24kHz audio started (speaker=$speakerphone, 50ms DSP frames)."
         )
     }
 
@@ -92,6 +102,7 @@ class LiveAudioEngine(
 
     fun enqueueAudioOutput(pcm24kBytes: ByteArray) {
         if (!isRunning.get() || pcm24kBytes.isEmpty()) return
+        lastAiPlaybackActiveMs = System.currentTimeMillis()
         if (!playbackQueue.offer(pcm24kBytes)) {
             playbackQueue.poll()
             playbackQueue.offer(pcm24kBytes)
@@ -100,6 +111,7 @@ class LiveAudioEngine(
 
     fun interruptPlayback() {
         playbackQueue.clear()
+        lastAiPlaybackActiveMs = 0L
         PilotStateHub.updateAudioLevels(ai = 0f)
         val track = audioTrack ?: return
         runCatching {
@@ -118,12 +130,15 @@ class LiveAudioEngine(
         captureJob = null
         playbackJob = null
         playbackQueue.clear()
+        lastAiPlaybackActiveMs = 0L
         PilotStateHub.updateAudioLevels(mic = 0f, ai = 0f)
 
         runCatching { echoCanceler?.release() }
         runCatching { noiseSuppressor?.release() }
+        runCatching { gainControl?.release() }
         echoCanceler = null
         noiseSuppressor = null
+        gainControl = null
 
         runCatching {
             audioRecord?.stop()
@@ -226,11 +241,16 @@ class LiveAudioEngine(
                 NoiseSuppressor.create(sessionId)?.apply { enabled = true }
             }.getOrNull()
         }
+        if (AutomaticGainControl.isAvailable()) {
+            gainControl = runCatching {
+                AutomaticGainControl.create(sessionId)?.apply { enabled = true }
+            }.getOrNull()
+        }
 
         PilotStateHub.log(
             LogLevel.AUDIO,
             "AudioEngine",
-            "DSP attached: AEC=${echoCanceler?.enabled == true}, NS=${noiseSuppressor?.enabled == true}"
+            "DSP attached: AEC=${echoCanceler?.enabled == true}, NS=${noiseSuppressor?.enabled == true}, AGC=${gainControl?.enabled == true}"
         )
 
         record.startRecording()
@@ -281,11 +301,21 @@ class LiveAudioEngine(
                 if (read > 0) {
                     if (!isMuted.get()) {
                         val copy = buffer.copyOf(read)
-                        onPcmCaptured(copy)
                         val now = System.currentTimeMillis()
+                        val rawRms = computeRawRms(copy, read)
+                        val aiSpeaking = (now - lastAiPlaybackActiveMs) < AI_ECHO_TAIL_MS && isSpeakerOn.get()
+
+                        val processed = applyVoiceClarityDsp(copy, read, rawRms, aiSpeaking)
+                        onPcmCaptured(processed)
+
                         if (now - lastMicUiPushMs >= 70L) {
                             lastMicUiPushMs = now
-                            PilotStateHub.updateAudioLevels(mic = computeNormalizedRms(copy, read))
+                            val displayLevel = if (aiSpeaking && rawRms < ECHO_DUCK_RMS) {
+                                0.04f
+                            } else {
+                                (rawRms / 8500.0).toFloat().coerceIn(0f, 1f)
+                            }
+                            PilotStateHub.updateAudioLevels(mic = displayLevel)
                         }
                     } else {
                         PilotStateHub.updateAudioLevels(mic = 0f)
@@ -298,6 +328,55 @@ class LiveAudioEngine(
         }
     }
 
+    /**
+     * Prevents two biggest real-world causes of wrong-language / garbled Bengali transcription:
+     * 1) Speakerphone echo bleed while AI is speaking (softly ducked unless user speaks loudly to barge in).
+     * 2) Low ambient fan/room hiss hallucinating random foreign words (soft noise gate with smooth hangover).
+     * 3) Gentle clarity gain on real human voice frames so soft Bengali consonants stay crisp.
+     */
+    private fun applyVoiceClarityDsp(
+        pcmBytes: ByteArray,
+        length: Int,
+        rms: Double,
+        aiSpeakingOnSpeaker: Boolean
+    ): ByteArray {
+        val gain: Float = when {
+            aiSpeakingOnSpeaker && rms < ECHO_DUCK_RMS -> {
+                // Suppress residual speaker echo so Gemini doesn't mishear its own voice as another language
+                speechHangoverFrames = 0
+                0.08f
+            }
+            rms >= SPEECH_OPEN_RMS -> {
+                // Real human speech detected — keep gate open for 8 frames (400ms) for trailing syllables
+                speechHangoverFrames = 8
+                // Boost quiet voices gently without clipping loud voices
+                if (rms < 3200.0) 1.32f else 1.05f
+            }
+            speechHangoverFrames > 0 -> {
+                speechHangoverFrames--
+                1.08f
+            }
+            rms < NOISE_FLOOR_RMS -> {
+                // Softly attenuate room fan/hiss noise so server VAD gets clean silence between words
+                0.15f
+            }
+            else -> 0.85f
+        }
+
+        if (gain == 1.0f) return pcmBytes
+        var i = 0
+        while (i + 1 < length) {
+            val lo = pcmBytes[i].toInt() and 0xFF
+            val hi = pcmBytes[i + 1].toInt()
+            val sample = ((hi shl 8) or lo).toShort().toInt()
+            val scaled = (sample * gain).roundToInt().coerceIn(-32760, 32760)
+            pcmBytes[i] = (scaled and 0xFF).toByte()
+            pcmBytes[i + 1] = ((scaled shr 8) and 0xFF).toByte()
+            i += 2
+        }
+        return pcmBytes
+    }
+
     private fun startPlaybackLoop() {
         playbackJob = scope.launch {
             while (isActive && isRunning.get()) {
@@ -307,11 +386,13 @@ class LiveAudioEngine(
                 val track = audioTrack ?: continue
                 if (isRunning.get() && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                     val now = System.currentTimeMillis()
+                    lastAiPlaybackActiveMs = now
                     if (now - lastAiUiPushMs >= 70L) {
                         lastAiUiPushMs = now
-                        PilotStateHub.updateAudioLevels(ai = computeNormalizedRms(chunk, chunk.size))
+                        PilotStateHub.updateAudioLevels(ai = (computeRawRms(chunk, chunk.size) / 9500.0).toFloat().coerceIn(0f, 1f))
                     }
                     track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+                    lastAiPlaybackActiveMs = System.currentTimeMillis()
                     if (playbackQueue.isEmpty()) {
                         PilotStateHub.updateAudioLevels(ai = 0f)
                     }
@@ -320,8 +401,8 @@ class LiveAudioEngine(
         }
     }
 
-    private fun computeNormalizedRms(pcmBytes: ByteArray, length: Int): Float {
-        if (length < 2) return 0f
+    private fun computeRawRms(pcmBytes: ByteArray, length: Int): Double {
+        if (length < 2) return 0.0
         var sumSq = 0.0
         var samples = 0
         var i = 0
@@ -331,16 +412,18 @@ class LiveAudioEngine(
             val sample = ((hi shl 8) or lo).toShort().toDouble()
             sumSq += sample * sample
             samples++
-            i += 4 // Stride 2 samples for fast telemetry
+            i += 4
         }
-        if (samples == 0) return 0f
-        val rms = sqrt(sumSq / samples)
-        return (rms / 9500.0).toFloat().coerceIn(0f, 1f)
+        return if (samples == 0) 0.0 else sqrt(sumSq / samples)
     }
 
     companion object {
         private const val INPUT_SAMPLE_RATE = 16000
         private const val OUTPUT_SAMPLE_RATE = 24000
-        private const val INPUT_CHUNK_BYTES = 3200
+        private const val INPUT_CHUNK_BYTES = 1600 // 50ms crisp PCM frames at 16kHz 16-bit mono
+        private const val NOISE_FLOOR_RMS = 230.0
+        private const val SPEECH_OPEN_RMS = 420.0
+        private const val ECHO_DUCK_RMS = 2600.0
+        private const val AI_ECHO_TAIL_MS = 260L
     }
 }

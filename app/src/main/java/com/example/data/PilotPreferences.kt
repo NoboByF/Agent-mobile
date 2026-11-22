@@ -41,6 +41,13 @@ class PilotPreferences(context: Context) {
             )
         }.getOrDefault(AppThemeMode.SYSTEM)
 
+        val voiceLanguage = runCatching {
+            VoiceLanguage.valueOf(
+                prefs.getString(KEY_VOICE_LANGUAGE, VoiceLanguage.BENGALI_BD.name)
+                    ?: VoiceLanguage.BENGALI_BD.name
+            )
+        }.getOrDefault(VoiceLanguage.BENGALI_BD)
+
         val legacySingleKey = prefs.getString(KEY_API_KEY, "").orEmpty().trim()
         val parsedKeys = loadApiKeysJson()
         val migratedKeys = if (parsedKeys.isEmpty() && legacySingleKey.isNotBlank()) {
@@ -78,6 +85,7 @@ class PilotPreferences(context: Context) {
             voiceName = prefs.getString(KEY_VOICE_NAME, PilotSettings.DEFAULT_VOICE)
                 .orEmpty()
                 .ifBlank { PilotSettings.DEFAULT_VOICE },
+            voiceLanguage = voiceLanguage,
             speakerphoneOn = prefs.getBoolean(KEY_SPEAKERPHONE, true),
             autoVisionDefaultOn = prefs.getBoolean(KEY_AUTO_VISION_DEFAULT, false),
             autoVisionIntervalSec = prefs.getInt(KEY_AUTO_VISION_INTERVAL, 4).coerceIn(2, 10),
@@ -123,6 +131,7 @@ class PilotPreferences(context: Context) {
             .putString(KEY_LIVE_MODEL, settings.liveModel.trim().removePrefix("models/"))
             .putString(KEY_TEXT_MODEL, settings.textModel.trim().removePrefix("models/"))
             .putString(KEY_VOICE_NAME, settings.voiceName.trim())
+            .putString(KEY_VOICE_LANGUAGE, settings.voiceLanguage.name)
             .putBoolean(KEY_SPEAKERPHONE, settings.speakerphoneOn)
             .putBoolean(KEY_AUTO_VISION_DEFAULT, settings.autoVisionDefaultOn)
             .putInt(KEY_AUTO_VISION_INTERVAL, settings.autoVisionIntervalSec.coerceIn(2, 10))
@@ -292,6 +301,7 @@ class PilotPreferences(context: Context) {
         private const val KEY_LIVE_MODEL = "live_model_id"
         private const val KEY_TEXT_MODEL = "text_model_id"
         private const val KEY_VOICE_NAME = "live_voice_name"
+        private const val KEY_VOICE_LANGUAGE = "live_voice_language"
         private const val KEY_SPEAKERPHONE = "speakerphone_on"
         private const val KEY_AUTO_VISION_DEFAULT = "auto_vision_default"
         private const val KEY_AUTO_VISION_INTERVAL = "auto_vision_interval"

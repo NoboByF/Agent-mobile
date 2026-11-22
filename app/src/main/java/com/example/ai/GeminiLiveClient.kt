@@ -4,6 +4,7 @@ import android.util.Base64
 import com.example.data.LiveConnectionPhase
 import com.example.data.LogLevel
 import com.example.data.PilotStateHub
+import com.example.data.VoiceLanguage
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -78,6 +79,9 @@ class GeminiLiveClient(
     private var currentVoice: String = "Kore"
 
     @Volatile
+    private var currentVoiceLanguage: VoiceLanguage = VoiceLanguage.BENGALI_BD
+
+    @Volatile
     private var currentCustomInstructions: String = ""
 
     private var reconnectAttempt = 0
@@ -89,7 +93,8 @@ class GeminiLiveClient(
         apiKey: String = "",
         modelId: String,
         voiceName: String,
-        customInstructions: String = ""
+        customInstructions: String = "",
+        voiceLanguage: VoiceLanguage = PilotStateHub.settings.value.voiceLanguage
     ) {
         manuallyClosed.set(false)
         setupCompleted.set(false)
@@ -98,6 +103,7 @@ class GeminiLiveClient(
 
         currentModel = normalizeModelPath(modelId)
         currentVoice = voiceName.trim().ifBlank { "Kore" }
+        currentVoiceLanguage = voiceLanguage
         currentCustomInstructions = customInstructions.trim()
 
         val selection = ApiKeyPoolManager.selectBestKey()
@@ -174,7 +180,8 @@ class GeminiLiveClient(
                     modelPath = currentModel,
                     voiceName = currentVoice,
                     resumptionHandle = savedResumptionHandle,
-                    customInstructions = currentCustomInstructions
+                    customInstructions = currentCustomInstructions,
+                    voiceLanguage = currentVoiceLanguage
                 )
                 val sent = webSocket.send(setupPayload.toString())
                 if (!sent) {
@@ -535,7 +542,8 @@ class GeminiLiveClient(
             modelPath: String,
             voiceName: String,
             resumptionHandle: String?,
-            customInstructions: String = ""
+            customInstructions: String = "",
+            voiceLanguage: VoiceLanguage = VoiceLanguage.BENGALI_BD
         ): JSONObject {
             val prebuiltVoice = JSONObject().put("voiceName", voiceName.ifBlank { "Kore" })
             val speechConfig = JSONObject().put(
@@ -556,7 +564,7 @@ class GeminiLiveClient(
                 JSONArray().put(
                     JSONObject().put(
                         "text",
-                        GeminiToolSchemas.buildSystemInstruction(customInstructions)
+                        GeminiToolSchemas.buildSystemInstruction(customInstructions, voiceLanguage)
                     )
                 )
             )

@@ -10,6 +10,7 @@ import com.example.ai.GeminiToolSchemas
 import com.example.automation.AutonomousMode
 import com.example.automation.AutonomousTaskEngine
 import com.example.automation.DrawingGestureHelper
+import com.example.automation.SmartSearchAndFinder
 import com.example.data.AppThemeMode
 import com.example.data.AskAiMessage
 import com.example.data.GeminiApiKeyEntry
@@ -19,6 +20,7 @@ import com.example.data.PilotSettings
 import com.example.data.PilotStateHub
 import com.example.data.RoutineAccent
 import com.example.data.SafetyGuardrails
+import com.example.data.VoiceLanguage
 import com.example.ui.components.formatAiRichText
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -72,7 +74,7 @@ class ExampleRobolectricTest {
         assertTrue(systemText.contains("Speak short Bengali"))
 
         val declarations = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
-        assertEquals(26, declarations.length())
+        assertEquals(28, declarations.length())
     }
 
     @Test
@@ -297,5 +299,36 @@ class ExampleRobolectricTest {
         val cleanedJson = GeminiRestClient.extractCleanJsonObject("```json\n{\"done\": true, \"action\": \"CLICK\"}\n```")
         assertTrue(cleanedJson.getBoolean("done"))
         assertEquals("CLICK", cleanedJson.getString("action"))
+    }
+
+    @Test
+    fun `voice language lock persists and builds strict Bengali system instruction header`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = PilotPreferences(context)
+
+        prefs.saveSettings(PilotSettings(voiceLanguage = VoiceLanguage.BENGALI_BD))
+        val loaded = prefs.loadSettings()
+        assertEquals(VoiceLanguage.BENGALI_BD, loaded.voiceLanguage)
+
+        val bnPrompt = GeminiToolSchemas.buildSystemInstruction("", VoiceLanguage.BENGALI_BD)
+        assertTrue(bnPrompt.contains("bn-BD"))
+        assertTrue(bnPrompt.contains("NEVER interpret the user's audio as Hindi"))
+
+        val enPrompt = GeminiToolSchemas.buildSystemInstruction("", VoiceLanguage.ENGLISH_US)
+        assertTrue(enPrompt.contains("en-US"))
+    }
+
+    @Test
+    fun `smart search expands Bengali and English UI synonyms and performs fuzzy matching`() {
+        val searchTerms = SmartSearchAndFinder.expandSynonyms("সার্চ")
+        assertTrue(searchTerms.contains("search"))
+        assertTrue(searchTerms.contains("খুঁজুন"))
+
+        val settingsTerms = SmartSearchAndFinder.expandSynonyms("সেটিংস")
+        assertTrue(settingsTerms.contains("settings"))
+
+        assertTrue(SmartSearchAndFinder.isFuzzyClose("youtube", "youtbe"))
+        assertTrue(SmartSearchAndFinder.isFuzzyClose("settings", "setings"))
+        assertFalse(SmartSearchAndFinder.isFuzzyClose("search", "camera"))
     }
 }

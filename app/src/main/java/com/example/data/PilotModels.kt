@@ -35,6 +35,16 @@ enum class AppThemeMode {
     DARK
 }
 
+enum class VoiceLanguage(
+    val displayLabel: String,
+    val shortBadge: String,
+    val bcp47: String
+) {
+    BENGALI_BD("বাংলা (Bangladesh)", "বাংলা", "bn-BD"),
+    BENGALI_ENGLISH("বাংলা + English", "BN+EN", "bn-BD"),
+    ENGLISH_US("English", "EN", "en-US")
+}
+
 enum class RoutineAccent {
     COBALT,
     EMERALD,
@@ -255,6 +265,7 @@ data class PilotSettings(
     val liveModel: String = DEFAULT_LIVE_MODEL,
     val textModel: String = DEFAULT_TEXT_MODEL,
     val voiceName: String = DEFAULT_VOICE,
+    val voiceLanguage: VoiceLanguage = VoiceLanguage.BENGALI_BD,
     val speakerphoneOn: Boolean = true,
     val autoVisionDefaultOn: Boolean = false,
     val autoVisionIntervalSec: Int = 4,

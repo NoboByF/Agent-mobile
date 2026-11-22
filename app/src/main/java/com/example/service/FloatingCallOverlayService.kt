@@ -18,10 +18,14 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
@@ -47,6 +51,7 @@ import com.example.data.LiveConnectionPhase
 import com.example.data.LogLevel
 import com.example.data.OverlaySessionController
 import com.example.data.PilotStateHub
+import com.example.data.VoiceLanguage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -72,6 +77,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     private var tickerTextView: TextView? = null
     private var captionStripView: TextView? = null
     private var muteButton: TextView? = null
+    private var bnSpeechButton: TextView? = null
     private var autoVisionButton: TextView? = null
     private var visionButton: TextView? = null
     private var appButton: TextView? = null
@@ -80,6 +86,9 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     private var orbAnimator: ObjectAnimator? = null
 
     private var isCompactMode = false
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var isPrecisionListening = false
+    private var wasMutedBeforePrecision = false
 
     private var liveClient: GeminiLiveClient? = null
     private var audioEngine: LiveAudioEngine? = null
@@ -201,7 +210,8 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             apiKey = settings.effectiveApiKey,
             modelId = settings.liveModel,
             voiceName = settings.voiceName,
-            customInstructions = settings.customVoiceInstructions
+            customInstructions = settings.customVoiceInstructions,
+            voiceLanguage = settings.voiceLanguage
         )
     }
 
@@ -380,6 +390,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     override fun emergencyStopActions() {
+        stopPrecisionVoiceRecognition(restoreMic = true)
         autoVisionJob?.cancel()
         autoVisionJob = null
         audioEngine?.interruptPlayback()
@@ -405,6 +416,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
     }
 
     private fun cleanupSessionResources() {
+        stopPrecisionVoiceRecognition(restoreMic = false)
         PilotStateHub.activeController = null
         PilotStateHub.pendingStartupCommand = null
         autoVisionJob?.cancel()
@@ -601,12 +613,12 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             startOrbPulse(orb)
 
             val ticker = TextView(this).apply {
-                layoutParams = LinearLayout.LayoutParams(dp(104), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
-                    marginEnd = dp(4)
+                layoutParams = LinearLayout.LayoutParams(dp(84), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                    marginEnd = dp(3)
                 }
                 text = "LivePilot AI"
                 setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.END
             }
@@ -614,6 +626,10 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
 
             val muteBtn = createPillActionButton("MIC", "#1E293B", "#E2E8F0") { toggleMute() }
             muteButton = muteBtn
+
+            val bnLabel = compactLanguageBadge(PilotStateHub.settings.value.voiceLanguage)
+            val bnBtn = createPillActionButton(bnLabel, "#065F46", "#D1FAE5") { triggerPrecisionVoiceCommand() }
+            bnSpeechButton = bnBtn
 
             val autoBtn = createPillActionButton("AUTO", "#1E293B", "#C4B5FD") { toggleAutoVision() }
             autoVisionButton = autoBtn
@@ -640,6 +656,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             pillRow.addView(orb)
             pillRow.addView(ticker)
             pillRow.addView(muteBtn)
+            pillRow.addView(bnBtn)
             pillRow.addView(autoBtn)
             pillRow.addView(visionBtn)
             pillRow.addView(stopBtn)
@@ -696,12 +713,155 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
         }
     }
 
+    private fun compactLanguageBadge(language: VoiceLanguage): String = when (language) {
+        VoiceLanguage.BENGALI_BD -> "BN"
+        VoiceLanguage.BENGALI_ENGLISH -> "B/E"
+        VoiceLanguage.ENGLISH_US -> "EN"
+    }
+
+    /**
+     * 1-tap Precision Speech-to-Text locked strictly to the user's selected language (default bn-BD).
+     * Temporarily pauses raw Live PCM streaming so Android SpeechRecognizer captures exact Bengali words
+     * without speakerphone bleed or cross-language mishearing, then injects the exact text into the Live call.
+     */
+    private fun triggerPrecisionVoiceCommand() {
+        mainHandler.post {
+            if (isPrecisionListening) {
+                stopPrecisionVoiceRecognition(restoreMic = true)
+                PilotStateHub.updateSession {
+                    it.copy(statusTicker = if (it.isMuted) "Mic muted" else "Listening...")
+                }
+                return@post
+            }
+
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                PilotStateHub.log(LogLevel.ERROR, "PrecisionSTT", "Android SpeechRecognizer is unavailable on this device.")
+                PilotStateHub.updateSession { it.copy(statusTicker = "Voice STT unavailable") }
+                return@post
+            }
+
+            val lang = PilotStateHub.settings.value.voiceLanguage
+            audioEngine?.interruptPlayback()
+            wasMutedBeforePrecision = PilotStateHub.sessionState.value.isMuted
+            audioEngine?.setMuted(true)
+            isPrecisionListening = true
+            updateBnButtonVisual(active = true, language = lang)
+            PilotStateHub.updateSession {
+                it.copy(
+                    activity = AgentActivity.LISTENING,
+                    statusTicker = if (lang == VoiceLanguage.ENGLISH_US) "Speak now (EN)..." else "বলুন (বাংলা)..."
+                )
+            }
+
+            runCatching { speechRecognizer?.destroy() }
+            val recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+            speechRecognizer = recognizer
+
+            recognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) = Unit
+                override fun onBeginningOfSpeech() = Unit
+                override fun onRmsChanged(rmsdB: Float) = Unit
+                override fun onBufferReceived(buffer: ByteArray?) = Unit
+                override fun onEndOfSpeech() {
+                    PilotStateHub.updateSession { it.copy(statusTicker = "Processing...") }
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.trim()
+                        .orEmpty()
+                    if (partial.isNotEmpty()) {
+                        tickerTextView?.text = partial
+                    }
+                }
+
+                override fun onResults(results: Bundle?) {
+                    val recognized = results
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.trim()
+                        .orEmpty()
+                    stopPrecisionVoiceRecognition(restoreMic = true)
+
+                    if (recognized.isNotEmpty()) {
+                        PilotStateHub.log(LogLevel.AUDIO, "PrecisionSTT", "Exact (${lang.bcp47}): $recognized")
+                        PilotStateHub.appendCaption("You", recognized)
+                        val sent = liveClient?.sendUserTextTurn(recognized) ?: false
+                        PilotStateHub.updateSession {
+                            it.copy(
+                                statusTicker = if (sent) "You: ${recognized.take(36)}" else "Call connecting..."
+                            )
+                        }
+                    } else {
+                        PilotStateHub.updateSession { it.copy(statusTicker = "Didn't catch that") }
+                    }
+                }
+
+                override fun onError(error: Int) {
+                    stopPrecisionVoiceRecognition(restoreMic = true)
+                    val msg = when (error) {
+                        SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "শুনতে পাইনি, আবার চাপুন"
+                        SpeechRecognizer.ERROR_AUDIO -> "Mic busy"
+                        SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "STT network error"
+                        else -> "Listening..."
+                    }
+                    PilotStateHub.log(LogLevel.AUDIO, "PrecisionSTT", "STT ended (code=$error)")
+                    PilotStateHub.updateSession { it.copy(statusTicker = msg) }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) = Unit
+            })
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang.bcp47)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang.bcp47)
+                putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, true)
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            }
+            runCatching { recognizer.startListening(intent) }
+                .onFailure { err ->
+                    stopPrecisionVoiceRecognition(restoreMic = true)
+                    PilotStateHub.log(LogLevel.ERROR, "PrecisionSTT", "Failed to start STT: ${err.message}")
+                    PilotStateHub.updateSession { it.copy(statusTicker = "STT start failed") }
+                }
+        }
+    }
+
+    private fun stopPrecisionVoiceRecognition(restoreMic: Boolean) {
+        val wasActive = isPrecisionListening
+        isPrecisionListening = false
+        mainHandler.post {
+            runCatching {
+                speechRecognizer?.cancel()
+                speechRecognizer?.destroy()
+            }
+            speechRecognizer = null
+            updateBnButtonVisual(active = false, language = PilotStateHub.settings.value.voiceLanguage)
+            if (restoreMic && wasActive) {
+                audioEngine?.setMuted(wasMutedBeforePrecision)
+            }
+        }
+    }
+
+    private fun updateBnButtonVisual(active: Boolean, language: VoiceLanguage) {
+        bnSpeechButton?.text = if (active) "●" else compactLanguageBadge(language)
+        (bnSpeechButton?.background as? GradientDrawable)?.setColor(
+            Color.parseColor(if (active) "#10B981" else "#065F46")
+        )
+    }
+
     private fun toggleCompactMode() {
         isCompactMode = !isCompactMode
         mainHandler.post {
             val vis = if (isCompactMode) View.GONE else View.VISIBLE
             tickerTextView?.visibility = vis
             muteButton?.visibility = vis
+            bnSpeechButton?.visibility = vis
             autoVisionButton?.visibility = vis
             visionButton?.visibility = vis
             appButton?.visibility = vis
@@ -860,6 +1020,10 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
                     Color.parseColor(if (state.isMuted) "#B45309" else "#1E293B")
                 )
 
+                if (!isPrecisionListening) {
+                    updateBnButtonVisual(active = false, language = PilotStateHub.settings.value.voiceLanguage)
+                }
+
                 (autoVisionButton?.background as? GradientDrawable)?.setColor(
                     Color.parseColor(if (state.isAutoVisionActive) "#059669" else "#1E293B")
                 )
@@ -889,6 +1053,7 @@ class FloatingCallOverlayService : Service(), OverlaySessionController, GeminiLi
             tickerTextView = null
             captionStripView = null
             muteButton = null
+            bnSpeechButton = null
             autoVisionButton = null
             visionButton = null
             appButton = null

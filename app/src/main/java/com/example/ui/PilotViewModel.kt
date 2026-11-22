@@ -29,6 +29,7 @@ import com.example.data.PilotSettings
 import com.example.data.PilotStateHub
 import com.example.data.RecentToolEvent
 import com.example.data.RoutineAccent
+import com.example.data.VoiceLanguage
 import com.example.messaging.IncomingMessageListener
 import com.example.service.FloatingCallOverlayService
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -316,6 +317,10 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateVoiceName(voice: String) {
         PilotStateHub.updateSettings { it.copy(voiceName = voice) }
+    }
+
+    fun updateVoiceLanguage(language: VoiceLanguage) {
+        PilotStateHub.updateSettings { it.copy(voiceLanguage = language) }
     }
 
     fun updateSpeakerphone(enabled: Boolean) {
