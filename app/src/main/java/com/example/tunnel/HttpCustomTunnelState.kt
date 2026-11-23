@@ -40,12 +40,17 @@ data class TunnelConnectionState(
     val statusDetail: String = "সংযোগ বিচ্ছিন্ন (Disconnected)",
     val activeDnsServer: String? = null,
     val activeDnsTransport: String? = null,
+    val activeDohUrl: String? = null,
     val dnsRttMs: Long? = null,
     val sshBanner: String? = null,
     val resolvedIp: String? = null,
     val txBytes: Long = 0L,
     val rxBytes: Long = 0L,
+    val txSpeedBps: Long = 0L,
+    val rxSpeedBps: Long = 0L,
     val dnsPacketsHandled: Int = 0,
+    val reconnectCount: Int = 0,
+    val pingHistoryMs: List<Long> = emptyList(),
     val connectedSinceMs: Long? = null,
     val lastError: String? = null,
     val logs: List<String> = emptyList()
@@ -59,6 +64,7 @@ data class DnsCandidateProbeResult(
     val rttMs: Long?,
     val responseCode: Int? = null,
     val resolvedIps: List<String> = emptyList(),
+    val dohUrl: String? = null,
     val error: String? = null
 )
 
@@ -66,6 +72,7 @@ data class ProbeSummary(
     val dnsReachable: Boolean,
     val workingDnsServer: String?,
     val workingDnsTransport: String?,
+    val workingDohUrl: String?,
     val workingDnsIsCarrier: Boolean,
     val dnsRttMs: Long?,
     val resolvedIps: List<String>,
@@ -82,10 +89,12 @@ object HttpCustomTunnelStateHolder {
 
     private val PUBLIC_FALLBACK_DNS = listOf(
         "1.1.1.1",
+        "1.0.0.1",
         "8.8.8.8",
         "8.8.4.4",
         "9.9.9.9",
-        "208.67.222.222"
+        "208.67.222.222",
+        GpNetworkInspector.ADGUARD_DNS_IP
     )
 
     private val _state = MutableStateFlow(TunnelConnectionState())
@@ -96,6 +105,18 @@ object HttpCustomTunnelStateHolder {
 
     private val _selectedProfileId = MutableStateFlow(HttpCustomTunnelProfile.DEFAULT_PROFILES.first().id)
     val selectedProfileId: StateFlow<String> = _selectedProfileId.asStateFlow()
+
+    private val _tuning = MutableStateFlow(TunnelTuningConfig())
+    val tuning: StateFlow<TunnelTuningConfig> = _tuning.asStateFlow()
+
+    private val _carrierSnapshot = MutableStateFlow(GpCarrierSnapshot())
+    val carrierSnapshot: StateFlow<GpCarrierSnapshot> = _carrierSnapshot.asStateFlow()
+
+    private val _benchmarkResults = MutableStateFlow<List<DnsBenchmarkEntry>>(emptyList())
+    val benchmarkResults: StateFlow<List<DnsBenchmarkEntry>> = _benchmarkResults.asStateFlow()
+
+    private val _isBenchmarkRunning = MutableStateFlow(false)
+    val isBenchmarkRunning: StateFlow<Boolean> = _isBenchmarkRunning.asStateFlow()
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
@@ -123,18 +144,41 @@ object HttpCustomTunnelStateHolder {
         _profiles.update { list ->
             list.map { if (it.id == profileId) it.copy(dnsServer = dnsServer) else it }
         }
-        appendLog("DNS resolver mode set to: $dnsServer")
+        appendLog("DNS resolver set to: $dnsServer")
+    }
+
+    fun updateTuning(transform: (TunnelTuningConfig) -> TunnelTuningConfig) {
+        _tuning.update(transform)
+        val cfg = _tuning.value
+        appendLog(
+            "GP Pro Tuning -> ${cfg.transportMode.shortLabel}, MTU=${cfg.mtuSize}, EDNS=${cfg.ednsPayloadSize}, AdBlock=${cfg.adBlockDnsEnabled}"
+        )
+    }
+
+    fun refreshCarrierSnapshot(context: Context): GpCarrierSnapshot {
+        val snap = GpNetworkInspector.inspectCurrentNetwork(context)
+        _carrierSnapshot.value = snap
+        return snap
     }
 
     fun updateState(transform: (TunnelConnectionState) -> TunnelConnectionState) {
         _state.update(transform)
     }
 
+    fun recordPingSample(rttMs: Long) {
+        _state.update { current ->
+            current.copy(
+                dnsRttMs = rttMs,
+                pingHistoryMs = (current.pingHistoryMs + rttMs).takeLast(24)
+            )
+        }
+    }
+
     fun appendLog(message: String) {
         val stamp = synchronized(timeFormat) { timeFormat.format(Date()) }
         val line = "[$stamp] $message"
         _state.update { current ->
-            current.copy(logs = (current.logs + line).takeLast(100))
+            current.copy(logs = (current.logs + line).takeLast(120))
         }
     }
 
@@ -147,6 +191,14 @@ object HttpCustomTunnelStateHolder {
             bytes < 1024L -> "$bytes B"
             bytes < 1024L * 1024L -> String.format(Locale.US, "%.1f KB", bytes / 1024.0)
             else -> String.format(Locale.US, "%.2f MB", bytes / (1024.0 * 1024.0))
+        }
+    }
+
+    fun formatSpeed(bytesPerSec: Long): String {
+        return when {
+            bytesPerSec < 1024L -> "$bytesPerSec B/s"
+            bytesPerSec < 1024L * 1024L -> String.format(Locale.US, "%.1f KB/s", bytesPerSec / 1024.0)
+            else -> String.format(Locale.US, "%.2f MB/s", bytesPerSec / (1024.0 * 1024.0))
         }
     }
 
@@ -201,12 +253,12 @@ object HttpCustomTunnelStateHolder {
 
     /**
      * Builds deduplicated ordered candidate DNS servers.
-     * In "auto" mode, carrier/system DNS servers are prioritized first because mobile operators
-     * (GP/Robi/Airtel) frequently drop direct UDP:53 to 8.8.8.8 while permitting carrier DNS.
+     * Prioritizes AdGuard when AdBlock is enabled, Carrier DNS in Auto mode, or explicit IP first.
      */
     fun buildCandidateDnsList(
         configuredDns: String,
-        carrierDnsList: List<String>
+        carrierDnsList: List<String>,
+        adBlockEnabled: Boolean = false
     ): List<Pair<String, Boolean>> {
         val cleanConfigured = configuredDns.trim()
         val isAuto = cleanConfigured.isBlank() || cleanConfigured.equals("auto", ignoreCase = true)
@@ -223,6 +275,9 @@ object HttpCustomTunnelStateHolder {
             }
         }
 
+        if (adBlockEnabled) {
+            addIfNew(GpNetworkInspector.ADGUARD_DNS_IP)
+        }
         if (isAuto) {
             carrierDnsList.forEach(::addIfNew)
             PUBLIC_FALLBACK_DNS.forEach(::addIfNew)
@@ -239,6 +294,7 @@ object HttpCustomTunnelStateHolder {
         isCarrier: Boolean,
         targetDomain: String,
         queryType: Int,
+        ednsPayloadSize: Int,
         timeoutMs: Int,
         underlyingNetwork: Network?,
         protectUdp: ((DatagramSocket) -> Boolean)?
@@ -249,7 +305,8 @@ object HttpCustomTunnelStateHolder {
                 domain = targetDomain,
                 queryType = queryType,
                 transactionId = txId,
-                includeEdns0 = true
+                includeEdns0 = true,
+                ednsUdpPayloadSize = ednsPayloadSize
             )
             DatagramSocket().use { sock ->
                 protectUdp?.invoke(sock)
@@ -377,9 +434,169 @@ object HttpCustomTunnelStateHolder {
         }
     }
 
+    private fun probeSingleDoh(
+        dohUrl: String,
+        labelIp: String,
+        targetDomain: String,
+        underlyingNetwork: Network?,
+        protectTcp: ((Socket) -> Boolean)?
+    ): DnsCandidateProbeResult {
+        return runCatching {
+            val txId = ((System.nanoTime() xor dohUrl.hashCode().toLong()) and 0xFFFFL).toInt()
+            val query = DnsPacketCodec.buildDnsQueryPacket(
+                domain = targetDomain,
+                queryType = DnsPacketCodec.TYPE_A,
+                transactionId = txId,
+                includeEdns0 = false
+            )
+            val client = GpNetworkInspector.createProtectedDohClient(
+                underlyingNetwork = underlyingNetwork,
+                protectTcp = protectTcp,
+                timeoutMs = 3000L
+            )
+            val reply = GpNetworkInspector.sendDohQuery(client, dohUrl, query)
+            if (reply != null) {
+                val (wireBytes, rtt) = reply
+                val parsed = DnsPacketCodec.parseDnsResponse(wireBytes, wireBytes.size)
+                if (parsed != null) {
+                    DnsCandidateProbeResult(
+                        serverIp = labelIp,
+                        isCarrierDns = false,
+                        transport = "DoH:443",
+                        reachable = true,
+                        rttMs = rtt,
+                        responseCode = parsed.responseCode,
+                        resolvedIps = parsed.resolvedIps,
+                        dohUrl = dohUrl
+                    )
+                } else {
+                    DnsCandidateProbeResult(
+                        serverIp = labelIp,
+                        isCarrierDns = false,
+                        transport = "DoH:443",
+                        reachable = false,
+                        rttMs = null,
+                        dohUrl = dohUrl,
+                        error = "Invalid DoH response"
+                    )
+                }
+            } else {
+                DnsCandidateProbeResult(
+                    serverIp = labelIp,
+                    isCarrierDns = false,
+                    transport = "DoH:443",
+                    reachable = false,
+                    rttMs = null,
+                    dohUrl = dohUrl,
+                    error = "DoH unreachable"
+                )
+            }
+        }.getOrElse { err ->
+            DnsCandidateProbeResult(
+                serverIp = labelIp,
+                isCarrierDns = false,
+                transport = "DoH:443",
+                reachable = false,
+                rttMs = null,
+                dohUrl = dohUrl,
+                error = err.localizedMessage ?: err::class.java.simpleName
+            )
+        }
+    }
+
+    /**
+     * Benchmarks Carrier DNS, Public UDP:53 resolvers, and Encrypted DoH:443 in parallel so
+     * GP users can see exact latency rankings and pick the fastest resolver in 1 tap.
+     */
+    suspend fun runDnsBenchmark(
+        context: Context,
+        profile: HttpCustomTunnelProfile
+    ): List<DnsBenchmarkEntry> = withContext(Dispatchers.IO) {
+        _isBenchmarkRunning.value = true
+        try {
+            val snap = refreshCarrierSnapshot(context)
+            val (activeNet, carrierDns) = discoverUnderlyingNetworkAndDns(context)
+            val ednsSize = _tuning.value.ednsPayloadSize
+            val targetDomain = profile.nameserver.ifBlank { profile.host }
+
+            val udpTargets = buildList {
+                carrierDns.forEachIndexed { idx, ip ->
+                    val prefix = if (snap.isGrameenphone) "GP Carrier DNS #${idx + 1}" else "Carrier DNS #${idx + 1}"
+                    add(Triple(prefix, ip, true))
+                }
+                add(Triple("Cloudflare Primary", "1.1.1.1", false))
+                add(Triple("Cloudflare Alt", "1.0.0.1", false))
+                add(Triple("Google DNS", "8.8.8.8", false))
+                add(Triple("Quad9 Secure", "9.9.9.9", false))
+                add(Triple("AdGuard AdBlock", GpNetworkInspector.ADGUARD_DNS_IP, false))
+            }.distinctBy { it.second }
+
+            val entries = coroutineScope {
+                val udpJobs = udpTargets.map { (label, ip, isCarrier) ->
+                    async(Dispatchers.IO) {
+                        val res = probeSingleUdpDns(
+                            dnsIp = ip,
+                            isCarrier = isCarrier,
+                            targetDomain = targetDomain,
+                            queryType = DnsPacketCodec.TYPE_TXT,
+                            ednsPayloadSize = ednsSize,
+                            timeoutMs = 2400,
+                            underlyingNetwork = activeNet,
+                            protectUdp = null
+                        )
+                        DnsBenchmarkEntry(
+                            label = label,
+                            serverIp = ip,
+                            transport = res.transport,
+                            isCarrier = isCarrier,
+                            reachable = res.reachable,
+                            rttMs = res.rttMs,
+                            detail = if (res.reachable) "SlowDNS EDNS0 OK" else (res.error ?: "Timeout")
+                        )
+                    }
+                }
+                val dohJob = async(Dispatchers.IO) {
+                    val dohRes = probeSingleDoh(
+                        dohUrl = GpNetworkInspector.CLOUDFLARE_DOH_URL,
+                        labelIp = "1.1.1.1",
+                        targetDomain = profile.host,
+                        underlyingNetwork = activeNet,
+                        protectTcp = null
+                    )
+                    DnsBenchmarkEntry(
+                        label = "Cloudflare DoH (HTTPS)",
+                        serverIp = "1.1.1.1",
+                        transport = "DoH:443",
+                        isCarrier = false,
+                        reachable = dohRes.reachable,
+                        rttMs = dohRes.rttMs,
+                        detail = if (dohRes.reachable) "Encrypted Port 443 OK" else (dohRes.error ?: "Timeout")
+                    )
+                }
+                udpJobs.awaitAll() + dohJob.await()
+            }
+
+            val sorted = entries.sortedWith(
+                compareByDescending<DnsBenchmarkEntry> { it.reachable }
+                    .thenBy { it.rttMs ?: Long.MAX_VALUE }
+            )
+            _benchmarkResults.value = sorted
+            val fastest = sorted.firstOrNull { it.reachable }
+            if (fastest != null) {
+                appendLog("DNS Benchmark fastest: ${fastest.label} (${fastest.serverIp} ${fastest.transport}) -> ${fastest.rttMs} ms")
+            } else {
+                appendLog("DNS Benchmark: No resolvers responded")
+            }
+            sorted
+        } finally {
+            _isBenchmarkRunning.value = false
+        }
+    }
+
     suspend fun probeNetworkReachability(
         profile: HttpCustomTunnelProfile,
         context: Context? = null,
+        tuningConfig: TunnelTuningConfig = _tuning.value,
         underlyingNetworkOverride: Network? = null,
         carrierDnsOverride: List<String>? = null,
         protectUdp: ((DatagramSocket) -> Boolean)? = null,
@@ -388,64 +605,98 @@ object HttpCustomTunnelStateHolder {
         val (discoveredNet, discoveredDns) = discoverUnderlyingNetworkAndDns(context)
         val activeNet = underlyingNetworkOverride ?: discoveredNet
         val carrierDnsList = carrierDnsOverride ?: discoveredDns
-        val candidates = buildCandidateDnsList(profile.dnsServer, carrierDnsList)
+        val candidates = buildCandidateDnsList(
+            configuredDns = profile.dnsServer,
+            carrierDnsList = carrierDnsList,
+            adBlockEnabled = tuningConfig.adBlockDnsEnabled
+        )
         val targetDomain = profile.nameserver.ifBlank { profile.host }
+        val allResults = mutableListOf<DnsCandidateProbeResult>()
+        var bestDns: DnsCandidateProbeResult? = null
 
-        // 1. Probe all candidate DNS servers concurrently over UDP:53 (SlowDNS TXT+EDNS0 & A)
-        val udpResults = coroutineScope {
-            candidates.map { (ip, isCarrier) ->
-                async(Dispatchers.IO) {
-                    val primary = probeSingleUdpDns(
-                        dnsIp = ip,
-                        isCarrier = isCarrier,
-                        targetDomain = targetDomain,
-                        queryType = DnsPacketCodec.TYPE_TXT,
-                        timeoutMs = 2600,
-                        underlyingNetwork = activeNet,
-                        protectUdp = protectUdp
-                    )
-                    if (primary.reachable) {
-                        // Also try resolving A record quickly for SSH host if possible
-                        if (primary.resolvedIps.isEmpty()) {
-                            val aProbe = probeSingleUdpDns(
+        // Mode 1: Explicit DoH HTTPS:443 mode
+        if (tuningConfig.transportMode == TunnelTransportMode.DOH_HTTPS) {
+            val primaryDoh = GpNetworkInspector.selectDohEndpoint(profile.dnsServer, tuningConfig.adBlockDnsEnabled)
+            val dohUrls = listOf(
+                primaryDoh to if (primaryDoh == GpNetworkInspector.GOOGLE_DOH_URL) "8.8.8.8"
+                else if (primaryDoh == GpNetworkInspector.ADGUARD_DOH_URL) GpNetworkInspector.ADGUARD_DNS_IP
+                else "1.1.1.1",
+                GpNetworkInspector.CLOUDFLARE_DOH_URL to "1.1.1.1",
+                GpNetworkInspector.GOOGLE_DOH_URL to "8.8.8.8"
+            ).distinctBy { it.first }
+
+            val dohResults = coroutineScope {
+                dohUrls.map { (url, ip) ->
+                    async(Dispatchers.IO) {
+                        probeSingleDoh(url, ip, profile.host, activeNet, protectTcp)
+                    }
+                }.awaitAll()
+            }
+            allResults.addAll(dohResults)
+            bestDns = dohResults.filter { it.reachable }.minByOrNull { it.rttMs ?: Long.MAX_VALUE }
+        }
+
+        // Mode 2: UDP:53 Probing (Auto Smart or Carrier UDP)
+        if (bestDns == null && tuningConfig.transportMode != TunnelTransportMode.TCP_53) {
+            val udpCandidates = if (tuningConfig.transportMode == TunnelTransportMode.CARRIER_UDP && carrierDnsList.isNotEmpty()) {
+                carrierDnsList.map { it to true }
+            } else {
+                candidates
+            }
+            val udpResults = coroutineScope {
+                udpCandidates.map { (ip, isCarrier) ->
+                    async(Dispatchers.IO) {
+                        val primary = probeSingleUdpDns(
+                            dnsIp = ip,
+                            isCarrier = isCarrier,
+                            targetDomain = targetDomain,
+                            queryType = DnsPacketCodec.TYPE_TXT,
+                            ednsPayloadSize = tuningConfig.ednsPayloadSize,
+                            timeoutMs = 2500,
+                            underlyingNetwork = activeNet,
+                            protectUdp = protectUdp
+                        )
+                        if (primary.reachable) {
+                            if (primary.resolvedIps.isEmpty()) {
+                                val aProbe = probeSingleUdpDns(
+                                    dnsIp = ip,
+                                    isCarrier = isCarrier,
+                                    targetDomain = profile.host,
+                                    queryType = DnsPacketCodec.TYPE_A,
+                                    ednsPayloadSize = tuningConfig.ednsPayloadSize,
+                                    timeoutMs = 1500,
+                                    underlyingNetwork = activeNet,
+                                    protectUdp = protectUdp
+                                )
+                                primary.copy(resolvedIps = aProbe.resolvedIps)
+                            } else {
+                                primary
+                            }
+                        } else {
+                            probeSingleUdpDns(
                                 dnsIp = ip,
                                 isCarrier = isCarrier,
                                 targetDomain = profile.host,
                                 queryType = DnsPacketCodec.TYPE_A,
-                                timeoutMs = 1500,
+                                ednsPayloadSize = tuningConfig.ednsPayloadSize,
+                                timeoutMs = 1900,
                                 underlyingNetwork = activeNet,
                                 protectUdp = protectUdp
                             )
-                            primary.copy(resolvedIps = aProbe.resolvedIps)
-                        } else {
-                            primary
                         }
-                    } else {
-                        // Fallback check with standard A query on same resolver (some carriers filter TXT)
-                        probeSingleUdpDns(
-                            dnsIp = ip,
-                            isCarrier = isCarrier,
-                            targetDomain = profile.host,
-                            queryType = DnsPacketCodec.TYPE_A,
-                            timeoutMs = 2000,
-                            underlyingNetwork = activeNet,
-                            protectUdp = protectUdp
-                        )
                     }
-                }
-            }.awaitAll()
+                }.awaitAll()
+            }
+            allResults.addAll(udpResults)
+            bestDns = udpResults
+                .filter { it.reachable }
+                .minByOrNull { (it.rttMs ?: Long.MAX_VALUE) + if (it.isCarrierDns) 0L else 15L }
         }
 
-        // 2. If all UDP:53 probes failed, try DNS-over-TCP (port 53) on top 3 resolvers
-        val allResults = mutableListOf<DnsCandidateProbeResult>()
-        allResults.addAll(udpResults)
-        var bestDns = udpResults
-            .filter { it.reachable }
-            .minByOrNull { (it.rttMs ?: Long.MAX_VALUE) + if (it.isCarrierDns) 0L else 15L }
-
+        // Mode 3: TCP:53 Probing (explicit TCP_53 or fallback when UDP:53 fails in Auto Smart)
         if (bestDns == null) {
             val tcpResults = coroutineScope {
-                candidates.take(3).map { (ip, isCarrier) ->
+                candidates.take(4).map { (ip, isCarrier) ->
                     async(Dispatchers.IO) {
                         probeSingleTcpDns(
                             dnsIp = ip,
@@ -462,7 +713,23 @@ object HttpCustomTunnelStateHolder {
             bestDns = tcpResults.filter { it.reachable }.minByOrNull { it.rttMs ?: Long.MAX_VALUE }
         }
 
-        // 3. Also test direct TCP + SSH-2.0 handshake to host:port
+        // Mode 4: Automatic DoH HTTPS:443 Fallback in Auto Smart when both UDP:53 & TCP:53 are blocked
+        if (bestDns == null && tuningConfig.transportMode == TunnelTransportMode.AUTO_SMART) {
+            val fallbackDoh = coroutineScope {
+                listOf(
+                    GpNetworkInspector.CLOUDFLARE_DOH_URL to "1.1.1.1",
+                    GpNetworkInspector.GOOGLE_DOH_URL to "8.8.8.8"
+                ).map { (url, ip) ->
+                    async(Dispatchers.IO) {
+                        probeSingleDoh(url, ip, profile.host, activeNet, protectTcp)
+                    }
+                }.awaitAll()
+            }
+            allResults.addAll(fallbackDoh)
+            bestDns = fallbackDoh.filter { it.reachable }.minByOrNull { it.rttMs ?: Long.MAX_VALUE }
+        }
+
+        // 5. Direct TCP + SSH-2.0 handshake to host:port
         var sshReachable = false
         var sshBanner: String? = null
         var sshRttMs: Long? = null
@@ -487,8 +754,8 @@ object HttpCustomTunnelStateHolder {
                     runCatching { activeNet.bindSocket(tcp) }
                 }
                 val t0 = System.currentTimeMillis()
-                tcp.connect(InetSocketAddress(connectTarget, profile.port), 3500)
-                tcp.soTimeout = 3000
+                tcp.connect(InetSocketAddress(connectTarget, profile.port), 3200)
+                tcp.soTimeout = 2800
                 val reader = tcp.getInputStream().bufferedReader(Charsets.UTF_8)
                 val bannerLine = reader.readLine()?.trim().orEmpty()
                 if (bannerLine.startsWith("SSH-", ignoreCase = true)) {
@@ -507,11 +774,10 @@ object HttpCustomTunnelStateHolder {
 
         val errorSummary = if (bestDns == null && !sshReachable) {
             val testedIps = candidates.take(4).joinToString(", ") { it.first }
-            val detail = buildList {
-                add("DNS ($testedIps): কোনো রেসপন্স নেই (ক্যারিয়ার UDP/TCP:53 ব্লক বা নেটওয়ার্ক অফ)")
+            buildList {
+                add("DNS ($testedIps + DoH:443): কোনো রেসপন্স নেই (মোবাইল ডাটা/সিগন্যাল চেক করুন)")
                 if (!sshError.isNullOrBlank()) add(sshError!!)
             }.joinToString(" | ")
-            detail
         } else {
             null
         }
@@ -520,6 +786,7 @@ object HttpCustomTunnelStateHolder {
             dnsReachable = bestDns != null,
             workingDnsServer = bestDns?.serverIp,
             workingDnsTransport = bestDns?.transport,
+            workingDohUrl = bestDns?.dohUrl,
             workingDnsIsCarrier = bestDns?.isCarrierDns == true,
             dnsRttMs = bestDns?.rttMs,
             resolvedIps = resolvedIps,

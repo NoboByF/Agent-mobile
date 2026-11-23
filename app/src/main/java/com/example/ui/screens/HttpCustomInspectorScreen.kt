@@ -26,10 +26,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AddCircleOutline
@@ -63,6 +61,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -88,11 +87,18 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.HttpCustomProfileParser
 import com.example.data.HttpCustomTunnelProfile
 import com.example.service.HttpCustomVpnService
+import com.example.tunnel.GpNetworkInspector
 import com.example.tunnel.HttpCustomTunnelStateHolder
 import com.example.tunnel.TunnelConnectionPhase
+import com.example.tunnel.TunnelTransportMode
 import com.example.ui.components.CallDurationBadge
+import com.example.ui.components.DnsBenchmarkCard
+import com.example.ui.components.EditTunnelProfileDialog
+import com.example.ui.components.GpCarrierStatusCard
+import com.example.ui.components.GpProTuningCard
 import com.example.ui.components.StatusPillBadge
 import com.example.ui.components.StudioCardContainer
+import com.example.ui.components.TunnelLatencySparkline
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.ConsoleDarkBg
 import com.example.ui.theme.ConsoleDarkCard
@@ -107,10 +113,11 @@ import com.example.ui.theme.WarmAmber
 import kotlinx.coroutines.launch
 
 private val DNS_PRESET_OPTIONS = listOf(
-    "auto" to "Auto (Carrier)",
+    "auto" to "GP Auto",
     "1.1.1.1" to "1.1.1.1",
     "8.8.8.8" to "8.8.8.8",
-    "9.9.9.9" to "9.9.9.9"
+    "9.9.9.9" to "9.9.9.9",
+    GpNetworkInspector.ADGUARD_DNS_IP to "AdGuard"
 )
 
 @Composable
@@ -129,9 +136,17 @@ fun HttpCustomInspectorScreen(
         onExitStandalone?.invoke()
     }
 
+    LaunchedEffect(Unit) {
+        HttpCustomTunnelStateHolder.refreshCarrierSnapshot(context)
+    }
+
     val profiles by HttpCustomTunnelStateHolder.profiles.collectAsStateWithLifecycle()
     val selectedProfileId by HttpCustomTunnelStateHolder.selectedProfileId.collectAsStateWithLifecycle()
     val tunnelState by HttpCustomTunnelStateHolder.state.collectAsStateWithLifecycle()
+    val tuning by HttpCustomTunnelStateHolder.tuning.collectAsStateWithLifecycle()
+    val carrierSnapshot by HttpCustomTunnelStateHolder.carrierSnapshot.collectAsStateWithLifecycle()
+    val benchmarkResults by HttpCustomTunnelStateHolder.benchmarkResults.collectAsStateWithLifecycle()
+    val isBenchmarkRunning by HttpCustomTunnelStateHolder.isBenchmarkRunning.collectAsStateWithLifecycle()
 
     val activeProfile = profiles.firstOrNull { it.id == selectedProfileId } ?: profiles.first()
 
@@ -214,8 +229,7 @@ fun HttpCustomInspectorScreen(
                             onShowNotice("প্রথমে JSON পেস্ট করুন।")
                             return@Button
                         }
-                        val parsed = HttpCustomProfileParser.parseFromJson(trimmed)
-                        parsed.onSuccess { profile ->
+                        HttpCustomProfileParser.parseFromJson(trimmed).onSuccess { profile ->
                             HttpCustomTunnelStateHolder.addOrSelectProfile(profile)
                             importJsonText = ""
                             showImportDialog = false
@@ -316,12 +330,12 @@ fun HttpCustomInspectorScreen(
                 }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "HTTP Custom Tunnel",
+                        text = "GP Pro Tunnel",
                         style = MaterialTheme.typography.headlineMedium,
                         color = palette.inkPrimary
                     )
                     Text(
-                        text = "গ্রামীণফোন, রবি ও এয়ারটেল SlowDNS + SSH কানেক্টর",
+                        text = "গ্রামীণফোন SlowDNS + DoH 443 + SSH অ্যাডভান্সড কানেক্টর",
                         style = MaterialTheme.typography.bodySmall,
                         color = palette.inkSecondary
                     )
@@ -346,7 +360,18 @@ fun HttpCustomInspectorScreen(
             }
         }
 
-        // Hero Connect / Disconnect Card
+        // Live Grameenphone SIM & Carrier Telemetry Card
+        item {
+            GpCarrierStatusCard(
+                snapshot = carrierSnapshot,
+                onRefresh = {
+                    val snap = HttpCustomTunnelStateHolder.refreshCarrierSnapshot(context)
+                    onShowNotice("নেটওয়ার্ক রিফ্রেশ: ${snap.operatorName} (${snap.carrierDnsServers.firstOrNull() ?: "Auto"})")
+                }
+            )
+        }
+
+        // Hero Connect / Disconnect Card with Live Speed & Ping Sparkline
         item {
             StudioCardContainer(
                 borderColor = if (isConnected) EmeraldGreen.copy(alpha = 0.55f)
@@ -396,8 +421,8 @@ fun HttpCustomInspectorScreen(
                             )
                             Text(
                                 text = tunnelState.activeDnsServer?.let { dns ->
-                                    "DNS: $dns • ${tunnelState.activeDnsTransport ?: "UDP:53"}"
-                                } ?: "${activeProfile.host}:${activeProfile.port} • DNS: ${activeProfile.dnsServer}",
+                                    "$dns • ${tunnelState.activeDnsTransport ?: "UDP:53"} • MTU ${tuning.mtuSize}"
+                                } ?: "${activeProfile.host}:${activeProfile.port} • ${tuning.transportMode.shortLabel}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = palette.inkSecondary,
                                 maxLines = 1,
@@ -448,7 +473,7 @@ fun HttpCustomInspectorScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Quick DNS Mode Selector Chips (Auto Carrier DNS solves 8.8.8.8 timeout on GP/Robi/Airtel)
+                // Quick DNS Mode Selector Chips
                 LazyRow(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -501,7 +526,7 @@ fun HttpCustomInspectorScreen(
                             TunnelConnectionPhase.CONNECTED -> "ডিসকানেক্ট করুন (Disconnect)"
                             TunnelConnectionPhase.CONNECTING -> "বাতিল করুন (Connecting...)"
                             TunnelConnectionPhase.ERROR -> "পুনরায় কানেক্ট করুন (Retry Connect)"
-                            TunnelConnectionPhase.DISCONNECTED -> "কানেক্ট করুন (Connect)"
+                            TunnelConnectionPhase.DISCONNECTED -> "GP টানেল কানেক্ট করুন (Connect)"
                         },
                         color = Color.White,
                         style = MaterialTheme.typography.titleSmall,
@@ -509,7 +534,7 @@ fun HttpCustomInspectorScreen(
                     )
                 }
 
-                // Live Telemetry Stats Row
+                // Live Telemetry Stats & Sparkline
                 if (isConnected || tunnelState.dnsRttMs != null || tunnelState.txBytes > 0L) {
                     Spacer(modifier = Modifier.height(12.dp))
                     Row(
@@ -521,27 +546,66 @@ fun HttpCustomInspectorScreen(
                             value = tunnelState.dnsRttMs?.let { "$it ms" } ?: "--",
                             accent = EmeraldGreen,
                             palette = palette,
-                            modifier = Modifier.weight(1f)
+                            modifier = Modifier.weight(0.9f)
                         )
                         TelemetryStatChip(
-                            label = "TX / RX",
-                            value = "${HttpCustomTunnelStateHolder.formatBytes(tunnelState.txBytes)} / ${
-                                HttpCustomTunnelStateHolder.formatBytes(tunnelState.rxBytes)
-                            }",
+                            label = "Live Speed",
+                            value = "↓${HttpCustomTunnelStateHolder.formatSpeed(tunnelState.rxSpeedBps)}",
                             accent = CobaltBlue,
                             palette = palette,
-                            modifier = Modifier.weight(1.3f)
+                            modifier = Modifier.weight(1.25f)
                         )
                         TelemetryStatChip(
-                            label = "DNS Pkts",
-                            value = "${tunnelState.dnsPacketsHandled}",
+                            label = "Data (${tunnelState.dnsPacketsHandled})",
+                            value = HttpCustomTunnelStateHolder.formatBytes(tunnelState.txBytes + tunnelState.rxBytes),
                             accent = WarmAmber,
                             palette = palette,
-                            modifier = Modifier.weight(0.9f)
+                            modifier = Modifier.weight(1.1f)
+                        )
+                    }
+                    if (tunnelState.pingHistoryMs.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        TunnelLatencySparkline(
+                            samples = tunnelState.pingHistoryMs,
+                            accentColor = EmeraldGreen
                         )
                     }
                 }
             }
+        }
+
+        // GP DNS Speed Benchmark Scanner
+        item {
+            DnsBenchmarkCard(
+                results = benchmarkResults,
+                isRunning = isBenchmarkRunning,
+                onRunBenchmark = {
+                    coroutineScope.launch {
+                        HttpCustomTunnelStateHolder.runDnsBenchmark(context, activeProfile)
+                    }
+                },
+                onApplyResolver = { entry ->
+                    HttpCustomTunnelStateHolder.updateProfileDns(activeProfile.id, entry.serverIp)
+                    if (entry.transport == "DoH:443") {
+                        HttpCustomTunnelStateHolder.updateTuning {
+                            it.copy(transportMode = TunnelTransportMode.DOH_HTTPS)
+                        }
+                    } else if (entry.isCarrier) {
+                        HttpCustomTunnelStateHolder.updateTuning {
+                            it.copy(transportMode = TunnelTransportMode.AUTO_SMART)
+                        }
+                    }
+                    onShowNotice("✓ নির্বাচিত: ${entry.label} (${entry.serverIp} • ${entry.rttMs}ms)")
+                }
+            )
+        }
+
+        // GP Pro Engine & Advanced Tuning Card
+        item {
+            GpProTuningCard(
+                tuning = tuning,
+                onUpdateTuning = { HttpCustomTunnelStateHolder.updateTuning(it) }
+            )
         }
 
         // Profile Selector Tabs
@@ -573,8 +637,8 @@ fun HttpCustomInspectorScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = when (profile.id) {
-                                "hc_gp_robi_airtel_1" -> "GP/Robi/Airtel (Auto)"
-                                "hc_cloudflare_slowdns_2" -> "Cloudflare 1.1.1.1"
+                                "hc_gp_robi_airtel_1" -> "GP Auto Pro"
+                                "hc_cloudflare_slowdns_2" -> "GP Cloudflare 1.1.1.1"
                                 else -> profile.name.take(18)
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -623,53 +687,25 @@ fun HttpCustomInspectorScreen(
                 )
                 Spacer(modifier = Modifier.height(10.dp))
 
+                TunnelDetailRow(Icons.Filled.Router, "Server Host & Port", "${activeProfile.host}:${activeProfile.port}", palette)
+                TunnelDetailRow(Icons.Filled.Person, "SSH Username", activeProfile.username, palette)
+                TunnelDetailRow(Icons.Filled.Key, "SSH Password", activeProfile.password, palette)
+                TunnelDetailRow(Icons.Filled.NetworkCheck, "SlowDNS Nameserver", activeProfile.nameserver, palette)
                 TunnelDetailRow(
-                    icon = Icons.Filled.Router,
-                    label = "Server Host & Port",
-                    value = "${activeProfile.host}:${activeProfile.port}",
-                    palette = palette
+                    Icons.Filled.Dns,
+                    "DNS Resolver",
+                    if (activeProfile.dnsServer.equals("auto", ignoreCase = true)) "GP Auto (Carrier + DoH)"
+                    else "${activeProfile.dnsServer}:53",
+                    palette
                 )
                 TunnelDetailRow(
-                    icon = Icons.Filled.Person,
-                    label = "SSH Username",
-                    value = activeProfile.username,
-                    palette = palette
-                )
-                TunnelDetailRow(
-                    icon = Icons.Filled.Key,
-                    label = "SSH Password",
-                    value = activeProfile.password,
-                    palette = palette
-                )
-                TunnelDetailRow(
-                    icon = Icons.Filled.NetworkCheck,
-                    label = "SlowDNS Nameserver",
-                    value = activeProfile.nameserver,
-                    palette = palette
-                )
-                TunnelDetailRow(
-                    icon = Icons.Filled.Dns,
-                    label = "DNS Resolver",
-                    value = if (activeProfile.dnsServer.equals("auto", ignoreCase = true)) {
-                        "Auto (Carrier + Public)"
-                    } else {
-                        "${activeProfile.dnsServer}:53"
-                    },
-                    palette = palette
-                )
-                TunnelDetailRow(
-                    icon = Icons.Filled.Security,
-                    label = "Public Key (PubKey)",
-                    value = activeProfile.pubKey.take(28).ifBlank { "None" } +
+                    Icons.Filled.Security,
+                    "Public Key (PubKey)",
+                    activeProfile.pubKey.take(28).ifBlank { "None" } +
                         if (activeProfile.pubKey.length > 28) "..." else "",
-                    palette = palette
+                    palette
                 )
-                TunnelDetailRow(
-                    icon = Icons.Filled.Code,
-                    label = "Banner / Note",
-                    value = activeProfile.bannerNote,
-                    palette = palette
-                )
+                TunnelDetailRow(Icons.Filled.Code, "Banner / Note", activeProfile.bannerNote, palette)
 
                 Spacer(modifier = Modifier.height(14.dp))
 
@@ -703,29 +739,28 @@ fun HttpCustomInspectorScreen(
                         onClick = {
                             if (isProbingOnly) return@OutlinedButton
                             isProbingOnly = true
-                            HttpCustomTunnelStateHolder.appendLog(
-                                "Probing Carrier & Public DNS for ${activeProfile.nameserver}..."
-                            )
+                            HttpCustomTunnelStateHolder.appendLog("Running GP Smart Probe for ${activeProfile.nameserver}...")
                             coroutineScope.launch {
                                 val result = HttpCustomTunnelStateHolder.probeNetworkReachability(
                                     profile = activeProfile,
-                                    context = context
+                                    context = context,
+                                    tuningConfig = tuning
                                 )
                                 isProbingOnly = false
                                 val summary = buildString {
                                     if (result.dnsReachable) {
-                                        val tag = if (result.workingDnsIsCarrier) "Carrier" else "DNS"
+                                        val tag = if (result.workingDnsIsCarrier) "GP DNS" else (result.workingDnsTransport ?: "DNS")
                                         append("$tag ${result.workingDnsServer} OK (${result.dnsRttMs}ms)")
                                     } else {
-                                        append("DNS Blocked/Offline")
+                                        append("DNS/DoH Offline")
                                     }
                                     append(" • ")
                                     if (result.sshReachable) append("SSH OK (${result.sshRttMs}ms)")
                                     else append("SSH Filtered")
                                 }
+                                result.dnsRttMs?.let { HttpCustomTunnelStateHolder.recordPingSample(it) }
                                 HttpCustomTunnelStateHolder.updateState {
                                     it.copy(
-                                        dnsRttMs = result.dnsRttMs ?: result.sshRttMs,
                                         activeDnsServer = result.workingDnsServer ?: it.activeDnsServer,
                                         activeDnsTransport = result.workingDnsTransport ?: it.activeDnsTransport,
                                         sshBanner = result.sshBanner ?: it.sshBanner
@@ -743,10 +778,7 @@ fun HttpCustomInspectorScreen(
                         border = BorderStroke(1.dp, palette.outline)
                     ) {
                         if (isProbingOnly) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp
-                            )
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
                         } else {
                             Icon(
                                 imageVector = Icons.Filled.Speed,
@@ -785,7 +817,7 @@ fun HttpCustomInspectorScreen(
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = "Tunnel Connection Logs",
+                                text = "GP Tunnel Live Console",
                                 style = MaterialTheme.typography.titleSmall,
                                 color = ConsoleTextPrimary,
                                 fontWeight = FontWeight.SemiBold
@@ -808,7 +840,7 @@ fun HttpCustomInspectorScreen(
 
                     if (tunnelState.logs.isEmpty()) {
                         Text(
-                            text = "কানেক্ট বাটনে ট্যাপ করলে এখানে ক্যারিয়ার DNS অটো-ডিটেকশন ও রিয়েল-টাইম লগ দেখাবে।",
+                            text = "GP টানেল কানেক্ট বা Scan DNS চাপলে এখানে রিয়েল-টাইম GP DNS/DoH/SSH লগ দেখাবে।",
                             style = MaterialTheme.typography.bodySmall,
                             color = ConsoleTextMuted,
                             fontFamily = JetBrainsMonoFontFamily
@@ -819,7 +851,7 @@ fun HttpCustomInspectorScreen(
                                 Text(
                                     text = line,
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = if (line.contains("OK") || line.contains("active")) EmeraldGreen
+                                    color = if (line.contains("OK") || line.contains("active") || line.contains("fastest")) EmeraldGreen
                                     else if (line.contains("failed") || line.contains("denied") || line.contains("Timeout")) SignalRed
                                     else ConsoleTextPrimary,
                                     fontFamily = JetBrainsMonoFontFamily
@@ -831,109 +863,6 @@ fun HttpCustomInspectorScreen(
             }
         }
     }
-}
-
-@Composable
-private fun EditTunnelProfileDialog(
-    profile: HttpCustomTunnelProfile,
-    onDismiss: () -> Unit,
-    onSave: (HttpCustomTunnelProfile) -> Unit
-) {
-    var host by remember(profile.id) { mutableStateOf(profile.host) }
-    var port by remember(profile.id) { mutableStateOf(profile.port.toString()) }
-    var nameserver by remember(profile.id) { mutableStateOf(profile.nameserver) }
-    var dnsServer by remember(profile.id) { mutableStateOf(profile.dnsServer) }
-    var username by remember(profile.id) { mutableStateOf(profile.username) }
-    var password by remember(profile.id) { mutableStateOf(profile.password) }
-    var pubKey by remember(profile.id) { mutableStateOf(profile.pubKey) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("প্রফাইল এডিট করুন") },
-        text = {
-            Column(
-                modifier = Modifier.verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                OutlinedTextField(
-                    value = host,
-                    onValueChange = { host = it },
-                    label = { Text("Server Host") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = port,
-                    onValueChange = { port = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Port (22)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = nameserver,
-                    onValueChange = { nameserver = it },
-                    label = { Text("SlowDNS Nameserver (NS)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = dnsServer,
-                    onValueChange = { dnsServer = it },
-                    label = { Text("DNS Resolver (auto / IP)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = username,
-                    onValueChange = { username = it },
-                    label = { Text("SSH Username") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    label = { Text("SSH Password") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = pubKey,
-                    onValueChange = { pubKey = it },
-                    label = { Text("SlowDNS Public Key") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    val cleanHost = host.trim().ifBlank { profile.host }
-                    val cleanPort = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: profile.port
-                    onSave(
-                        profile.copy(
-                            host = cleanHost,
-                            port = cleanPort,
-                            nameserver = nameserver.trim().ifBlank { cleanHost },
-                            dnsServer = dnsServer.trim().ifBlank { "auto" },
-                            username = username.trim(),
-                            password = password.trim(),
-                            pubKey = pubKey.trim()
-                        )
-                    )
-                },
-                modifier = Modifier.testTag("hc_save_profile_button")
-            ) {
-                Text("সেভ করুন")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("বাতিল")
-            }
-        }
-    )
 }
 
 @Composable

@@ -1032,6 +1032,32 @@ class ExampleRobolectricTest {
         assertEquals(query.size, parsedTun.payload.size)
         assertEquals(0x42, parsedTun.payload[0].toInt() and 0xFF)
     }
+
+    @Test
+    fun `gp network inspector detects Grameenphone MCC MNC 47001, selects DoH endpoints, and prioritizes AdGuard`() {
+        assertTrue(com.example.tunnel.GpNetworkInspector.isGrameenphoneOperator("47001", ""))
+        assertTrue(com.example.tunnel.GpNetworkInspector.isGrameenphoneOperator("", "Grameenphone"))
+        assertFalse(com.example.tunnel.GpNetworkInspector.isGrameenphoneOperator("47002", "Robi"))
+        assertEquals(
+            "Grameenphone (GP)",
+            com.example.tunnel.GpNetworkInspector.resolveOperatorDisplayName("47001", "")
+        )
+        assertEquals(
+            com.example.tunnel.GpNetworkInspector.ADGUARD_DOH_URL,
+            com.example.tunnel.GpNetworkInspector.selectDohEndpoint("1.1.1.1", adBlockEnabled = true)
+        )
+        assertEquals(
+            com.example.tunnel.GpNetworkInspector.GOOGLE_DOH_URL,
+            com.example.tunnel.GpNetworkInspector.selectDohEndpoint("8.8.8.8", adBlockEnabled = false)
+        )
+        val adBlockOrder = com.example.tunnel.HttpCustomTunnelStateHolder.buildCandidateDnsList(
+            configuredDns = "auto",
+            carrierDnsList = listOf("182.160.120.11"),
+            adBlockEnabled = true
+        )
+        assertEquals(com.example.tunnel.GpNetworkInspector.ADGUARD_DNS_IP, adBlockOrder.first().first)
+        assertEquals("1.5 KB/s", com.example.tunnel.HttpCustomTunnelStateHolder.formatSpeed(1536L))
+    }
 }
 
 
