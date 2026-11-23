@@ -207,16 +207,22 @@ object TunnelAutoDoctor {
 
         if (wsAttempted && !wsSucceeded && slowDnsAttempted && !slowDnsSucceeded) {
             val captivePortal = wsFailures.any { it.contains("HTTP 302", ignoreCase = true) || it.contains("HTTP 301", ignoreCase = true) }
-            val extraReason = if (captivePortal) {
-                "আপনার $opLabel সিম সব ট্র্যাফিক ব্যালেন্স পোর্টালে (HTTP 302) রিডাইরেক্ট করছে।"
-            } else {
-                "আপনার $opLabel সিমে বর্তমানে WebSocket (80/443), Cloudflare Edge ও SlowDNS (UDP/DoH/DoT) সবগুলো পোর্ট ফায়ারওয়ালে ব্লক রয়েছে।"
+            if (captivePortal) {
+                return TunnelDiagnosis(
+                    category = FailureCategory.ALL_ROUTES_BLOCKED,
+                    titleBn = "সিমে সক্রিয় ইন্টারনেট ডাটা নেই (HTTP 302)",
+                    explanationBn = "আপনার $opLabel সিমের সব ট্র্যাফিক অপারেটরের ব্যালেন্স পোর্টালে (HTTP 302) রিডাইরেক্ট হচ্ছে। যেকোনো VPN বা SSH টানেল সঠিকভাবে কানেক্ট হতে হলে প্রথমে সিমে সক্রিয় ইন্টারনেট ডাটা প্যাক অথবা Wi-Fi চালু থাকতে হবে।",
+                    autoFixActionLabelBn = "ডাটা/Wi-Fi চালু করে পুনরায় যাচাই করুন",
+                    canAutoFix = true,
+                    checks = checks,
+                    requiresNewConfig = false
+                )
             }
             return TunnelDiagnosis(
                 category = FailureCategory.ALL_ROUTES_BLOCKED,
-                titleBn = "$opLabel ফায়ারওয়াল সব পোর্ট ব্লক করেছে",
-                explanationBn = "$extraReason অটো সমাধান চাপলে ১৬টি GP পোর্টাল ও সব DNS স্ক্যান করে কোনো খোলা রুট থাকলে সাথে সাথে কানেক্ট করবে।",
-                autoFixActionLabelBn = "অটো সমাধান ও GP স্ক্যান করুন",
+                titleBn = "$opLabel নেটওয়ার্কে টানেল সার্ভার পৌঁছায়নি",
+                explanationBn = "বর্তমান সার্ভারে WebSocket (80/443) ও SlowDNS কোনোটিই সাড়া দেয়নি। সক্রিয় ইন্টারনেট ডাটা বা Wi-Fi আছে কিনা দেখুন, অথবা অটো স্ক্যান চাপুন।",
+                autoFixActionLabelBn = "সার্ভার ও পোর্ট স্ক্যান করুন",
                 canAutoFix = true,
                 checks = checks,
                 requiresNewConfig = true
@@ -226,15 +232,16 @@ object TunnelAutoDoctor {
         return TunnelDiagnosis(
             category = FailureCategory.WS_PORTS_BLOCKED,
             titleBn = "সার্ভারে কানেক্ট করা যায়নি",
-            explanationBn = "বর্তমান রুট দিয়ে সার্ভার রেসপন্স দেয়নি। অটো সমাধান চাপলে সব বিকল্প পোর্ট ও GP Bug Host স্ক্যান করে চালু রুট সেট করে দেবে।",
-            autoFixActionLabelBn = "অটো সমাধান ও রিকানেক্ট করুন",
+            explanationBn = "বর্তমান রুট দিয়ে সার্ভার রেসপন্স দেয়নি। অটো স্ক্যান চাপলে সব বিকল্প পোর্ট পরীক্ষা করে চালু রুট সেট করে দেবে।",
+            autoFixActionLabelBn = "সার্ভার ও পোর্ট স্ক্যান করুন",
             canAutoFix = true,
             checks = checks
         )
     }
 
     /**
-     * Computes the best automated self-healing action from live Bug-Host scan & DNS benchmark data.
+     * Computes the best automated self-healing action from live endpoint scan & DNS benchmark data.
+     * Never loops on HTTP 301/302 captive portal redirects or plain HTTP 200 webpages.
      */
     fun buildAutoFixPlan(
         currentProfile: HttpCustomTunnelProfile,
@@ -243,8 +250,8 @@ object TunnelAutoDoctor {
         bugHostResults: List<GpBugHostScanEntry>,
         dnsResults: List<DnsBenchmarkEntry>
     ): AutoFixPlan {
-        // 1. Best case: Found a live HTTP 101 / 200 WebSocket host or Cloudflare Edge IP!
-        val bestWs101 = bugHostResults.firstOrNull { it.wsUpgrade101 }
+        // 1. Best case: Found a genuine HTTP 101 Switching Protocols WebSocket SSH endpoint!
+        val bestWs101 = bugHostResults.firstOrNull { it.wsUpgrade101 && it.httpStatusCode == 101 }
         if (bestWs101 != null) {
             val wsHost = if (currentProfile.isWebSocketSsh) currentProfile.host else "nl1.wssht.to"
             val isDirect = bestWs101.connectTarget.equals(wsHost, ignoreCase = true)
@@ -265,7 +272,7 @@ object TunnelAutoDoctor {
                 updatedProfile = updated,
                 selectProfileId = updated.id,
                 recommendedTransportMode = TunnelTransportMode.AUTO_SMART,
-                summaryBn = "✓ চালু রুট পাওয়া গেছে: ${bestWs101.label} (${bestWs101.rttMs ?: 0}ms) — কানেক্ট হচ্ছে!"
+                summaryBn = "✓ চালু HTTP 101 সার্ভার পাওয়া গেছে: ${bestWs101.label} (${bestWs101.rttMs ?: 0}ms) — কানেক্ট হচ্ছে!"
             )
         }
 
@@ -285,34 +292,40 @@ object TunnelAutoDoctor {
             }
         }
 
-        // 3. Found any reachable Cloudflare Edge / GP Portal host (even non-101, e.g. 400/426 where split payload can upgrade)
-        val reachableEdge = bugHostResults.firstOrNull {
-            it.reachable && (it.serverHeader?.contains("cloudflare", ignoreCase = true) == true || it.connectTarget.startsWith("104.") || it.connectTarget.startsWith("162."))
-        }
-        if (reachableEdge != null) {
-            val wsHost = if (currentProfile.isWebSocketSsh) currentProfile.host else "nl1.wssht.to"
-            val updated = currentProfile.copy(
-                isWebSocketSsh = true,
-                host = wsHost,
-                port = reachableEdge.port,
-                useTls = reachableEdge.useTls,
-                bugHost = reachableEdge.connectTarget,
-                sniHost = reachableEdge.sniHost.ifBlank { wsHost },
-                customPayload = if (!reachableEdge.useTls) SshWebSocketTransport.PRESET_GP_SPLIT_DPI else "",
-                enableSplitPayload = true,
-                enableTlsFragment = true,
-                autoFallbackAllModes = true
+        // 3. Detect Captive Portal (HTTP 301/302 redirect) — DO NOT loop! Report clearly and honestly.
+        val captiveRedirectCount = bugHostResults.count { it.httpStatusCode in 301..302 }
+        if (captiveRedirectCount > 0) {
+            val captiveDiag = TunnelDiagnosis(
+                category = FailureCategory.ALL_ROUTES_BLOCKED,
+                titleBn = "সিমে সক্রিয় ডাটা প্যাক নেই (HTTP 302 রিডাইরেক্ট)",
+                explanationBn = "স্ক্যানে দেখা গেছে আপনার সিম সব কানেকশন অপারেটরের ব্যালেন্স পোর্টালে (HTTP 302) পাঠিয়ে দিচ্ছে এবং কোনো সার্ভারই HTTP 101 দেয়নি। সিমে সক্রিয় ইন্টারনেট ডাটা অথবা Wi-Fi চালু করে তারপর কানেক্ট করুন।",
+                autoFixActionLabelBn = "ডাটা/Wi-Fi চালু করে পুনরায় যাচাই করুন",
+                canAutoFix = true,
+                checks = listOf(
+                    DiagnosticCheckRow(
+                        label = "ইন্টারনেট ডাটা স্ট্যাটাস",
+                        passed = false,
+                        detail = "$captiveRedirectCount টি পোর্টে HTTP 302 (পোর্টাল রিডাইরেক্ট)"
+                    ),
+                    DiagnosticCheckRow(
+                        label = "SSH WebSocket (HTTP 101)",
+                        passed = false,
+                        detail = "সক্রিয় ইন্টারনেট ছাড়া সার্ভারে পৌঁছানো সম্ভব নয়"
+                    )
+                ),
+                requiresNewConfig = false
             )
             return AutoFixPlan(
-                shouldReconnect = true,
-                updatedProfile = updated,
-                selectProfileId = updated.id,
-                recommendedTransportMode = TunnelTransportMode.AUTO_SMART,
-                summaryBn = "✓ Cloudflare Edge (${reachableEdge.connectTarget}:${reachableEdge.port}) সাড়া দিয়েছে — Split DPI দিয়ে কানেক্ট হচ্ছে!"
+                shouldReconnect = false,
+                updatedProfile = null,
+                selectProfileId = null,
+                recommendedTransportMode = null,
+                summaryBn = captiveDiag.titleBn,
+                updatedDiagnosis = captiveDiag
             )
         }
 
-        // 4. If user was on a non-Super-Auto profile and DoH:443 or Carrier DNS responded, switch to GP Super Auto or fastest DNS
+        // 4. If user was on a non-Super-Auto profile and DoH:443 responded, switch to GP Super Auto
         val bestDoh = dnsResults.firstOrNull { it.reachable && it.transport == "DoH:443" }
         if (bestDoh != null && currentProfile.id != HttpCustomTunnelProfile.GP_SUPER_AUTO_ID) {
             return AutoFixPlan(
@@ -320,46 +333,37 @@ object TunnelAutoDoctor {
                 updatedProfile = null,
                 selectProfileId = HttpCustomTunnelProfile.GP_SUPER_AUTO_ID,
                 recommendedTransportMode = TunnelTransportMode.DOH_HTTPS,
-                summaryBn = "✓ Encrypted DoH:443 (${bestDoh.rttMs}ms) চালু — GP Super Auto দিয়ে কানেক্ট হচ্ছে!"
+                summaryBn = "✓ Encrypted DoH:443 (${bestDoh.rttMs}ms) চালু — কানেক্ট হচ্ছে!"
             )
         }
 
-        val reachablePortalCount = bugHostResults.count { it.reachable }
         val reachableDnsList = dnsResults.filter { it.reachable }
-        val openPortals = bugHostResults.filter { it.reachable }.take(2).joinToString(", ") { "${it.label} (${it.httpStatusCode ?: "OK"})" }
         val openDnsText = reachableDnsList.take(2).joinToString(", ") { "${it.serverIp} (${it.rttMs}ms)" }
 
         val honestChecks = listOf(
             DiagnosticCheckRow(
                 label = "সিম DNS স্ক্যান (${dnsResults.size} টি)",
                 passed = reachableDnsList.isNotEmpty(),
-                detail = if (reachableDnsList.isNotEmpty()) "চালু: $openDnsText" else "সব DNS ব্লক/অফলাইন"
+                detail = if (reachableDnsList.isNotEmpty()) "চালু: $openDnsText" else "সব DNS অফলাইন"
             ),
             DiagnosticCheckRow(
-                label = "Cloudflare & WS পোর্ট (80/443)",
+                label = "SSH WebSocket পোর্ট (80/443/8443)",
                 passed = false,
-                detail = "১৬টির মধ্যে কোনো হোস্ট HTTP 101 দেয়নি"
-            ),
-            DiagnosticCheckRow(
-                label = "GP পোর্টাল রিচেবিলিটি",
-                passed = reachablePortalCount > 0,
-                detail = if (reachablePortalCount > 0) "খোলা: $openPortals" else "কোনো GP পোর্টাল রেসপন্স দেয়নি"
+                detail = "কোনো পোর্টেই HTTP 101 রেসপন্স আসেনি"
             )
         )
 
         val finalExplanation = if (reachableDnsList.isEmpty()) {
-            "সিমের মোবাইল ডাটা সম্পূর্ণ বন্ধ বা 4G সিগন্যাল নেই। ফোনের Mobile Data অন করে (অথবা Airplane Mode অফ-অন করে) আবার চেষ্টা করুন।"
-        } else if (reachablePortalCount > 0) {
-            "আপনার GP সিমে শুধু $openPortals খোলা আছে, কিন্তু বর্তমান সার্ভার (${currentProfile.host}) ও SlowDNS (nsts3.me-link.uk) ব্লক। একটি নতুন চালু GP কনফিগ (.hc JSON বা নতুন SSH WS সার্ভার) ইমপোর্ট করুন।"
+            "সিমের মোবাইল ডাটা সম্পূর্ণ বন্ধ বা 4G সিগন্যাল নেই। ফোনের Mobile Data বা Wi-Fi চালু করে আবার চেষ্টা করুন।"
         } else {
-            "আপনার GP সিম শুধুমাত্র ক্যারিয়ার DNS ($openDnsText) ছাড়া বাইরের সব TCP পোর্ট (80/443/8080/8443) এবং SlowDNS TXT ব্লক করে রেখেছে। একটি ছোট ডাটা/সোশ্যাল প্যাক চালু করুন অথবা নতুন GP কনফিগ ইমপোর্ট করুন।"
+            "সিম থেকে শুধু ক্যারিয়ার DNS ($openDnsText) চালু আছে, কিন্তু বাইরের SSH সার্ভার (${currentProfile.host}) বা SlowDNS পোর্টে ইন্টারনেট সংযোগ পৌঁছাচ্ছে না। সক্রিয় ইন্টারনেট ডাটা প্যাক বা Wi-Fi চালু করুন অথবা নতুন চালু SSH সার্ভার কনফিগ ইমপোর্ট করুন।"
         }
 
         val updatedDiag = TunnelDiagnosis(
             category = if (reachableDnsList.isEmpty()) FailureCategory.NO_NETWORK else FailureCategory.ALL_ROUTES_BLOCKED,
-            titleBn = if (reachableDnsList.isEmpty()) "মোবাইল ডাটা পাওয়া যাচ্ছে না" else "এই সিমে বর্তমান সার্ভারের কোনো পোর্ট খোলা নেই",
+            titleBn = if (reachableDnsList.isEmpty()) "মোবাইল ডাটা পাওয়া যাচ্ছে না" else "সার্ভারে ইন্টারনেট সংযোগ পৌঁছায়নি",
             explanationBn = finalExplanation,
-            autoFixActionLabelBn = "আবার অটো স্ক্যান করুন",
+            autoFixActionLabelBn = "পুনরায় স্ক্যান করুন",
             canAutoFix = true,
             checks = honestChecks,
             requiresNewConfig = reachableDnsList.isNotEmpty()

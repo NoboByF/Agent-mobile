@@ -60,29 +60,25 @@ object GpBugHostScanner {
     fun buildGpScanTargets(sshWsHost: String): List<ScanTarget> {
         val targetWs = sshWsHost.trim().ifBlank { "nl1.wssht.to" }
         return listOf(
-            // Direct sshOcean / CF CDN host on TLS 443, 8443 & HTTP 80, 8080
+            // Direct SSH WebSocket server ports (TLS & HTTP)
             ScanTarget("Direct TLS:443", targetWs, 443, true, targetWs, targetWs),
             ScanTarget("Direct HTTP:80", targetWs, 80, false, "", targetWs),
             ScanTarget("Direct HTTP:8080", targetWs, 8080, false, "", targetWs),
             ScanTarget("Direct TLS:8443", targetWs, 8443, true, targetWs, targetWs),
+            ScanTarget("Direct HTTP:2052", targetWs, 2052, false, "", targetWs),
+            ScanTarget("Direct TLS:2083", targetWs, 2083, true, targetWs, targetWs),
 
-            // Cloudflare Anycast Edge IPs routed to sshWsHost via HTTP:80 (No TLS SNI needed!)
+            // Cloudflare CDN Anycast Edge endpoints for the configured SSH-WS host
             ScanTarget("CF Edge 104.16 (HTTP:80)", "104.16.132.229", 80, false, "", targetWs),
             ScanTarget("CF Edge 104.18 (HTTP:80)", "104.18.2.2", 80, false, "", targetWs),
             ScanTarget("CF Edge 162.159 (HTTP:80)", "162.159.135.42", 80, false, "", targetWs),
             ScanTarget("CF Edge 172.64 (HTTP:80)", "172.64.155.1", 80, false, "", targetWs),
-
-            // Cloudflare Anycast Edge IPs over TLS:443 with target SNI & GP wildcard SNI
             ScanTarget("CF Edge 104.16 (TLS:443)", "104.16.132.229", 443, true, targetWs, targetWs),
             ScanTarget("CF Edge 104.18 (TLS:443)", "104.18.2.2", 443, true, targetWs, targetWs),
-            ScanTarget("CF Edge 104.16 (GP Wildcard)", "104.16.132.229", 443, true, "www.grameenphone.com.$targetWs", "www.grameenphone.com.$targetWs"),
-            ScanTarget("CF Edge 104.18 (CF Wildcard)", "104.18.2.2", 443, true, "cloudflare.com.$targetWs", "cloudflare.com.$targetWs"),
-
-            // Grameenphone Zero-Rated / Portal Bug Host reachability probes
-            ScanTarget("GP Portal (TLS:443)", "www.grameenphone.com", 443, true, "www.grameenphone.com", targetWs),
-            ScanTarget("MyGP Portal (TLS:443)", "mygp.grameenphone.com", 443, true, "mygp.grameenphone.com", targetWs),
-            ScanTarget("Bioscope GP (TLS:443)", "www.bioscopelive.com", 443, true, "www.bioscopelive.com", targetWs),
-            ScanTarget("Cloudflare 1.1.1.1 (TLS:443)", "1.1.1.1", 443, true, targetWs, targetWs)
+            ScanTarget("CF Edge 162.159 (TLS:443)", "162.159.135.42", 443, true, targetWs, targetWs),
+            ScanTarget("CF Edge 172.64 (TLS:443)", "172.64.155.1", 443, true, targetWs, targetWs),
+            ScanTarget("Direct HTTP:8880", targetWs, 8880, false, "", targetWs),
+            ScanTarget("Direct TLS:2096", targetWs, 2096, true, targetWs, targetWs)
         )
     }
 
@@ -155,10 +151,13 @@ object GpBugHostScanner {
             val resp = SshWebSocketTransport.readHttpUpgradeResponse(activeSocket.getInputStream())
             val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
             val serverHdr = resp.headers["server"]
-            val is101 = resp.statusCode == 101 || resp.statusCode == 200
+            val upgradeHdr = resp.headers["upgrade"]
+            val is101 = resp.statusCode == 101 &&
+                (upgradeHdr.isNullOrBlank() || upgradeHdr.contains("websocket", ignoreCase = true))
             val detail = buildString {
                 append("HTTP ${resp.statusCode}")
-                if (is101) append(" • WS READY")
+                if (is101) append(" • WS 101 READY")
+                else if (resp.statusCode in 301..302) append(" • Captive Portal Redirect")
                 if (!serverHdr.isNullOrBlank()) append(" [$serverHdr]")
             }
             GpBugHostScanEntry(

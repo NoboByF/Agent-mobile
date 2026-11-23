@@ -114,7 +114,7 @@ class TunnelProtocolUnitTest {
         val scanTargets = com.example.tunnel.GpBugHostScanner.buildGpScanTargets("nl1.wssht.to")
         assertEquals(16, scanTargets.size)
         assertTrue(scanTargets.any { it.connectTarget == "104.16.132.229" && it.port == 80 })
-        assertTrue(scanTargets.any { it.connectTarget == "www.grameenphone.com" && it.port == 443 })
+        assertTrue(scanTargets.any { it.connectTarget == "nl1.wssht.to" && it.port == 443 })
 
         val generatedKey = SshWebSocketTransport.generateWebSocketKey()
         assertEquals(24, generatedKey.length)
@@ -197,7 +197,7 @@ class TunnelProtocolUnitTest {
         assertEquals(com.example.tunnel.FailureCategory.SSH_AUTH_FAILED, authDiag.category)
         assertTrue(authDiag.requiresNewConfig)
 
-        // 3. Auto-Fix plan picks live HTTP 101 Cloudflare Edge IP automatically
+        // 3. Auto-Fix plan picks genuine HTTP 101 Cloudflare Edge IP automatically
         val winnerEdge = com.example.tunnel.GpBugHostScanEntry(
             label = "CF Edge 104.16 (HTTP:80)",
             connectTarget = "104.16.132.229",
@@ -210,7 +210,7 @@ class TunnelProtocolUnitTest {
             httpStatusCode = 101,
             rttMs = 68L,
             serverHeader = "cloudflare",
-            detail = "HTTP 101 • WS READY [cloudflare]"
+            detail = "HTTP 101 • WS 101 READY [cloudflare]"
         )
         val plan = com.example.tunnel.TunnelAutoDoctor.buildAutoFixPlan(
             currentProfile = gpAuto,
@@ -220,10 +220,34 @@ class TunnelProtocolUnitTest {
             dnsResults = emptyList()
         )
         assertTrue(plan.shouldReconnect)
-        assertNotNull(plan.updatedProfile)
-        assertEquals("104.16.132.229", plan.updatedProfile!!.bugHost)
-        assertEquals(80, plan.updatedProfile!!.port)
-        assertTrue(plan.updatedProfile!!.enableSplitPayload)
+        val updatedProf = plan.updatedProfile!!
+        assertEquals("104.16.132.229", updatedProf.bugHost)
+        assertEquals(80, updatedProf.port)
+        assertTrue(updatedProf.enableSplitPayload)
+
+        // 4. Auto-Fix does NOT loop on HTTP 302 Captive Portal redirect
+        val captiveEntry = com.example.tunnel.GpBugHostScanEntry(
+            label = "Direct HTTP:80",
+            connectTarget = "nl1.wssht.to",
+            port = 80,
+            useTls = false,
+            sniHost = "",
+            wsHostHeader = "nl1.wssht.to",
+            reachable = true,
+            wsUpgrade101 = false,
+            httpStatusCode = 302,
+            rttMs = 110L,
+            detail = "HTTP 302 • Captive Portal Redirect"
+        )
+        val captivePlan = com.example.tunnel.TunnelAutoDoctor.buildAutoFixPlan(
+            currentProfile = gpAuto,
+            allProfiles = HttpCustomTunnelProfile.DEFAULT_PROFILES,
+            currentDiagnosis = allBlocked,
+            bugHostResults = listOf(captiveEntry),
+            dnsResults = emptyList()
+        )
+        assertEquals(false, captivePlan.shouldReconnect)
+        assertNotNull(captivePlan.updatedDiagnosis)
     }
 }
 
