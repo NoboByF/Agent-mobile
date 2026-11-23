@@ -73,6 +73,13 @@ android {
     dex {
       useLegacyPackaging = true
     }
+    resources {
+      excludes += setOf(
+        "META-INF/versions/9/OSGI-INF/MANIFEST.MF",
+        "META-INF/BCKEY.DSA",
+        "META-INF/BCKEY.SF"
+      )
+    }
   }
 }
 
@@ -129,6 +136,8 @@ dependencies {
   implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   implementation(libs.okhttp)
+  implementation(libs.bouncycastle.bcprov)
+  implementation(libs.mwiede.jsch)
   // implementation(libs.play.services.location)
   // implementation(libs.retrofit)
   testImplementation(libs.androidx.compose.ui.test.junit4)

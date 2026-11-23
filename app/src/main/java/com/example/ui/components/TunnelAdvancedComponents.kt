@@ -65,9 +65,18 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.filled.Cancel
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Public
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.WarningAmber
 import com.example.data.HttpCustomTunnelProfile
 import com.example.tunnel.DnsBenchmarkEntry
 import com.example.tunnel.GpCarrierSnapshot
+import com.example.tunnel.InternetCheckResult
+import com.example.tunnel.InternetCheckStatus
+import com.example.tunnel.PipelineStageState
+import com.example.tunnel.TunnelPipelineStages
 import com.example.tunnel.TunnelTransportMode
 import com.example.tunnel.TunnelTuningConfig
 import com.example.ui.theme.CobaltBlue
@@ -127,11 +136,12 @@ fun GpCarrierStatusCard(
                             fontWeight = FontWeight.Bold,
                             color = palette.inkPrimary,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false)
                         )
                         if (snapshot.isGrameenphone) {
                             StatusPillBadge(
-                                label = "GP PRO READY",
+                                label = "GP PRO",
                                 accentColor = CyanTeal,
                                 containerColor = CyanTeal.copy(alpha = 0.14f),
                                 leadingDot = true
@@ -755,4 +765,201 @@ fun EditTunnelProfileDialog(
             }
         }
     )
+}
+
+@Composable
+fun TunnelPipelineAndInternetBanner(
+    stages: TunnelPipelineStages,
+    internetCheck: InternetCheckResult,
+    localProxyPort: Int?,
+    isTunnelActive: Boolean,
+    onCheckInternetNow: () -> Unit
+) {
+    val palette = StudioTheme.colors
+    val isChecking = internetCheck.status == InternetCheckStatus.CHECKING
+    val bannerAccent = when (internetCheck.status) {
+        InternetCheckStatus.VERIFIED_ONLINE -> EmeraldGreen
+        InternetCheckStatus.CHECKING -> CobaltBlue
+        InternetCheckStatus.DNS_ONLY_NO_INTERNET -> WarmAmber
+        InternetCheckStatus.OFFLINE -> SignalRed
+        InternetCheckStatus.IDLE -> palette.inkSecondary
+    }
+    val bannerIcon = when (internetCheck.status) {
+        InternetCheckStatus.VERIFIED_ONLINE -> Icons.Filled.Public
+        InternetCheckStatus.CHECKING -> Icons.Filled.Schedule
+        InternetCheckStatus.DNS_ONLY_NO_INTERNET -> Icons.Filled.WarningAmber
+        InternetCheckStatus.OFFLINE -> Icons.Filled.Cancel
+        InternetCheckStatus.IDLE -> Icons.Filled.Public
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        // 5-Stage Live Pipeline Strip
+        val stageItems = listOf(
+            "GP DNS" to stages.carrierDns,
+            "SlowDNS" to stages.slowDnsServer,
+            "Noise+SMUX" to stages.noiseSmux,
+            "SSH Auth" to stages.sshAuth,
+            "Internet" to stages.internetCheck
+        )
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            items(stageItems, key = { it.first }) { (label, state) ->
+                val stageColor = when (state) {
+                    PipelineStageState.PASSED -> EmeraldGreen
+                    PipelineStageState.RUNNING -> CobaltBlue
+                    PipelineStageState.FAILED -> SignalRed
+                    PipelineStageState.PENDING -> palette.inkMuted
+                }
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = stageColor.copy(alpha = 0.11f),
+                    border = BorderStroke(1.dp, stageColor.copy(alpha = 0.30f))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        when (state) {
+                            PipelineStageState.RUNNING -> CircularProgressIndicator(
+                                modifier = Modifier.size(12.dp),
+                                strokeWidth = 1.8.dp,
+                                color = stageColor
+                            )
+
+                            PipelineStageState.PASSED -> Icon(
+                                imageVector = Icons.Filled.CheckCircle,
+                                contentDescription = "$label OK",
+                                tint = stageColor,
+                                modifier = Modifier.size(13.dp)
+                            )
+
+                            PipelineStageState.FAILED -> Icon(
+                                imageVector = Icons.Filled.Cancel,
+                                contentDescription = "$label Failed",
+                                tint = stageColor,
+                                modifier = Modifier.size(13.dp)
+                            )
+
+                            PipelineStageState.PENDING -> Icon(
+                                imageVector = Icons.Filled.Schedule,
+                                contentDescription = "$label Pending",
+                                tint = stageColor,
+                                modifier = Modifier.size(13.dp)
+                            )
+                        }
+                        Text(
+                            text = label,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = stageColor
+                        )
+                    }
+                }
+            }
+        }
+
+        // Real Internet Connectivity Verification Card
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(14.dp),
+            color = bannerAccent.copy(alpha = 0.10f),
+            border = BorderStroke(1.dp, bannerAccent.copy(alpha = 0.35f))
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        if (isChecking) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = bannerAccent
+                            )
+                        } else {
+                            Icon(
+                                imageVector = bannerIcon,
+                                contentDescription = "Internet Status",
+                                tint = bannerAccent,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = internetCheck.summaryBn,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = palette.inkPrimary
+                            )
+                            val subtitle = internetCheck.detailText
+                                ?: localProxyPort?.let { "Local HTTP/SOCKS5 Proxy: 127.0.0.1:$it" }
+                            if (!subtitle.isNullOrBlank()) {
+                                Text(
+                                    text = subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    color = palette.inkSecondary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+
+                    if (isTunnelActive) {
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = onCheckInternetNow,
+                            enabled = !isChecking,
+                            modifier = Modifier
+                                .height(48.dp)
+                                .testTag("hc_check_internet_button"),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, bannerAccent.copy(alpha = 0.5f))
+                        ) {
+                            Text(
+                                text = if (isChecking) "চেক হচ্ছে" else "চেক করুন",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = bannerAccent
+                            )
+                        }
+                    }
+                }
+
+                if (!stages.failureHintBn.isNullOrBlank()) {
+                    Text(
+                        text = "কারণ: ${stages.failureHintBn}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = SignalRed,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+
+                if (localProxyPort != null) {
+                    Text(
+                        text = "Proxy Active: 127.0.0.1:$localProxyPort (HTTP CONNECT + SOCKS5)",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = EmeraldGreen,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+    }
 }

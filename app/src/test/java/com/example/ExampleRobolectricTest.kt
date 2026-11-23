@@ -1058,8 +1058,96 @@ class ExampleRobolectricTest {
         assertEquals(com.example.tunnel.GpNetworkInspector.ADGUARD_DNS_IP, adBlockOrder.first().first)
         assertEquals("1.5 KB/s", com.example.tunnel.HttpCustomTunnelStateHolder.formatSpeed(1536L))
     }
+
+    @Test
+    fun `dnstt SlowDNS codec encodes Base32 labels under 63 chars, respects 255B QNAME, and unpacks TXT packets`() {
+        val mtu = com.example.tunnel.DnsttCodec.computeMaxKcpMtu("nsts3.me-link.uk")
+        assertTrue(mtu in 100..140)
+
+        val clientId = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8)
+        val payload = "hello-kcp-payload".toByteArray(Charsets.UTF_8)
+        val qname = com.example.tunnel.DnsttCodec.encodeQueryDomain(clientId, payload, "nsts3.me-link.uk")
+        assertTrue(qname.endsWith(".nsts3.me-link.uk"))
+        val labels = qname.split('.')
+        assertTrue(labels.all { it.length in 1..63 })
+
+        // Decode encoded prefix labels and verify ClientID + padding prefix 0xE3 + data length + payload
+        val encodedPrefix = qname.removeSuffix(".nsts3.me-link.uk").replace(".", "")
+        val decoded = com.example.tunnel.DnsttCodec.decodeBase32(encodedPrefix)
+        assertTrue(decoded.copyOfRange(0, 8).contentEquals(clientId))
+        assertEquals(0xE0 + com.example.tunnel.DnsttCodec.NUM_PADDING_DATA, decoded[8].toInt() and 0xFF)
+        val dataLenIdx = 8 + 1 + com.example.tunnel.DnsttCodec.NUM_PADDING_DATA
+        assertEquals(payload.size, decoded[dataLenIdx].toInt() and 0xFF)
+        assertTrue(decoded.copyOfRange(dataLenIdx + 1, dataLenIdx + 1 + payload.size).contentEquals(payload))
+
+        // Verify downstream 2-byte big-endian length-prefixed packet unpacking
+        val p1 = byteArrayOf(0x11, 0x22, 0x33)
+        val p2 = byteArrayOf(0x44, 0x55)
+        val combined = byteArrayOf(0x00, 0x03) + p1 + byteArrayOf(0x00, 0x02) + p2
+        val unpacked = com.example.tunnel.DnsttCodec.unpackDownstreamPackets(combined)
+        assertEquals(2, unpacked.size)
+        assertTrue(unpacked[0].contentEquals(p1))
+        assertTrue(unpacked[1].contentEquals(p2))
+    }
+
+    @Test
+    fun `KCP 24-byte LE header, Noise_NK X25519 ChaChaPoly BLAKE2s, SMUX v1 frame, and HTTP proxy parser work accurately`() {
+        // 1. KCP segment round-trip
+        val kcpSeg = com.example.tunnel.KcpWire.Segment(
+            conv = 0x12345678,
+            cmd = com.example.tunnel.KcpWire.CMD_PUSH,
+            frg = 0,
+            wnd = 256,
+            ts = 9999,
+            sn = 7,
+            una = 5,
+            data = "kcp-data".toByteArray()
+        )
+        val kcpBytes = com.example.tunnel.KcpWire.encodeSegment(kcpSeg)
+        assertEquals(com.example.tunnel.KcpWire.HEADER_SIZE + 8, kcpBytes.size)
+        val decodedKcp = com.example.tunnel.KcpWire.decodeSegments(kcpBytes)
+        assertEquals(1, decodedKcp.size)
+        assertEquals(0x12345678, decodedKcp[0].conv)
+        assertEquals(7, decodedKcp[0].sn)
+        assertEquals("kcp-data", String(decodedKcp[0].data))
+
+        // 2. Noise_NK X25519 + HKDF-BLAKE2s + ChaCha20-Poly1305 round-trip
+        val (aPriv, aPub) = com.example.tunnel.NoisePrimitives.generateX25519Keypair()
+        val (bPriv, bPub) = com.example.tunnel.NoisePrimitives.generateX25519Keypair()
+        val sharedA = com.example.tunnel.NoisePrimitives.x25519SharedSecret(aPriv, bPub)
+        val sharedB = com.example.tunnel.NoisePrimitives.x25519SharedSecret(bPriv, aPub)
+        assertTrue(sharedA.contentEquals(sharedB))
+        val (ck, key) = com.example.tunnel.NoisePrimitives.hkdf2(
+            com.example.tunnel.NoisePrimitives.blake2sHash("dnstt 2020-04-13".toByteArray()),
+            sharedA
+        )
+        assertEquals(32, ck.size)
+        assertEquals(32, key.size)
+        val aad = "aad".toByteArray()
+        val plain = "secret-ssh-payload".toByteArray()
+        val ct = com.example.tunnel.NoisePrimitives.encryptChaChaPoly(key, 42L, aad, plain)
+        val pt = com.example.tunnel.NoisePrimitives.decryptChaChaPoly(key, 42L, aad, ct)
+        assertTrue(plain.contentEquals(pt))
+
+        // 3. SMUX v1 8-byte frame round-trip
+        val smuxFrame = com.example.tunnel.SmuxWire.Frame(
+            version = 1,
+            cmd = com.example.tunnel.SmuxWire.CMD_PSH,
+            streamId = 3,
+            data = "SSH-2.0".toByteArray()
+        )
+        val encodedSmux = com.example.tunnel.SmuxWire.encodeFrame(smuxFrame)
+        val parsedSmux = com.example.tunnel.SmuxWire.readFrame(java.io.ByteArrayInputStream(encodedSmux))
+        assertNotNull(parsedSmux)
+        assertEquals(3, parsedSmux!!.streamId)
+        assertEquals("SSH-2.0", String(parsedSmux.data))
+
+        // 4. Local proxy authority & HTTP URL parsing
+        assertEquals("google.com" to 443, com.example.tunnel.SshProxyBridge.parseHostPort("google.com:443", 443))
+        val parsedUrl = com.example.tunnel.SshProxyBridge.parseHttpProxyUrl(
+            "http://connectivitycheck.gstatic.com/generate_204",
+            emptyList()
+        )
+        assertEquals(Triple("connectivitycheck.gstatic.com", 80, "/generate_204"), parsedUrl)
+    }
 }
-
-
-
-

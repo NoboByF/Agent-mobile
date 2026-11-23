@@ -99,6 +99,7 @@ import com.example.ui.components.GpProTuningCard
 import com.example.ui.components.StatusPillBadge
 import com.example.ui.components.StudioCardContainer
 import com.example.ui.components.TunnelLatencySparkline
+import com.example.ui.components.TunnelPipelineAndInternetBanner
 import com.example.ui.theme.CobaltBlue
 import com.example.ui.theme.ConsoleDarkBg
 import com.example.ui.theme.ConsoleDarkCard
@@ -531,6 +532,23 @@ fun HttpCustomInspectorScreen(
                         color = Color.White,
                         style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold
+                    )
+                }
+
+                // 5-Stage Live Tunnel Pipeline + Real Internet Verification Banner
+                if (isConnected || isConnecting || isError || tunnelState.internetCheck.checkedAtMs != null) {
+                    Spacer(modifier = Modifier.height(12.dp))
+                    TunnelPipelineAndInternetBanner(
+                        stages = tunnelState.pipelineStages,
+                        internetCheck = tunnelState.internetCheck,
+                        localProxyPort = tunnelState.localProxyPort,
+                        isTunnelActive = isConnected,
+                        onCheckInternetNow = {
+                            coroutineScope.launch {
+                                val res = HttpCustomTunnelStateHolder.runManualInternetCheck(context)
+                                onShowNotice(res.summaryBn)
+                            }
+                        }
                     )
                 }
 

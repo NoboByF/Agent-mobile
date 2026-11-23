@@ -44,6 +44,10 @@ data class TunnelConnectionState(
     val dnsRttMs: Long? = null,
     val sshBanner: String? = null,
     val resolvedIp: String? = null,
+    val localProxyPort: Int? = null,
+    val tunnelEngineLabel: String? = null,
+    val pipelineStages: TunnelPipelineStages = TunnelPipelineStages(),
+    val internetCheck: InternetCheckResult = InternetCheckResult(),
     val txBytes: Long = 0L,
     val rxBytes: Long = 0L,
     val txSpeedBps: Long = 0L,
@@ -184,6 +188,47 @@ object HttpCustomTunnelStateHolder {
 
     fun clearLogs() {
         _state.update { it.copy(logs = emptyList()) }
+    }
+
+    /**
+     * Runs a real end-to-end internet connectivity verification check (HTTP 204 + Exit Public IP)
+     * through the active local SlowDNS+SSH proxy (or underlying network if no proxy is running).
+     */
+    suspend fun runManualInternetCheck(context: Context): InternetCheckResult {
+        _state.update { current ->
+            current.copy(
+                internetCheck = current.internetCheck.copy(
+                    status = InternetCheckStatus.CHECKING,
+                    summaryBn = "ইন্টারনেট যাচাই হচ্ছে (HTTP 204)...",
+                    detailText = null
+                ),
+                pipelineStages = current.pipelineStages.copy(
+                    internetCheck = PipelineStageState.RUNNING
+                )
+            )
+        }
+        val proxyPort = _state.value.localProxyPort
+        val (activeNet, _) = discoverUnderlyingNetworkAndDns(context)
+        val result = InternetConnectivityVerifier.verifyInternet(
+            localProxyPort = proxyPort,
+            underlyingNetwork = activeNet,
+            protectTcp = null,
+            timeoutSec = 10L
+        )
+        _state.update { current ->
+            current.copy(
+                internetCheck = result,
+                pipelineStages = current.pipelineStages.copy(
+                    internetCheck = if (result.status == InternetCheckStatus.VERIFIED_ONLINE) {
+                        PipelineStageState.PASSED
+                    } else {
+                        PipelineStageState.FAILED
+                    }
+                )
+            )
+        }
+        appendLog("Internet Check: ${result.summaryBn} (${result.detailText ?: ""})")
+        return result
     }
 
     fun formatBytes(bytes: Long): String {
@@ -534,16 +579,43 @@ object HttpCustomTunnelStateHolder {
             val entries = coroutineScope {
                 val udpJobs = udpTargets.map { (label, ip, isCarrier) ->
                     async(Dispatchers.IO) {
-                        val res = probeSingleUdpDns(
+                        val firstTry = probeSingleUdpDns(
                             dnsIp = ip,
                             isCarrier = isCarrier,
                             targetDomain = targetDomain,
                             queryType = DnsPacketCodec.TYPE_TXT,
                             ednsPayloadSize = ednsSize,
-                            timeoutMs = 2400,
+                            timeoutMs = if (isCarrier) 3200 else 2200,
                             underlyingNetwork = activeNet,
                             protectUdp = null
                         )
+                        val res = if (firstTry.reachable) {
+                            firstTry
+                        } else if (isCarrier) {
+                            // Retry GP Carrier DNS with safe 512B EDNS0 & TYPE_A fallback
+                            val retryTxt = probeSingleUdpDns(
+                                dnsIp = ip,
+                                isCarrier = true,
+                                targetDomain = targetDomain,
+                                queryType = DnsPacketCodec.TYPE_TXT,
+                                ednsPayloadSize = 512,
+                                timeoutMs = 3000,
+                                underlyingNetwork = activeNet,
+                                protectUdp = null
+                            )
+                            if (retryTxt.reachable) retryTxt else probeSingleUdpDns(
+                                dnsIp = ip,
+                                isCarrier = true,
+                                targetDomain = profile.host,
+                                queryType = DnsPacketCodec.TYPE_A,
+                                ednsPayloadSize = 512,
+                                timeoutMs = 2600,
+                                underlyingNetwork = activeNet,
+                                protectUdp = null
+                            )
+                        } else {
+                            firstTry
+                        }
                         DnsBenchmarkEntry(
                             label = label,
                             serverIp = ip,
@@ -636,61 +708,103 @@ object HttpCustomTunnelStateHolder {
             bestDns = dohResults.filter { it.reachable }.minByOrNull { it.rttMs ?: Long.MAX_VALUE }
         }
 
-        // Mode 2: UDP:53 Probing (Auto Smart or Carrier UDP)
+        // Mode 2: UDP:53 Probing — FAST PATH Carrier DNS first!
+        // On GP 4G (192.0.0.1), probing carrier DNS first avoids wasting 20+ seconds on blocked public IPs.
         if (bestDns == null && tuningConfig.transportMode != TunnelTransportMode.TCP_53) {
-            val udpCandidates = if (tuningConfig.transportMode == TunnelTransportMode.CARRIER_UDP && carrierDnsList.isNotEmpty()) {
+            val isExplicitPublic = profile.dnsServer.trim().let {
+                it.isNotBlank() && !it.equals("auto", ignoreCase = true) && it !in carrierDnsList
+            }
+            val fastCarrierTargets = if (tuningConfig.transportMode == TunnelTransportMode.CARRIER_UDP || !isExplicitPublic) {
                 carrierDnsList.map { it to true }
             } else {
-                candidates
+                listOf(profile.dnsServer.trim() to false)
             }
-            val udpResults = coroutineScope {
-                udpCandidates.map { (ip, isCarrier) ->
-                    async(Dispatchers.IO) {
-                        val primary = probeSingleUdpDns(
-                            dnsIp = ip,
-                            isCarrier = isCarrier,
-                            targetDomain = targetDomain,
-                            queryType = DnsPacketCodec.TYPE_TXT,
-                            ednsPayloadSize = tuningConfig.ednsPayloadSize,
-                            timeoutMs = 2500,
-                            underlyingNetwork = activeNet,
-                            protectUdp = protectUdp
-                        )
-                        if (primary.reachable) {
-                            if (primary.resolvedIps.isEmpty()) {
-                                val aProbe = probeSingleUdpDns(
+
+            // Phase 2A: Fast-path probe primary (GP Carrier DNS 192.0.0.1) with EDNS512 retry
+            if (fastCarrierTargets.isNotEmpty()) {
+                val primaryResults = coroutineScope {
+                    fastCarrierTargets.map { (ip, isCarrier) ->
+                        async(Dispatchers.IO) {
+                            val t1 = probeSingleUdpDns(
+                                dnsIp = ip,
+                                isCarrier = isCarrier,
+                                targetDomain = targetDomain,
+                                queryType = DnsPacketCodec.TYPE_TXT,
+                                ednsPayloadSize = tuningConfig.ednsPayloadSize,
+                                timeoutMs = 2800,
+                                underlyingNetwork = activeNet,
+                                protectUdp = protectUdp
+                            )
+                            if (t1.reachable) {
+                                t1
+                            } else {
+                                val t2 = probeSingleUdpDns(
+                                    dnsIp = ip,
+                                    isCarrier = isCarrier,
+                                    targetDomain = targetDomain,
+                                    queryType = DnsPacketCodec.TYPE_TXT,
+                                    ednsPayloadSize = 512,
+                                    timeoutMs = 2600,
+                                    underlyingNetwork = activeNet,
+                                    protectUdp = protectUdp
+                                )
+                                if (t2.reachable) t2 else probeSingleUdpDns(
                                     dnsIp = ip,
                                     isCarrier = isCarrier,
                                     targetDomain = profile.host,
                                     queryType = DnsPacketCodec.TYPE_A,
-                                    ednsPayloadSize = tuningConfig.ednsPayloadSize,
-                                    timeoutMs = 1500,
+                                    ednsPayloadSize = 512,
+                                    timeoutMs = 2200,
                                     underlyingNetwork = activeNet,
                                     protectUdp = protectUdp
                                 )
-                                primary.copy(resolvedIps = aProbe.resolvedIps)
-                            } else {
-                                primary
                             }
-                        } else {
-                            probeSingleUdpDns(
-                                dnsIp = ip,
-                                isCarrier = isCarrier,
-                                targetDomain = profile.host,
-                                queryType = DnsPacketCodec.TYPE_A,
-                                ednsPayloadSize = tuningConfig.ednsPayloadSize,
-                                timeoutMs = 1900,
-                                underlyingNetwork = activeNet,
-                                protectUdp = protectUdp
-                            )
                         }
-                    }
-                }.awaitAll()
+                    }.awaitAll()
+                }
+                allResults.addAll(primaryResults)
+                bestDns = primaryResults
+                    .filter { it.reachable }
+                    .minByOrNull { it.rttMs ?: Long.MAX_VALUE }
             }
-            allResults.addAll(udpResults)
-            bestDns = udpResults
-                .filter { it.reachable }
-                .minByOrNull { (it.rttMs ?: Long.MAX_VALUE) + if (it.isCarrierDns) 0L else 15L }
+
+            // Phase 2B: Only probe remaining public resolvers if Phase 2A failed!
+            if (bestDns == null && tuningConfig.transportMode != TunnelTransportMode.CARRIER_UDP) {
+                val alreadyTested = allResults.map { it.serverIp }.toSet()
+                val remaining = candidates.filter { it.first !in alreadyTested }
+                if (remaining.isNotEmpty()) {
+                    val udpResults = coroutineScope {
+                        remaining.map { (ip, isCarrier) ->
+                            async(Dispatchers.IO) {
+                                val primary = probeSingleUdpDns(
+                                    dnsIp = ip,
+                                    isCarrier = isCarrier,
+                                    targetDomain = targetDomain,
+                                    queryType = DnsPacketCodec.TYPE_TXT,
+                                    ednsPayloadSize = tuningConfig.ednsPayloadSize,
+                                    timeoutMs = 2000,
+                                    underlyingNetwork = activeNet,
+                                    protectUdp = protectUdp
+                                )
+                                if (primary.reachable) primary else probeSingleUdpDns(
+                                    dnsIp = ip,
+                                    isCarrier = isCarrier,
+                                    targetDomain = profile.host,
+                                    queryType = DnsPacketCodec.TYPE_A,
+                                    ednsPayloadSize = 512,
+                                    timeoutMs = 1600,
+                                    underlyingNetwork = activeNet,
+                                    protectUdp = protectUdp
+                                )
+                            }
+                        }.awaitAll()
+                    }
+                    allResults.addAll(udpResults)
+                    bestDns = udpResults
+                        .filter { it.reachable }
+                        .minByOrNull { (it.rttMs ?: Long.MAX_VALUE) + if (it.isCarrierDns) 0L else 15L }
+                }
+            }
         }
 
         // Mode 3: TCP:53 Probing (explicit TCP_53 or fallback when UDP:53 fails in Auto Smart)
@@ -702,7 +816,7 @@ object HttpCustomTunnelStateHolder {
                             dnsIp = ip,
                             isCarrier = isCarrier,
                             targetDomain = profile.host,
-                            timeoutMs = 2600,
+                            timeoutMs = 2200,
                             underlyingNetwork = activeNet,
                             protectTcp = protectTcp
                         )
@@ -729,7 +843,7 @@ object HttpCustomTunnelStateHolder {
             bestDns = fallbackDoh.filter { it.reachable }.minByOrNull { it.rttMs ?: Long.MAX_VALUE }
         }
 
-        // 5. Direct TCP + SSH-2.0 handshake to host:port
+        // 5. Quick Direct TCP + SSH-2.0 check (fast 1800ms timeout so it never stalls SlowDNS startup)
         var sshReachable = false
         var sshBanner: String? = null
         var sshRttMs: Long? = null
@@ -754,8 +868,8 @@ object HttpCustomTunnelStateHolder {
                     runCatching { activeNet.bindSocket(tcp) }
                 }
                 val t0 = System.currentTimeMillis()
-                tcp.connect(InetSocketAddress(connectTarget, profile.port), 3200)
-                tcp.soTimeout = 2800
+                tcp.connect(InetSocketAddress(connectTarget, profile.port), 1800)
+                tcp.soTimeout = 1800
                 val reader = tcp.getInputStream().bufferedReader(Charsets.UTF_8)
                 val bannerLine = reader.readLine()?.trim().orEmpty()
                 if (bannerLine.startsWith("SSH-", ignoreCase = true)) {

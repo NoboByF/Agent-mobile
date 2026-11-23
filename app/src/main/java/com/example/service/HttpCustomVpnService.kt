@@ -11,6 +11,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.ProxyInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -19,9 +20,20 @@ import com.example.MainActivity
 import com.example.R
 import com.example.data.HttpCustomTunnelProfile
 import com.example.tunnel.DnsPacketCodec
+import com.example.tunnel.DnsttPacketTransport
 import com.example.tunnel.GpNetworkInspector
 import com.example.tunnel.HttpCustomTunnelStateHolder
+import com.example.tunnel.InternetCheckResult
+import com.example.tunnel.InternetCheckStatus
+import com.example.tunnel.InternetConnectivityVerifier
+import com.example.tunnel.KcpSession
+import com.example.tunnel.NoiseNkChannel
+import com.example.tunnel.PipelineStageState
+import com.example.tunnel.SmuxSession
+import com.example.tunnel.SmuxStream
+import com.example.tunnel.SshProxyBridge
 import com.example.tunnel.TunnelConnectionPhase
+import com.example.tunnel.TunnelPipelineStages
 import com.example.tunnel.TunnelTuningConfig
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -41,6 +53,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicLong
 
 class HttpCustomVpnService : VpnService() {
 
@@ -52,9 +65,18 @@ class HttpCustomVpnService : VpnService() {
     private var speedMeterJob: Job? = null
     private var watchdogReconnectJob: Job? = null
 
+    // Full SlowDNS (dnstt) -> KCP -> Noise_NK -> SMUX -> SSH-2.0 -> Local Proxy stack
+    private var dnsttTransport: DnsttPacketTransport? = null
+    private var kcpSession: KcpSession? = null
+    private var smuxSession: SmuxSession? = null
+    private var smuxStream: SmuxStream? = null
+    private var sshBridge: SshProxyBridge? = null
+
     private var activeProfileRef: HttpCustomTunnelProfile? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastBoundNetworkHandle: Long? = null
+    private val lastConnectAttemptMs = AtomicLong(0L)
+    private val lastDnsRxAtMs = AtomicLong(0L)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -106,7 +128,7 @@ class HttpCustomVpnService : VpnService() {
             host = host,
             port = port,
             username = intent?.getStringExtra(EXTRA_USERNAME).orEmpty(),
-            password = "",
+            password = intent?.getStringExtra(EXTRA_PASSWORD).orEmpty(),
             protocol = "SlowDns + SSH",
             nameserver = ns,
             pubKey = intent?.getStringExtra(EXTRA_PUBKEY).orEmpty(),
@@ -117,12 +139,8 @@ class HttpCustomVpnService : VpnService() {
     }
 
     private fun startTunnelConnection(profile: HttpCustomTunnelProfile, isAutoReconnect: Boolean) {
-        connectJob?.cancel()
-        packetLoopJob?.cancel()
-        keepaliveJob?.cancel()
-        speedMeterJob?.cancel()
-        runCatching { tunInterface?.close() }
-        tunInterface = null
+        lastConnectAttemptMs.set(System.currentTimeMillis())
+        cleanupTunnelOnly()
 
         val tuning = HttpCustomTunnelStateHolder.tuning.value
         val carrierSnap = HttpCustomTunnelStateHolder.refreshCarrierSnapshot(this)
@@ -134,9 +152,9 @@ class HttpCustomVpnService : VpnService() {
                 activeProfileId = profile.id,
                 activeProfileName = profile.name,
                 statusDetail = if (isAutoReconnect) {
-                    "$opTag নেটওয়ার্ক পরিবর্তন — অটো রিকানেক্ট হচ্ছে..."
+                    "$opTag নেটওয়ার্ক রি-ক্যালিব্রেট হচ্ছে..."
                 } else {
-                    "$opTag • ${tuning.transportMode.shortLabel} যাচাই হচ্ছে..."
+                    "ধাপ ১/৫: $opTag DNS যাচাই হচ্ছে..."
                 },
                 activeDnsServer = null,
                 activeDnsTransport = null,
@@ -144,6 +162,13 @@ class HttpCustomVpnService : VpnService() {
                 dnsRttMs = null,
                 sshBanner = null,
                 resolvedIp = null,
+                localProxyPort = null,
+                tunnelEngineLabel = null,
+                pipelineStages = TunnelPipelineStages(carrierDns = PipelineStageState.RUNNING),
+                internetCheck = InternetCheckResult(
+                    status = InternetCheckStatus.IDLE,
+                    summaryBn = "টানেল কানেক্ট হলে অটো ইন্টারনেট চেক হবে"
+                ),
                 lastError = null,
                 txSpeedBps = 0L,
                 rxSpeedBps = 0L,
@@ -170,6 +195,7 @@ class HttpCustomVpnService : VpnService() {
                 HttpCustomTunnelStateHolder.appendLog("No carrier DNS reported; probing public + DoH:443...")
             }
 
+            // Stage 1: Fast-Path Carrier DNS + Direct SSH probe
             val probe = HttpCustomTunnelStateHolder.probeNetworkReachability(
                 profile = profile,
                 context = this@HttpCustomVpnService,
@@ -190,7 +216,7 @@ class HttpCustomVpnService : VpnService() {
             }
 
             if (probe.sshReachable) {
-                HttpCustomTunnelStateHolder.appendLog("OK SSH ${profile.host}:${profile.port} (${probe.sshRttMs} ms) [${probe.sshBanner}]")
+                HttpCustomTunnelStateHolder.appendLog("OK Direct SSH ${profile.host}:${profile.port} (${probe.sshRttMs} ms) [${probe.sshBanner}]")
             }
 
             if (!probe.dnsReachable && !probe.sshReachable) {
@@ -200,6 +226,10 @@ class HttpCustomVpnService : VpnService() {
                     current.copy(
                         phase = TunnelConnectionPhase.ERROR,
                         statusDetail = "সংযোগ ব্যর্থ হয়েছে",
+                        pipelineStages = TunnelPipelineStages(
+                            carrierDns = PipelineStageState.FAILED,
+                            failureHintBn = "সিমের 4G ডাটা বা সিগন্যাল চেক করে আবার চেষ্টা করুন।"
+                        ),
                         dnsRttMs = null,
                         lastError = errText,
                         connectedSinceMs = null
@@ -222,13 +252,95 @@ class HttpCustomVpnService : VpnService() {
                 } else {
                     null
                 }
+            val dohClient = GpNetworkInspector.createProtectedDohClient(
+                underlyingNetwork = underlyingNetwork,
+                protectTcp = { tcp -> protect(tcp) },
+                timeoutMs = 3800L
+            )
 
+            updatePipeline { it.copy(carrierDns = PipelineStageState.PASSED) }
+            lastDnsRxAtMs.set(System.currentTimeMillis())
+
+            // Stage 2..4: Establish real full TCP proxy via Direct SSH OR SlowDNS (dnstt -> KCP -> Noise_NK -> SMUX -> SSH)
+            var activeProxyPort: Int? = null
+            var activeEngineLabel = "DNS Relay Only"
+            var resolvedSshBanner: String? = probe.sshBanner
+
+            if (probe.sshReachable && profile.username.isNotBlank()) {
+                HttpCustomTunnelStateHolder.updateState {
+                    it.copy(statusDetail = "ধাপ ২/৫: Direct SSH অথেন্টিকেশন হচ্ছে...")
+                }
+                updatePipeline {
+                    it.copy(
+                        slowDnsServer = PipelineStageState.PASSED,
+                        noiseSmux = PipelineStageState.PASSED,
+                        sshAuth = PipelineStageState.RUNNING
+                    )
+                }
+                runCatching {
+                    val bridge = SshProxyBridge(
+                        profile = profile,
+                        customSocketFactory = null,
+                        underlyingNetwork = underlyingNetwork,
+                        protectTcp = { s -> protect(s) },
+                        onTraffic = { tx, rx -> recordTrafficDelta(tx, rx) },
+                        onLog = { msg -> HttpCustomTunnelStateHolder.appendLog(msg) }
+                    )
+                    val port = bridge.connectAndStartProxy(connectTimeoutMs = 15_000)
+                    sshBridge = bridge
+                    activeProxyPort = port
+                    activeEngineLabel = "Direct SSH Proxy (127.0.0.1:$port)"
+                    resolvedSshBanner = bridge.serverVersionBanner
+                    updatePipeline { it.copy(sshAuth = PipelineStageState.PASSED) }
+                }.onFailure { err ->
+                    val errMsg = err.localizedMessage ?: err::class.java.simpleName
+                    HttpCustomTunnelStateHolder.appendLog("Direct SSH auth failed: $errMsg (trying SlowDNS dnstt...)")
+                }
+            }
+
+            if (activeProxyPort == null && profile.nameserver.isNotBlank() && profile.pubKey.trim().length == 64) {
+                activeProxyPort = attemptFullDnsttSshPipeline(
+                    profile = profile,
+                    tuning = tuning,
+                    upstreamDnsIp = upstreamDnsIp,
+                    transport = transport,
+                    activeDohUrl = activeDohUrl,
+                    dohClient = dohClient,
+                    underlyingNetwork = underlyingNetwork
+                )?.also { port ->
+                    activeEngineLabel = "SlowDNS (dnstt) + SSH Proxy (127.0.0.1:$port)"
+                    resolvedSshBanner = sshBridge?.serverVersionBanner ?: "SlowDNS+SSH Active"
+                }
+            } else if (activeProxyPort == null) {
+                updatePipeline {
+                    it.copy(
+                        slowDnsServer = PipelineStageState.FAILED,
+                        failureHintBn = "সঠিক ৬৪-অক্ষরের SlowDNS Public Key বা Nameserver দেওয়া নেই।"
+                    )
+                }
+            }
+
+            if (!isActive) {
+                cleanupTunnelOnly()
+                return@launch
+            }
+
+            // Build Android VPN TUN interface + attach System HTTP Proxy (API 29+) when SSH proxy is active!
             val builder = Builder()
                 .setSession(profile.name)
                 .setMtu(tuning.mtuSize.coerceIn(1280, 1500))
                 .addAddress(HttpCustomTunnelStateHolder.VIRTUAL_TUN_CLIENT_IP, 32)
                 .addDnsServer(HttpCustomTunnelStateHolder.VIRTUAL_TUN_DNS_IP)
                 .addRoute(HttpCustomTunnelStateHolder.VIRTUAL_TUN_DNS_IP, 32)
+
+            if (activeProxyPort != null) {
+                runCatching {
+                    builder.setHttpProxy(ProxyInfo.buildDirectProxy("127.0.0.1", activeProxyPort!!))
+                    HttpCustomTunnelStateHolder.appendLog("VPN System HTTP/HTTPS Proxy bound -> 127.0.0.1:$activeProxyPort")
+                }.onFailure { e ->
+                    HttpCustomTunnelStateHolder.appendLog("setHttpProxy warning: ${e.localizedMessage}")
+                }
+            }
 
             if (underlyingNetwork != null) {
                 runCatching { builder.setUnderlyingNetworks(arrayOf(underlyingNetwork)) }
@@ -246,6 +358,7 @@ class HttpCustomVpnService : VpnService() {
                     )
                 }
                 HttpCustomTunnelStateHolder.appendLog("TUN establish returned null")
+                cleanupTunnelOnly()
                 unregisterNetworkWatchdog()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -261,10 +374,10 @@ class HttpCustomVpnService : VpnService() {
                 else -> upstreamDnsIp
             }
             val modeLabel = when {
-                probe.sshReachable && probe.dnsReachable -> "সংযুক্ত • SSH + $dnsLabel"
-                probe.sshReachable -> "সংযুক্ত • Direct SSH (VPN সক্রিয়)"
-                activeDohUrl != null -> "সংযুক্ত • Encrypted DoH:443 ($upstreamDnsIp)"
-                else -> "সংযুক্ত • SlowDNS ($transport • $dnsLabel)"
+                activeProxyPort != null && probe.sshReachable -> "সংযুক্ত • SSH প্রক্সি + $dnsLabel"
+                activeProxyPort != null -> "সংযুক্ত • SlowDNS + SSH প্রক্সি ($dnsLabel)"
+                activeDohUrl != null -> "সংযুক্ত • DoH:443 ($upstreamDnsIp)"
+                else -> "সংযুক্ত (শুধু DNS) • $dnsLabel"
             }
             val initialRtt = probe.dnsRttMs ?: probe.sshRttMs
 
@@ -280,22 +393,23 @@ class HttpCustomVpnService : VpnService() {
                     dnsRttMs = initialRtt,
                     pingHistoryMs = initialRtt?.let { (current.pingHistoryMs + it).takeLast(24) }
                         ?: current.pingHistoryMs,
-                    sshBanner = probe.sshBanner ?: "SlowDNS $transport Active",
+                    sshBanner = resolvedSshBanner ?: "SlowDNS $transport Active",
                     resolvedIp = probe.resolvedIps.firstOrNull(),
+                    localProxyPort = activeProxyPort,
+                    tunnelEngineLabel = activeEngineLabel,
+                    internetCheck = InternetCheckResult(
+                        status = InternetCheckStatus.CHECKING,
+                        summaryBn = "ইন্টারনেট চলছে কিনা যাচাই হচ্ছে (HTTP 204)..."
+                    ),
                     connectedSinceMs = current.connectedSinceMs ?: System.currentTimeMillis(),
                     lastError = null
                 )
             }
+            updatePipeline { it.copy(internetCheck = PipelineStageState.RUNNING) }
             HttpCustomTunnelStateHolder.appendLog(
-                "VPN TUN active: ${HttpCustomTunnelStateHolder.VIRTUAL_TUN_CLIENT_IP}/32 (MTU ${tuning.mtuSize}) -> $dnsLabel [$transport]"
+                "VPN TUN active: ${HttpCustomTunnelStateHolder.VIRTUAL_TUN_CLIENT_IP}/32 -> $dnsLabel [$activeEngineLabel]"
             )
-            updateNotification("সংযুক্ত: $dnsLabel (${initialRtt ?: 0} ms)")
-
-            val dohClient = GpNetworkInspector.createProtectedDohClient(
-                underlyingNetwork = underlyingNetwork,
-                protectTcp = { tcp -> protect(tcp) },
-                timeoutMs = 3500L
-            )
+            updateNotification("সংযুক্ত: $dnsLabel — ইন্টারনেট চেক হচ্ছে...")
 
             launchPacketForwarder(
                 tun = established,
@@ -320,6 +434,213 @@ class HttpCustomVpnService : VpnService() {
             } else {
                 unregisterNetworkWatchdog()
             }
+
+            // Stage 5: Mandatory real post-connect Internet Verification (HTTP 204 + Exit Public IP)
+            launch(Dispatchers.IO) {
+                val checkResult = InternetConnectivityVerifier.verifyInternet(
+                    localProxyPort = activeProxyPort,
+                    underlyingNetwork = underlyingNetwork,
+                    protectTcp = { tcp -> protect(tcp) },
+                    timeoutSec = 10L
+                )
+                HttpCustomTunnelStateHolder.updateState { current ->
+                    current.copy(
+                        internetCheck = checkResult,
+                        pipelineStages = current.pipelineStages.copy(
+                            internetCheck = if (checkResult.status == InternetCheckStatus.VERIFIED_ONLINE) {
+                                PipelineStageState.PASSED
+                            } else {
+                                PipelineStageState.FAILED
+                            }
+                        )
+                    )
+                }
+                HttpCustomTunnelStateHolder.appendLog(
+                    "Internet Verification -> ${checkResult.summaryBn} | ${checkResult.detailText.orEmpty()}"
+                )
+                val notifLine = when (checkResult.status) {
+                    InternetCheckStatus.VERIFIED_ONLINE ->
+                        "ইন্টারনেট চালু (${checkResult.httpLatencyMs ?: 0}ms${checkResult.exitPublicIp?.let { " • $it" } ?: ""})"
+                    else ->
+                        "শুধু GP DNS চালু — ইন্টারনেট রেসপন্স নেই"
+                }
+                updateNotification(notifLine)
+            }
+        }
+    }
+
+    /**
+     * Runs the genuine 4-layer dnstt SlowDNS stack:
+     * DnsttPacketTransport (UDP:53/TCP:53/DoH) -> KcpSession -> NoiseNkChannel -> SmuxSession -> SshProxyBridge.
+     */
+    private fun attemptFullDnsttSshPipeline(
+        profile: HttpCustomTunnelProfile,
+        tuning: TunnelTuningConfig,
+        upstreamDnsIp: String,
+        transport: String,
+        activeDohUrl: String?,
+        dohClient: OkHttpClient,
+        underlyingNetwork: Network?
+    ): Int? {
+        HttpCustomTunnelStateHolder.updateState {
+            it.copy(statusDetail = "ধাপ ২/৫: SlowDNS (${profile.nameserver}) যাচাই হচ্ছে...")
+        }
+        updatePipeline { it.copy(slowDnsServer = PipelineStageState.RUNNING) }
+
+        val dnstt = DnsttPacketTransport(
+            resolverIp = upstreamDnsIp,
+            transportType = transport,
+            tunnelDomain = profile.nameserver,
+            ednsPayloadSize = tuning.ednsPayloadSize,
+            dohUrl = activeDohUrl,
+            dohClient = dohClient,
+            underlyingNetwork = underlyingNetwork,
+            protectUdp = { sock -> protect(sock) },
+            protectTcp = { tcp -> protect(tcp) },
+            onBytesTransferred = { tx, rx, rtt ->
+                recordTrafficDelta(tx, rx)
+                if (rx > 0) lastDnsRxAtMs.set(System.currentTimeMillis())
+                if (rtt != null) HttpCustomTunnelStateHolder.recordPingSample(rtt)
+            },
+            onLog = { msg -> HttpCustomTunnelStateHolder.appendLog(msg) }
+        )
+
+        val (dnsttReachable, dnsttRtt) = dnstt.verifyDnsttServerReachable(timeoutMs = 4200)
+        if (!dnsttReachable) {
+            HttpCustomTunnelStateHolder.appendLog(
+                "SlowDNS TXT poll failed on ${profile.nameserver} via $upstreamDnsIp (no TXT reply from dnstt-server)"
+            )
+            updatePipeline {
+                it.copy(
+                    slowDnsServer = PipelineStageState.FAILED,
+                    noiseSmux = PipelineStageState.FAILED,
+                    sshAuth = PipelineStageState.FAILED,
+                    failureHintBn = "${profile.nameserver} সার্ভার থেকে SlowDNS TXT রেসপন্স আসেনি। নতুন চালু SlowDNS সার্ভার/কনফিগ ইমপোর্ট করুন।"
+                )
+            }
+            dnstt.close()
+            return null
+        }
+
+        HttpCustomTunnelStateHolder.appendLog(
+            "OK SlowDNS dnstt-server TXT reply (${dnsttRtt ?: 0} ms, KCP MTU=${dnstt.maxKcpMtu}B)"
+        )
+        updatePipeline {
+            it.copy(
+                slowDnsServer = PipelineStageState.PASSED,
+                noiseSmux = PipelineStageState.RUNNING
+            )
+        }
+        HttpCustomTunnelStateHolder.updateState {
+            it.copy(statusDetail = "ধাপ ৩/৫: Noise_NK + KCP + SMUX এনক্রিপশন হচ্ছে...")
+        }
+
+        dnstt.start(workerCount = 3)
+        dnsttTransport = dnstt
+
+        val kcp = KcpSession(
+            mtu = dnstt.maxKcpMtu,
+            sendPacket = { pkt -> dnstt.enqueueSend(pkt) },
+            pollPacket = { waitMs -> dnstt.pollReceived(waitMs) },
+            windowSize = 256
+        )
+        kcp.start()
+        kcpSession = kcp
+
+        val noiseChannel = runCatching {
+            NoiseNkChannel.connectClient(
+                rawIn = kcp.asInputStream(readTimeoutMs = 15_000L),
+                rawOut = kcp.asOutputStream(),
+                serverPubKeyHex = profile.pubKey
+            )
+        }.getOrElse { err ->
+            val msg = err.localizedMessage ?: err::class.java.simpleName
+            HttpCustomTunnelStateHolder.appendLog("Noise_NK handshake failed: $msg")
+            updatePipeline {
+                it.copy(
+                    noiseSmux = PipelineStageState.FAILED,
+                    sshAuth = PipelineStageState.FAILED,
+                    failureHintBn = "Noise_NK হ্যান্ডশেক ব্যর্থ ($msg) — SlowDNS Public Key বা সার্ভার স্ট্যাটাস চেক করুন।"
+                )
+            }
+            cleanupDnsttStack()
+            return null
+        }
+
+        val smux = SmuxSession(noiseChannel.inputStream, noiseChannel.outputStream)
+        smux.start()
+        val stream = runCatching { smux.openStream() }.getOrElse { err ->
+            HttpCustomTunnelStateHolder.appendLog("SMUX stream open failed: ${err.localizedMessage}")
+            updatePipeline {
+                it.copy(
+                    noiseSmux = PipelineStageState.FAILED,
+                    sshAuth = PipelineStageState.FAILED,
+                    failureHintBn = "SMUX স্ট্রিম ওপেন করা যায়নি (${err.localizedMessage ?: "error"})।"
+                )
+            }
+            cleanupDnsttStack()
+            return null
+        }
+        smuxSession = smux
+        smuxStream = stream
+
+        HttpCustomTunnelStateHolder.appendLog("OK Noise_NK + SMUX encrypted tunnel established (stream #${stream.streamId})")
+        updatePipeline {
+            it.copy(
+                noiseSmux = PipelineStageState.PASSED,
+                sshAuth = PipelineStageState.RUNNING
+            )
+        }
+        HttpCustomTunnelStateHolder.updateState {
+            it.copy(statusDetail = "ধাপ ৪/৫: SSH লগইন (${profile.username}) যাচাই হচ্ছে...")
+        }
+
+        return runCatching {
+            val bridge = SshProxyBridge(
+                profile = profile,
+                customSocketFactory = { stream.asSocket() },
+                underlyingNetwork = underlyingNetwork,
+                protectTcp = { s -> protect(s) },
+                onTraffic = { tx, rx -> recordTrafficDelta(tx, rx) },
+                onLog = { msg -> HttpCustomTunnelStateHolder.appendLog(msg) }
+            )
+            val port = bridge.connectAndStartProxy(connectTimeoutMs = 22_000)
+            sshBridge = bridge
+            updatePipeline { it.copy(sshAuth = PipelineStageState.PASSED) }
+            port
+        }.getOrElse { err ->
+            val msg = err.localizedMessage ?: err::class.java.simpleName
+            HttpCustomTunnelStateHolder.appendLog("SSH login over SlowDNS failed: $msg")
+            val hint = if (msg.contains("Auth fail", ignoreCase = true) || msg.contains("Auth cancel", ignoreCase = true)) {
+                "SSH ইউজারনেম/পাসওয়ার্ড (${profile.username}) মেয়াদ শেষ বা ভুল! Edit বাটনে গিয়ে নতুন SSH অ্যাকাউন্ট দিন।"
+            } else {
+                "SlowDNS এর ভিতরে SSH কানেক্ট ব্যর্থ ($msg)।"
+            }
+            updatePipeline {
+                it.copy(
+                    sshAuth = PipelineStageState.FAILED,
+                    failureHintBn = hint
+                )
+            }
+            cleanupDnsttStack()
+            null
+        }
+    }
+
+    private fun updatePipeline(transform: (TunnelPipelineStages) -> TunnelPipelineStages) {
+        HttpCustomTunnelStateHolder.updateState { current ->
+            current.copy(pipelineStages = transform(current.pipelineStages))
+        }
+    }
+
+    private fun recordTrafficDelta(txDelta: Long, rxDelta: Long) {
+        if (txDelta <= 0L && rxDelta <= 0L) return
+        HttpCustomTunnelStateHolder.updateState { current ->
+            current.copy(
+                txBytes = current.txBytes + txDelta.coerceAtLeast(0L),
+                rxBytes = current.rxBytes + rxDelta.coerceAtLeast(0L),
+                dnsPacketsHandled = current.dnsPacketsHandled + if (rxDelta > 0L) 1 else 0
+            )
         }
     }
 
@@ -363,6 +684,7 @@ class HttpCustomVpnService : VpnService() {
                             underlyingNetwork = underlyingNetwork
                         ) ?: return@launch
 
+                        lastDnsRxAtMs.set(System.currentTimeMillis())
                         val tunReply = DnsPacketCodec.buildTunUdpResponsePacket(
                             srcIp = udpPacket.dstIp,
                             dstIp = udpPacket.srcIp,
@@ -423,14 +745,15 @@ class HttpCustomVpnService : VpnService() {
         payload: ByteArray,
         upstreamAddr: InetAddress,
         port: Int,
-        underlyingNetwork: Network?
+        underlyingNetwork: Network?,
+        timeoutMs: Int = 3500
     ): ByteArray? = runCatching {
         DatagramSocket().use { sock ->
             protect(sock)
             if (underlyingNetwork != null) {
                 runCatching { underlyingNetwork.bindSocket(sock) }
             }
-            sock.soTimeout = 3000
+            sock.soTimeout = timeoutMs
             sock.send(DatagramPacket(payload, payload.size, upstreamAddr, port))
             val replyBuf = ByteArray(2048)
             val replyPacket = DatagramPacket(replyBuf, replyBuf.size)
@@ -450,8 +773,8 @@ class HttpCustomVpnService : VpnService() {
             if (underlyingNetwork != null) {
                 runCatching { underlyingNetwork.bindSocket(tcp) }
             }
-            tcp.connect(InetSocketAddress(upstreamAddr, port), 3000)
-            tcp.soTimeout = 3000
+            tcp.connect(InetSocketAddress(upstreamAddr, port), 3200)
+            tcp.soTimeout = 3200
             val dos = DataOutputStream(tcp.getOutputStream())
             dos.writeShort(payload.size)
             dos.write(payload)
@@ -469,6 +792,12 @@ class HttpCustomVpnService : VpnService() {
         }
     }.getOrNull()
 
+    /**
+     * Stabilized keepalive monitor that NEVER causes rapid connect/disconnect loops on GP 4G:
+     * - When SSH proxy is active, monitors real SSH session liveness instead of tearing down on DNS jitter.
+     * - In DNS mode, skips probe when real DNS traffic flowed within last 12s, retries with EDNS=512,
+     *   and requires 5 consecutive failures before re-calibrating.
+     */
     private fun launchKeepaliveMonitor(
         profile: HttpCustomTunnelProfile,
         tuning: TunnelTuningConfig,
@@ -481,19 +810,40 @@ class HttpCustomVpnService : VpnService() {
         keepaliveJob = serviceScope.launch {
             val upstreamAddr = runCatching { InetAddress.getByName(upstreamDnsIp) }.getOrNull() ?: return@launch
             val queryDomain = profile.nameserver.ifBlank { profile.host }
-            val intervalMs = (tuning.keepaliveIntervalSec.coerceIn(10, 60)) * 1000L
+            val intervalMs = (tuning.keepaliveIntervalSec.coerceIn(15, 60)) * 1000L
             var consecutiveMisses = 0
 
             while (isActive) {
                 delay(intervalMs)
                 if (!isActive) break
+
+                // If full SlowDNS+SSH proxy is running and healthy, keep connection stable without DNS teardown
+                val activeBridge = sshBridge
+                if (activeBridge != null) {
+                    if (activeBridge.isConnected()) {
+                        consecutiveMisses = 0
+                        continue
+                    } else if (tuning.autoReconnectWatchdog) {
+                        HttpCustomTunnelStateHolder.appendLog("Watchdog: SSH session dropped -> reconnecting...")
+                        triggerWatchdogReconnect()
+                        break
+                    }
+                }
+
+                // Skip redundant probe if real DNS RX happened recently
+                val msSinceRx = System.currentTimeMillis() - lastDnsRxAtMs.get()
+                if (msSinceRx in 0L..12_000L) {
+                    consecutiveMisses = 0
+                    continue
+                }
+
                 val txId = (System.currentTimeMillis() and 0xFFFFL).toInt()
                 val query = DnsPacketCodec.buildDnsQueryPacket(
                     domain = queryDomain,
-                    queryType = DnsPacketCodec.TYPE_TXT,
+                    queryType = DnsPacketCodec.TYPE_A,
                     transactionId = txId,
                     includeEdns0 = true,
-                    ednsUdpPayloadSize = tuning.ednsPayloadSize
+                    ednsUdpPayloadSize = 512
                 )
                 val t0 = System.currentTimeMillis()
                 val reply = forwardDnsQuery(
@@ -507,12 +857,15 @@ class HttpCustomVpnService : VpnService() {
                 )
                 if (reply != null) {
                     consecutiveMisses = 0
+                    lastDnsRxAtMs.set(System.currentTimeMillis())
                     val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                     HttpCustomTunnelStateHolder.recordPingSample(rtt)
                 } else {
                     consecutiveMisses++
-                    if (consecutiveMisses >= 2 && tuning.autoReconnectWatchdog) {
-                        HttpCustomTunnelStateHolder.appendLog("Watchdog: Keepalive missed ($consecutiveMisses) -> re-calibrating GP route...")
+                    if (consecutiveMisses >= 5 && tuning.autoReconnectWatchdog) {
+                        HttpCustomTunnelStateHolder.appendLog(
+                            "Watchdog: 5 consecutive GP DNS timeouts -> refreshing route..."
+                        )
                         triggerWatchdogReconnect()
                         break
                     }
@@ -550,7 +903,11 @@ class HttpCustomVpnService : VpnService() {
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 val handle = network.networkHandle
-                if (lastBoundNetworkHandle != null && handle != lastBoundNetworkHandle) {
+                val sinceLastConnect = System.currentTimeMillis() - lastConnectAttemptMs.get()
+                if (lastBoundNetworkHandle != null &&
+                    handle != lastBoundNetworkHandle &&
+                    sinceLastConnect > 20_000L
+                ) {
                     HttpCustomTunnelStateHolder.appendLog("Network switched -> Watchdog scheduling GP DNS refresh")
                     triggerWatchdogReconnect()
                 }
@@ -577,9 +934,11 @@ class HttpCustomVpnService : VpnService() {
 
     private fun triggerWatchdogReconnect() {
         val profile = activeProfileRef ?: return
+        val sinceLast = System.currentTimeMillis() - lastConnectAttemptMs.get()
+        if (sinceLast < 20_000L) return
         watchdogReconnectJob?.cancel()
         watchdogReconnectJob = serviceScope.launch {
-            delay(1500L)
+            delay(2000L)
             if (isActive && HttpCustomTunnelStateHolder.state.value.phase == TunnelConnectionPhase.CONNECTED) {
                 startTunnelConnection(profile, isAutoReconnect = true)
             }
@@ -596,6 +955,10 @@ class HttpCustomVpnService : VpnService() {
                 activeDnsServer = null,
                 activeDnsTransport = null,
                 activeDohUrl = null,
+                localProxyPort = null,
+                tunnelEngineLabel = null,
+                pipelineStages = TunnelPipelineStages(),
+                internetCheck = InternetCheckResult(),
                 txSpeedBps = 0L,
                 rxSpeedBps = 0L,
                 connectedSinceMs = null,
@@ -607,14 +970,32 @@ class HttpCustomVpnService : VpnService() {
         stopSelf()
     }
 
-    private fun cleanupResources() {
+    private fun cleanupDnsttStack() {
+        runCatching { sshBridge?.close() }
+        sshBridge = null
+        runCatching { smuxStream?.close() }
+        smuxStream = null
+        runCatching { smuxSession?.close() }
+        smuxSession = null
+        runCatching { kcpSession?.close() }
+        kcpSession = null
+        runCatching { dnsttTransport?.close() }
+        dnsttTransport = null
+    }
+
+    private fun cleanupTunnelOnly() {
         connectJob?.cancel()
         packetLoopJob?.cancel()
         keepaliveJob?.cancel()
         speedMeterJob?.cancel()
-        watchdogReconnectJob?.cancel()
+        cleanupDnsttStack()
         runCatching { tunInterface?.close() }
         tunInterface = null
+    }
+
+    private fun cleanupResources() {
+        watchdogReconnectJob?.cancel()
+        cleanupTunnelOnly()
     }
 
     private fun ensureNotificationChannel() {
@@ -656,7 +1037,7 @@ class HttpCustomVpnService : VpnService() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("GP SlowDNS • HTTP Custom")
+            .setContentTitle("GP Pro Tunnel • SlowDNS + SSH")
             .setContentText(contentText)
             .setContentIntent(openIntent)
             .setOngoing(true)
@@ -683,6 +1064,7 @@ class HttpCustomVpnService : VpnService() {
         const val EXTRA_HOST = "extra_host"
         const val EXTRA_PORT = "extra_port"
         const val EXTRA_USERNAME = "extra_username"
+        const val EXTRA_PASSWORD = "extra_password"
         const val EXTRA_NAMESERVER = "extra_nameserver"
         const val EXTRA_DNS_SERVER = "extra_dns_server"
         const val EXTRA_PUBKEY = "extra_pubkey"
@@ -698,6 +1080,7 @@ class HttpCustomVpnService : VpnService() {
                 putExtra(EXTRA_HOST, profile.host)
                 putExtra(EXTRA_PORT, profile.port)
                 putExtra(EXTRA_USERNAME, profile.username)
+                putExtra(EXTRA_PASSWORD, profile.password)
                 putExtra(EXTRA_NAMESERVER, profile.nameserver)
                 putExtra(EXTRA_DNS_SERVER, profile.dnsServer)
                 putExtra(EXTRA_PUBKEY, profile.pubKey)
