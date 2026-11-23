@@ -801,7 +801,8 @@ object GeminiRestClient {
         ownerPersonalData: List<PersonalDataItem>,
         consultationTranscript: List<String>,
         ownerLatestUtterance: String,
-        ownerDisplayName: String = ""
+        ownerDisplayName: String = "",
+        decisionHint: String? = null
     ): Result<OwnerVoiceConsultationResult> = withContext(Dispatchers.IO) {
         runCatching {
             val cleanModel = modelId.trim().removePrefix("models/").ifBlank { "gemini-2.5-flash" }
@@ -867,6 +868,9 @@ object GeminiRestClient {
                 }
 
                 append("\nOwner just spoke: \"").append(ownerLatestUtterance).append("\"\n")
+                if (!decisionHint.isNullOrBlank()) {
+                    append("Calibrated Decision Engine Hint: ").append(decisionHint).append('\n')
+                }
                 append("Return strict JSON only.")
             }
 

@@ -43,6 +43,7 @@ import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.filled.VpnLock
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -178,7 +179,8 @@ suspend fun signOutFromFirebase(context: Context) {
 fun AuthGateScreen(
     deviceProfile: DeviceProfileIdentity,
     onSignedIn: () -> Unit,
-    onOpenFreeExplorer: () -> Unit = {}
+    onOpenFreeExplorer: () -> Unit = {},
+    onOpenHttpCustom: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val palette = StudioTheme.colors
@@ -907,6 +909,63 @@ fun AuthGateScreen(
                         )
                     ) {
                         Text("খুলুন", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            // HTTP Custom SlowDNS + SSH Tunnel Access Card (usable before sign-in)
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                color = palette.amberSoft,
+                border = BorderStroke(1.dp, WarmAmber.copy(alpha = 0.45f))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(44.dp)
+                            .clip(CircleShape)
+                            .background(WarmAmber),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.VpnLock,
+                            contentDescription = "HTTP Custom Tunnel",
+                            tint = Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "HTTP Custom Tunnel",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = palette.inkPrimary,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            text = "SlowDNS + SSH প্রফাইল দিয়ে সরাসরি VPN কানেক্ট করুন।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                    }
+                    Button(
+                        onClick = onOpenHttpCustom,
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("auth_open_http_custom_button"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = WarmAmber,
+                            contentColor = Color.White
+                        )
+                    ) {
+                        Text("কানেক্ট", fontWeight = FontWeight.Bold)
                     }
                 }
             }

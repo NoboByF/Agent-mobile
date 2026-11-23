@@ -129,6 +129,7 @@ fun SettingsLogsScreen(
     liveModelTest: ConnectionTestState,
     agentModelTest: ConnectionTestState,
     textModelTest: ConnectionTestState,
+    decisionModelTest: ConnectionTestState,
     logs: List<DiagnosticLogEntry>,
     onSyncNow: () -> Unit,
     onSignOut: () -> Unit,
@@ -148,6 +149,9 @@ fun SettingsLogsScreen(
     onUpdateVerifyTaskCompletion: (Boolean) -> Unit,
     onUpdateTextModel: (String) -> Unit,
     onTestTextModel: () -> Unit,
+    onUpdateDecisionModel: (String) -> Unit,
+    onUpdateUseDecisionModel: (Boolean) -> Unit,
+    onTestDecisionModel: () -> Unit,
     onDeleteModel: (String) -> Unit,
     onRestoreModel: (String) -> Unit,
     onRestoreAllModels: () -> Unit,
@@ -880,6 +884,93 @@ fun SettingsLogsScreen(
                             accentColor = palette.violetAccent,
                             state = textModelTest,
                             onTest = onTestTextModel
+                        )
+                    }
+                }
+
+                // 3B. Dedicated Calibrated Decision Brain (Gemini Decision 1)
+                item {
+                    StudioCardContainer {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Decision Brain (Gemini Decision 1)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = palette.inkPrimary,
+                                modifier = Modifier.weight(1f)
+                            )
+                            StatusPillBadge(
+                                label = "CALIBRATED",
+                                accentColor = palette.amberAccent,
+                                containerColor = palette.amberSoft,
+                                leadingDot = false
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "দ্রুত ও নিখুঁত সিদ্ধান্তের জন্য (Auto-Chat ট্রিয়াজ, স্প্যাম/গালি শনাক্তকরণ, গুরুত্বপূর্ণ মেসেজ যাচাই, ভয়েস পরামর্শ রাউটিং এবং অটোনমাস টাস্ক যাচাই) dedicated /v1beta/decisions মডেল ব্যবহার করে।",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.inkSecondary
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        ToggleSettingRow(
+                            title = "Use Gemini Decision 1 (সিদ্ধান্ত ইঞ্জিন চালু)",
+                            subtitle = "সকল গুরুত্বপূর্ণ সিদ্ধান্তে ক্যালিব্রেটেড প্রবাবিলিটি ব্যবহার করে (ব্যর্থ হলে অটো ফলব্যাক হয়)",
+                            checked = settings.useDecisionModel,
+                            tag = "use_decision_model_switch",
+                            trackColor = WarmAmber,
+                            onCheckedChange = onUpdateUseDecisionModel
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            PilotSettings.DECISION_MODEL_PRESETS.forEach { preset ->
+                                val isSel = settings.decisionModel.equals(preset, ignoreCase = true)
+                                FilterChip(
+                                    selected = isSel,
+                                    onClick = { onUpdateDecisionModel(preset) },
+                                    modifier = Modifier.testTag("decision_model_chip_${preset.lowercase()}"),
+                                    label = { Text("$preset (Fast & Calibrated)", style = MaterialTheme.typography.labelMedium) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = palette.amberSoft,
+                                        selectedLabelColor = palette.amberAccent
+                                    )
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedTextField(
+                            value = settings.decisionModel,
+                            onValueChange = onUpdateDecisionModel,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("settings_decision_model_input"),
+                            singleLine = true,
+                            label = { Text("Decision Model ID") },
+                            shape = RoundedCornerShape(14.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedContainerColor = palette.surfaceSubtle,
+                                unfocusedContainerColor = palette.surfaceSubtle,
+                                focusedBorderColor = palette.amberAccent,
+                                unfocusedBorderColor = palette.outline
+                            )
+                        )
+
+                        Spacer(modifier = Modifier.height(8.dp))
+                        ModelDiagnosticTestBar(
+                            buttonLabel = "Test Decision Model",
+                            testTag = "settings_test_decision_button",
+                            accentColor = palette.amberAccent,
+                            state = decisionModelTest,
+                            onTest = onTestDecisionModel
                         )
                     }
                 }

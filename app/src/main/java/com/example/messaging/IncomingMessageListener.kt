@@ -7,6 +7,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import com.example.ai.GeminiDecisionClient
 import com.example.ai.GeminiRestClient
 import com.example.ai.GeneratedImageHelper
 import com.example.automation.PilotAccessibilityService
@@ -265,62 +266,7 @@ class IncomingMessageListener : NotificationListenerService() {
 
         // Step 1.5: Real AI Image Generation for incoming requests like "একটি পাখির ইমেজ তৈরি করে দাও"
         if (GeneratedImageHelper.isImageGenerationRequest(combinedIncomingText)) {
-            PilotStateHub.log(
-                LogLevel.INFO,
-                "AutoReply",
-                "Image request from ${record.senderName}; generating real AI image..."
-            )
-            val imgRes = GeminiRestClient.generateImage(
-                apiKey = settings.effectiveApiKey,
-                prompt = combinedIncomingText
-            )
-            val generated = imgRes.getOrNull()
-            if (generated != null) {
-                val savedFile = GeneratedImageHelper.saveGeneratedBytesToAppFile(
-                    context = applicationContext,
-                    bytes = generated.imageBytes,
-                    mimeType = generated.mimeType
-                )
-                GeneratedImageHelper.saveImageFileToGallery(
-                    context = applicationContext,
-                    filePath = savedFile.absolutePath,
-                    displayLabel = "LivePilot_Chat"
-                )
-                PilotStateHub.recordGeneratedImageInAskAi(
-                    prompt = "${record.senderName}: $combinedIncomingText",
-                    imagePath = savedFile.absolutePath,
-                    caption = generated.captionText.ifBlank {
-                        "${record.senderName} (${record.app.displayName})-এর অনুরোধে ছবিটি তৈরি হয়েছে।"
-                    },
-                    modelUsed = generated.modelUsed
-                )
-                val isBengali = combinedIncomingText.any { it in '\u0980'..'\u09FF' }
-                val chatReply = if (isBengali) {
-                    "আপনার জন্য ছবিটি তৈরি করে রেখেছি! গ্যালারি ও Auto-Chat-এ সেভ হয়েছে, এখনই পাঠিয়ে দেওয়া হবে।"
-                } else {
-                    "I've generated your image and saved it on the phone! I'll share it with you shortly."
-                }
-                registerSentReply(record.packageName, record.senderName, chatReply)
-                lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
-                val delivered = deliverReply(
-                    settingsDelivery = settings.autoReplyDelivery,
-                    record = record,
-                    replyAction = replyAction,
-                    replyText = chatReply
-                )
-                if (delivered) {
-                    appendConversationHistory(convKey, "Me: $chatReply")
-                }
-                PilotStateHub.markMessageGeneratedImage(
-                    recordId = record.id,
-                    imagePath = savedFile.absolutePath,
-                    replyText = if (delivered) chatReply else null
-                )
-                PilotStateHub.log(
-                    LogLevel.INFO,
-                    "AutoReply",
-                    "Generated real AI image for ${record.senderName} (${savedFile.name}); ready for 1-tap Share."
-                )
+            if (handleIncomingImageGenerationRequest(convKey, record, combinedIncomingText, replyAction, settings)) {
                 return
             }
         }
@@ -350,6 +296,81 @@ class IncomingMessageListener : NotificationListenerService() {
         var sensitivityReason = localSensitive.reason
         var ownerQuestion = localSensitive.questionForOwner
         var finalReplyText = localSensitive.deferralReply
+
+        // Step 2.5: Fast calibrated triage via Gemini Decision 1 (`gemini-decision-1`, $0 output tokens)
+        if (!isSensitive && settings.useDecisionModel) {
+            val historyForDecision = getConversationHistory(convKey)
+            val decision = GeminiDecisionClient.classifyIncomingMessage(
+                apiKey = settings.effectiveApiKey,
+                modelId = settings.decisionModel,
+                appName = record.app.displayName,
+                senderName = record.senderName,
+                incomingText = combinedIncomingText,
+                conversationHistory = historyForDecision,
+                personalDataFacts = shareablePersonalData
+            ).getOrNull()
+
+            if (decision != null) {
+                val confPct = (decision.categoryConfidence * 100).toInt()
+                val ownerPct = (decision.needsOwnerProb * 100).toInt()
+                val pdPct = (decision.answerableByPersonalDataProb * 100).toInt()
+                PilotStateHub.log(
+                    LogLevel.INFO,
+                    "Decision1",
+                    "Triage [${record.senderName}]: cat=${decision.category} (${confPct}%), needsOwner=${ownerPct}%, inMyData=${pdPct}%, urgency=${"%.1f".format(decision.urgencyScore)} (${decision.latencyMs}ms)"
+                )
+
+                when (decision.category) {
+                    "ABUSIVE" -> if (decision.categoryConfidence >= 0.72) {
+                        val mod = ChatModerationEngine.recordAbuseAndDecide(convKey, combinedIncomingText)
+                        if (mod.action == ModerationAction.WARN_ABUSE && mod.replyText.isNotBlank()) {
+                            registerSentReply(record.packageName, record.senderName, mod.replyText)
+                            lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                            if (deliverReply(settings.autoReplyDelivery, record, replyAction, mod.replyText)) {
+                                appendConversationHistory(convKey, "Me: ${mod.replyText}")
+                                PilotStateHub.markMessageAutoReplied(record.id, mod.replyText)
+                            }
+                        }
+                        PilotStateHub.log(LogLevel.SAFETY, "Decision1", "Calibrated abuse detected for ${record.senderName}: ${mod.reason}")
+                        return
+                    }
+                    "SPAM_NONSENSE" -> if (decision.categoryConfidence >= 0.72) {
+                        val mod = ChatModerationEngine.recordSpamAndDecide(convKey, combinedIncomingText)
+                        if (mod.action == ModerationAction.AVOID_SPAM_ONCE && mod.replyText.isNotBlank()) {
+                            registerSentReply(record.packageName, record.senderName, mod.replyText)
+                            lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+                            if (deliverReply(settings.autoReplyDelivery, record, replyAction, mod.replyText)) {
+                                appendConversationHistory(convKey, "Me: ${mod.replyText}")
+                                PilotStateHub.markMessageAutoReplied(record.id, mod.replyText)
+                            }
+                        }
+                        PilotStateHub.log(LogLevel.SAFETY, "Decision1", "Calibrated spam detected for ${record.senderName}: ${mod.reason}")
+                        return
+                    }
+                    "IMAGE_REQUEST" -> if (decision.categoryConfidence >= 0.78) {
+                        if (handleIncomingImageGenerationRequest(convKey, record, combinedIncomingText, replyAction, settings)) {
+                            return
+                        }
+                    }
+                    "SENSITIVE_OWNER_ONLY" -> if (
+                        settings.sensitiveQuestionGuardEnabled &&
+                        decision.categoryConfidence >= 0.72 &&
+                        decision.needsOwnerProb >= 0.65 &&
+                        decision.answerableByPersonalDataProb < 0.55 &&
+                        !SensitiveMessageGuard.isCreativeOrAiSolvableRequest(combinedIncomingText)
+                    ) {
+                        isSensitive = true
+                        sensitivityReason = if (decision.urgencyScore >= 1.5) {
+                            "জরুরি ব্যক্তিগত অনুরোধ"
+                        } else {
+                            "ব্যক্তিগত সিদ্ধান্ত"
+                        }
+                        ownerQuestion = "${record.senderName} (${record.app.displayName}) জিজ্ঞেস করেছে: \"${combinedIncomingText.take(140)}\" — কী উত্তর পাঠাবো?"
+                        finalReplyText = ChatModerationEngine.buildOwnerAwayMessage(ownerName, combinedIncomingText)
+                    }
+                }
+            }
+        }
 
         if (!isSensitive) {
             // Step 3: Context-aware Gemini Smart Auto-Reply + AI Classifier (NORMAL / ABUSIVE / SPAM_NONSENSE / SENSITIVE_OWNER_ONLY)
@@ -529,6 +550,71 @@ class IncomingMessageListener : NotificationListenerService() {
             "AutoReply",
             "Replied cleanly once to ${record.senderName} (${record.app.displayName}): \"${finalReplyText.take(80)}\""
         )
+    }
+
+    private suspend fun handleIncomingImageGenerationRequest(
+        convKey: String,
+        record: IncomingMessageRecord,
+        combinedIncomingText: String,
+        replyAction: Notification.Action?,
+        settings: com.example.data.PilotSettings
+    ): Boolean {
+        PilotStateHub.log(
+            LogLevel.INFO,
+            "AutoReply",
+            "Image request from ${record.senderName}; generating real AI image..."
+        )
+        val imgRes = GeminiRestClient.generateImage(
+            apiKey = settings.effectiveApiKey,
+            prompt = combinedIncomingText
+        )
+        val generated = imgRes.getOrNull() ?: return false
+        val savedFile = GeneratedImageHelper.saveGeneratedBytesToAppFile(
+            context = applicationContext,
+            bytes = generated.imageBytes,
+            mimeType = generated.mimeType
+        )
+        GeneratedImageHelper.saveImageFileToGallery(
+            context = applicationContext,
+            filePath = savedFile.absolutePath,
+            displayLabel = "LivePilot_Chat"
+        )
+        PilotStateHub.recordGeneratedImageInAskAi(
+            prompt = "${record.senderName}: $combinedIncomingText",
+            imagePath = savedFile.absolutePath,
+            caption = generated.captionText.ifBlank {
+                "${record.senderName} (${record.app.displayName})-এর অনুরোধে ছবিটি তৈরি হয়েছে।"
+            },
+            modelUsed = generated.modelUsed
+        )
+        val isBengali = combinedIncomingText.any { it in '\u0980'..'\u09FF' }
+        val chatReply = if (isBengali) {
+            "আপনার জন্য ছবিটি তৈরি করে রেখেছি! গ্যালারি ও Auto-Chat-এ সেভ হয়েছে, এখনই পাঠিয়ে দেওয়া হবে।"
+        } else {
+            "I've generated your image and saved it on the phone! I'll share it with you shortly."
+        }
+        registerSentReply(record.packageName, record.senderName, chatReply)
+        lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
+        val delivered = deliverReply(
+            settingsDelivery = settings.autoReplyDelivery,
+            record = record,
+            replyAction = replyAction,
+            replyText = chatReply
+        )
+        if (delivered) {
+            appendConversationHistory(convKey, "Me: $chatReply")
+        }
+        PilotStateHub.markMessageGeneratedImage(
+            recordId = record.id,
+            imagePath = savedFile.absolutePath,
+            replyText = if (delivered) chatReply else null
+        )
+        PilotStateHub.log(
+            LogLevel.INFO,
+            "AutoReply",
+            "Generated real AI image for ${record.senderName} (${savedFile.name}); ready for 1-tap Share."
+        )
+        return true
     }
 
     private suspend fun deliverReply(

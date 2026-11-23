@@ -200,7 +200,7 @@ fun FreeExplorerScreen(
                                 overflow = TextOverflow.Ellipsis
                             )
                             StatusPillBadge(
-                                label = "FREE",
+                                label = "ZERO-RATED",
                                 accentColor = palette.emeraldAccent,
                                 containerColor = palette.emeraldSoft,
                                 leadingDot = true
@@ -226,7 +226,7 @@ fun FreeExplorerScreen(
                         }
                     }
 
-                    // Browser Navigation Controls (minimum 48dp touch targets)
+                    // Browser Navigation Controls
                     IconButton(
                         onClick = { webViewRef?.takeIf { it.canGoBack() }?.goBack() },
                         enabled = canGoBack,
@@ -269,7 +269,7 @@ fun FreeExplorerScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Home,
-                            contentDescription = "Grameenphone হোম পেজ",
+                            contentDescription = "GP Shop হোম পেজ",
                             tint = palette.emeraldAccent,
                             modifier = Modifier.size(20.dp)
                         )
@@ -343,10 +343,6 @@ fun FreeExplorerScreen(
                             safeBrowsingEnabled = true
                             allowFileAccess = false
                             allowContentAccess = false
-                            @Suppress("DEPRECATION")
-                            allowFileAccessFromFileURLs = false
-                            @Suppress("DEPRECATION")
-                            allowUniversalAccessFromFileURLs = false
                         }
 
                         webChromeClient = object : WebChromeClient() {
@@ -370,7 +366,6 @@ fun FreeExplorerScreen(
                                 request: WebResourceRequest?
                             ): Boolean {
                                 val target = request?.url?.toString()
-                                // Block unsafe schemes (javascript:, file:, content:, intent:, data:)
                                 return !FreeExplorerUrlPolicy.isSafeNavigableUrl(target)
                             }
 
@@ -412,7 +407,7 @@ fun FreeExplorerScreen(
                 }
             )
 
-            // Friendly Error Overlay if main frame fails (e.g., Airplane mode / mobile data off)
+            // Friendly Error Overlay if main frame fails
             if (!loadErrorMessage.isNullOrBlank()) {
                 Box(
                     modifier = Modifier

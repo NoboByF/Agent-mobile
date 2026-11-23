@@ -34,11 +34,13 @@ import androidx.compose.material.icons.filled.ChatBubble
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material.icons.outlined.Explore
 import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Tune
+import androidx.compose.material.icons.outlined.VpnKey
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -110,6 +112,12 @@ enum class PilotTab(
         selectedIcon = Icons.Filled.Explore,
         unselectedIcon = Icons.Outlined.Explore,
         testTag = "nav_tab_explorer"
+    ),
+    HTTP_CUSTOM(
+        label = "HTTP Custom",
+        selectedIcon = Icons.Filled.VpnKey,
+        unselectedIcon = Icons.Outlined.VpnKey,
+        testTag = "nav_tab_http_custom"
     ),
     SETTINGS(
         label = "Settings",
@@ -414,6 +422,7 @@ fun FloatingPilotBottomBar(
                         PilotTab.ASK_AI -> if (palette.isDark) palette.violetAccent else RoyalViolet
                         PilotTab.AUTO_CHAT -> if (palette.isDark) palette.roseAccent else RosePink
                         PilotTab.EXPLORER -> if (palette.isDark) palette.emeraldAccent else EmeraldGreen
+                        PilotTab.HTTP_CUSTOM -> if (palette.isDark) palette.amberAccent else WarmAmber
                         PilotTab.SETTINGS -> if (palette.isDark) palette.amberAccent else WarmAmber
                     }
                     val soft = when (tab) {
@@ -421,6 +430,7 @@ fun FloatingPilotBottomBar(
                         PilotTab.ASK_AI -> palette.violetSoft
                         PilotTab.AUTO_CHAT -> palette.roseSoft
                         PilotTab.EXPLORER -> palette.emeraldSoft
+                        PilotTab.HTTP_CUSTOM -> palette.amberSoft
                         PilotTab.SETTINGS -> palette.amberSoft
                     }
                     val pillBg by animateColorAsState(

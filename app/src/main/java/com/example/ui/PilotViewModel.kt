@@ -10,6 +10,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.ai.ApiKeyPoolManager
+import com.example.ai.GeminiDecisionClient
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.ai.GeneratedImageHelper
@@ -95,6 +96,9 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     private val _textModelTest = MutableStateFlow(ConnectionTestState())
     val textModelTest: StateFlow<ConnectionTestState> = _textModelTest.asStateFlow()
 
+    private val _decisionModelTest = MutableStateFlow(ConnectionTestState())
+    val decisionModelTest: StateFlow<ConnectionTestState> = _decisionModelTest.asStateFlow()
+
     private val _isFetchingModels = MutableStateFlow(false)
     val isFetchingModels: StateFlow<Boolean> = _isFetchingModels.asStateFlow()
 
@@ -163,11 +167,16 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             cloudRepo.observeAccountConfig().collect { cloudSettings ->
                 if (cloudSettings != null) {
                     initialDeviceCloudChecked = true
-                    val merged = if (cloudSettings.ownerDisplayName.isBlank() && fbDisplayName.isNotBlank()) {
-                        cloudSettings.copy(ownerDisplayName = fbDisplayName.take(80))
-                    } else {
-                        cloudSettings
-                    }
+                    val currentLocal = PilotStateHub.settings.value
+                    val merged = cloudSettings.copy(
+                        ownerDisplayName = if (cloudSettings.ownerDisplayName.isBlank() && fbDisplayName.isNotBlank()) {
+                            fbDisplayName.take(80)
+                        } else {
+                            cloudSettings.ownerDisplayName
+                        },
+                        decisionModel = currentLocal.decisionModel,
+                        useDecisionModel = currentLocal.useDecisionModel
+                    )
                     PilotStateHub.applySettingsFromCloud(merged)
                     _cloudSyncStatus.value = "Account Cloud Synced • $accountLabel"
                 } else if (!initialDeviceCloudChecked) {
@@ -538,6 +547,35 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun testDecisionModelConnection() {
+        if (_decisionModelTest.value.isTesting) return
+        val current = settings.value
+        if (!current.hasAnyApiKey) {
+            _decisionModelTest.value = ConnectionTestState(
+                isTesting = false,
+                success = false,
+                message = "Add at least one Gemini API Key first."
+            )
+            return
+        }
+        viewModelScope.launch {
+            _decisionModelTest.value = ConnectionTestState(
+                isTesting = true,
+                message = "Testing calibrated Decisions API on ${current.decisionModel}..."
+            )
+            val (ok, message, latency) = GeminiDecisionClient.testDecisionModel(
+                apiKey = current.effectiveApiKey,
+                modelId = current.decisionModel
+            )
+            _decisionModelTest.value = ConnectionTestState(
+                isTesting = false,
+                success = ok,
+                message = message,
+                latencyMs = latency
+            )
+        }
+    }
+
     fun fetchModels() {
         if (_isFetchingModels.value) return
         val key = settings.value.effectiveApiKey
@@ -615,6 +653,15 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     fun updateTextModel(modelId: String) {
         val clean = modelId.trim().removePrefix("models/")
         PilotStateHub.updateSettings { it.copy(textModel = clean) }
+    }
+
+    fun updateDecisionModel(modelId: String) {
+        val clean = modelId.trim().removePrefix("models/")
+        PilotStateHub.updateSettings { it.copy(decisionModel = clean) }
+    }
+
+    fun updateUseDecisionModel(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(useDecisionModel = enabled) }
     }
 
     fun updateVoiceName(voice: String) {

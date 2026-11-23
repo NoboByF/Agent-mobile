@@ -75,6 +75,7 @@ import com.example.ui.screens.AskAiScreen
 import com.example.ui.screens.AuthGateScreen
 import com.example.ui.screens.AutoChatScreen
 import com.example.ui.screens.FreeExplorerScreen
+import com.example.ui.screens.HttpCustomInspectorScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.SettingsLogsScreen
 import com.example.ui.screens.signOutFromFirebase
@@ -111,6 +112,7 @@ class MainActivity : ComponentActivity() {
             "AUTO_CHAT" -> PilotTab.AUTO_CHAT
             "ASK_AI" -> PilotTab.ASK_AI
             "EXPLORER", "FREE_EXPLORER" -> PilotTab.EXPLORER
+            "HTTP_CUSTOM", "HTTP" -> PilotTab.HTTP_CUSTOM
             "SETTINGS" -> PilotTab.SETTINGS
             else -> PilotTab.HOME
         }
@@ -160,19 +162,66 @@ private fun LivePilotAppEntry(
 
         val signedInUser = currentUser
         var openOfflineExplorer by rememberSaveable { mutableStateOf(false) }
+        var openOfflineHttpCustom by rememberSaveable { mutableStateOf(false) }
+        var standaloneNotice by remember { mutableStateOf<String?>(null) }
         if (signedInUser == null) {
             if (openOfflineExplorer) {
                 FreeExplorerScreen(
                     standaloneMode = true,
                     onExitStandalone = { openOfflineExplorer = false }
                 )
+            } else if (openOfflineHttpCustom) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    HttpCustomInspectorScreen(
+                        onShowNotice = { standaloneNotice = it },
+                        standaloneMode = true,
+                        onExitStandalone = {
+                            standaloneNotice = null
+                            openOfflineHttpCustom = false
+                        }
+                    )
+                    AnimatedVisibility(
+                        visible = !standaloneNotice.isNullOrBlank(),
+                        enter = fadeIn(),
+                        exit = fadeOut(),
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .statusBarsPadding()
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Surface(
+                            shape = RoundedCornerShape(14.dp),
+                            color = CobaltBlue
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = standaloneNotice.orEmpty(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color.White,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                IconButton(onClick = { standaloneNotice = null }) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Close,
+                                        contentDescription = "Dismiss notice",
+                                        tint = Color.White
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 AuthGateScreen(
                     deviceProfile = deviceProfile,
                     onSignedIn = {
                         currentUser = runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull()
                     },
-                    onOpenFreeExplorer = { openOfflineExplorer = true }
+                    onOpenFreeExplorer = { openOfflineExplorer = true },
+                    onOpenHttpCustom = { openOfflineHttpCustom = true }
                 )
             }
         } else {
@@ -225,6 +274,7 @@ private fun LivePilotAppRoot(
     val connectionTest by viewModel.connectionTest.collectAsStateWithLifecycle()
     val agentModelTest by viewModel.agentModelTest.collectAsStateWithLifecycle()
     val textModelTest by viewModel.textModelTest.collectAsStateWithLifecycle()
+    val decisionModelTest by viewModel.decisionModelTest.collectAsStateWithLifecycle()
     val logs by viewModel.logs.collectAsStateWithLifecycle()
     val captions by viewModel.captions.collectAsStateWithLifecycle()
     val recentToolEvents by viewModel.recentToolEvents.collectAsStateWithLifecycle()
@@ -497,6 +547,10 @@ private fun LivePilotAppRoot(
                             standaloneMode = false
                         )
 
+                        PilotTab.HTTP_CUSTOM -> HttpCustomInspectorScreen(
+                            onShowNotice = { viewModel.showNotice(it) }
+                        )
+
                         PilotTab.SETTINGS -> SettingsLogsScreen(
                             settings = settings,
                             deviceProfile = viewModel.deviceProfile,
@@ -509,6 +563,7 @@ private fun LivePilotAppRoot(
                             liveModelTest = connectionTest,
                             agentModelTest = agentModelTest,
                             textModelTest = textModelTest,
+                            decisionModelTest = decisionModelTest,
                             logs = logs,
                             onSyncNow = { viewModel.syncNowToCloud() },
                             onSignOut = onSignOut,
@@ -532,6 +587,9 @@ private fun LivePilotAppRoot(
                             onUpdateVerifyTaskCompletion = { viewModel.updateVerifyTaskCompletion(it) },
                             onUpdateTextModel = { viewModel.updateTextModel(it) },
                             onTestTextModel = { viewModel.testTextModelConnection() },
+                            onUpdateDecisionModel = { viewModel.updateDecisionModel(it) },
+                            onUpdateUseDecisionModel = { viewModel.updateUseDecisionModel(it) },
+                            onTestDecisionModel = { viewModel.testDecisionModelConnection() },
                             onDeleteModel = { viewModel.deleteModelFromDevice(it) },
                             onRestoreModel = { viewModel.restoreDeletedModel(it) },
                             onRestoreAllModels = { viewModel.restoreAllDeletedModels() },

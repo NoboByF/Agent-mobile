@@ -18,6 +18,8 @@ import com.example.data.AppThemeMode
 import com.example.data.AskAiMessage
 import com.example.data.DiscoveredModel
 import com.example.data.GeminiApiKeyEntry
+import com.example.data.HttpCustomProfileParser
+import com.example.data.HttpCustomTunnelProfile
 import com.example.data.PilotPreferences
 import com.example.data.PilotRoutine
 import com.example.data.PilotSettings
@@ -875,6 +877,141 @@ class ExampleRobolectricTest {
         assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl("intent://scan/#Intent;end"))
         assertFalse(com.example.ui.screens.FreeExplorerUrlPolicy.isSafeNavigableUrl(""))
     }
+
+    @Test
+    fun `gemini decision 1 request builder, response parser, and preferences persistence work accurately`() {
+        val req = com.example.ai.GeminiDecisionClient.buildDecisionsRequestJson(
+            modelId = "models/gemini-decision-1",
+            input = "Sender: Karim | Message: ভাই ৫০০০ টাকা বিকাশ করো জরুরি",
+            questions = linkedMapOf(
+                "needs_owner" to com.example.ai.DecisionQuestion.Noul("Requires human owner approval?"),
+                "category" to com.example.ai.DecisionQuestion.Choice(
+                    instructions = "Pick best category",
+                    criteria = linkedMapOf(
+                        "NORMAL" to "Casual chat",
+                        "SENSITIVE_OWNER_ONLY" to "Financial or private request"
+                    )
+                ),
+                "urgency" to com.example.ai.DecisionQuestion.Score(
+                    instructions = "Rate urgency",
+                    criteria = listOf("0: Low", "1: Medium", "2: Urgent")
+                )
+            )
+        )
+        assertEquals("gemini-decision-1", req.getString("model"))
+        val qObj = req.getJSONObject("questions")
+        assertEquals("noul", qObj.getJSONObject("needs_owner").getString("type"))
+        assertEquals("choice", qObj.getJSONObject("category").getString("type"))
+        assertEquals("score", qObj.getJSONObject("urgency").getString("type"))
+        assertEquals(3, qObj.getJSONObject("urgency").getJSONArray("criteria").length())
+
+        val sampleResponse = """
+            {
+              "answers": {
+                "needs_owner": { "type": "noul", "noul": 0.97, "confidence": 0.99 },
+                "category": {
+                  "type": "choice",
+                  "choice": "SENSITIVE_OWNER_ONLY",
+                  "probabilities": { "NORMAL": 0.02, "SENSITIVE_OWNER_ONLY": 0.98 },
+                  "confidence": 0.96
+                },
+                "urgency": {
+                  "type": "score",
+                  "score": 1.88,
+                  "probabilities": { "0": 0.02, "1": 0.08, "2": 0.90 },
+                  "confidence": 0.93
+                }
+              }
+            }
+        """.trimIndent()
+
+        val parsed = com.example.ai.GeminiDecisionClient.parseDecisionsResponseJson(
+            bodyStr = sampleResponse,
+            modelUsed = "gemini-decision-1",
+            latencyMs = 215L,
+            keyLabelUsed = "Key 1"
+        )
+        assertTrue(parsed.noulAnswers["needs_owner"]!!.isYes)
+        assertEquals(0.97, parsed.noulAnswers["needs_owner"]!!.probability, 0.001)
+        assertEquals("SENSITIVE_OWNER_ONLY", parsed.choiceAnswers["category"]!!.choice)
+        assertEquals(0.96, parsed.choiceAnswers["category"]!!.confidence, 0.001)
+        assertEquals(1.88, parsed.scoreAnswers["urgency"]!!.score, 0.001)
+        assertEquals(215L, parsed.latencyMs)
+
+        // Verify PilotPreferences persistence & JSON backup round-trip for decisionModel + useDecisionModel
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = PilotPreferences(context)
+        prefs.saveSettings(
+            PilotSettings(
+                decisionModel = "gemini-decision-1",
+                useDecisionModel = false
+            )
+        )
+        val loaded = prefs.loadSettings()
+        assertEquals("gemini-decision-1", loaded.decisionModel)
+        assertFalse(loaded.useDecisionModel)
+
+        val backup = prefs.exportDeviceBackupJson("dev_test", "Pixel")
+        prefs.saveSettings(PilotSettings(decisionModel = "other-model", useDecisionModel = true))
+        assertTrue(prefs.importDeviceBackupJson(backup).isSuccess)
+
+        val restored = prefs.loadSettings()
+        assertEquals("gemini-decision-1", restored.decisionModel)
+        assertFalse(restored.useDecisionModel)
+    }
+
+    @Test
+    fun `http custom profile parser parses server username slowdns and banner note accurately`() {
+        val sample = HttpCustomTunnelProfile.DEFAULT_PROFILES.first()
+        assertEquals("nsts3.me-link.uk", sample.host)
+        assertEquals(22, sample.port)
+        assertEquals("jssh_9qknqpo", sample.username)
+        assertEquals("RgNax1QLRtx68x", sample.password)
+        assertEquals("nsts3.me-link.uk", sample.nameserver)
+        assertEquals("8.8.8.8", sample.dnsServer)
+        assertEquals("75148e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220", sample.pubKey)
+        assertEquals("য়ে যাবে", sample.bannerNote)
+
+        val parsedResult = HttpCustomProfileParser.parseFromJson(sample.rawJson)
+        assertTrue(parsedResult.isSuccess)
+        val p = parsedResult.getOrThrow()
+        assertEquals("nsts3.me-link.uk", p.host)
+        assertEquals("jssh_9qknqpo", p.username)
+        assertEquals("8.8.8.8", p.dnsServer)
+    }
+
+    @Test
+    fun `dns packet codec builds RFC1035 query, parses response, and wraps IPv4 UDP TUN packets accurately`() {
+        val query = com.example.tunnel.DnsPacketCodec.buildDnsQueryPacket(
+            domain = "nsts3.me-link.uk",
+            queryType = com.example.tunnel.DnsPacketCodec.TYPE_A,
+            transactionId = 0x4242
+        )
+        assertTrue(query.size > 16)
+        assertEquals(0x42, query[0].toInt() and 0xFF)
+        assertEquals(0x42, query[1].toInt() and 0xFF)
+
+        val srcIp = byteArrayOf(8, 8, 8, 8)
+        val dstIp = byteArrayOf(10, 88, 0, 2)
+        val tunPacket = com.example.tunnel.DnsPacketCodec.buildTunUdpResponsePacket(
+            srcIp = srcIp,
+            dstIp = dstIp,
+            srcPort = 53,
+            dstPort = 54321,
+            payload = query
+        )
+        // Verify IPv4 header checksum validates to 0
+        assertEquals(0, com.example.tunnel.DnsPacketCodec.computeChecksum(tunPacket, 0, 20))
+
+        val parsedTun = com.example.tunnel.DnsPacketCodec.parseTunUdpPacket(tunPacket, tunPacket.size)
+        assertNotNull(parsedTun)
+        assertEquals(53, parsedTun!!.srcPort)
+        assertEquals(54321, parsedTun.dstPort)
+        assertEquals(query.size, parsedTun.payload.size)
+        assertEquals(0x42, parsedTun.payload[0].toInt() and 0xFF)
+    }
 }
+
+
 
 

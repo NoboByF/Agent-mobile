@@ -116,6 +116,10 @@ class PilotPreferences(context: Context) {
             rawAgentModel
         }
 
+        val rawDecisionModel = prefs.getString(KEY_DECISION_MODEL, PilotSettings.DEFAULT_DECISION_MODEL)
+            .orEmpty()
+            .ifBlank { PilotSettings.DEFAULT_DECISION_MODEL }
+
         val deletedModelsSet = prefs.getStringSet(KEY_DELETED_MODELS, emptySet()).orEmpty()
         val deletedModels = deletedModelsSet.map { it.trim() }.filter { it.isNotBlank() }.sorted()
 
@@ -128,6 +132,8 @@ class PilotPreferences(context: Context) {
             liveModel = migratedLiveModel,
             agentModel = migratedAgentModel,
             textModel = migratedTextModel,
+            decisionModel = rawDecisionModel,
+            useDecisionModel = prefs.getBoolean(KEY_USE_DECISION_MODEL, true),
             deletedModels = deletedModels,
             verifyTaskCompletion = prefs.getBoolean(KEY_VERIFY_TASK_COMPLETION, true),
             voiceName = prefs.getString(KEY_VOICE_NAME, PilotSettings.DEFAULT_VOICE)
@@ -182,6 +188,11 @@ class PilotPreferences(context: Context) {
             .putString(KEY_LIVE_MODEL, settings.liveModel.trim().removePrefix("models/"))
             .putString(KEY_AGENT_MODEL, settings.agentModel.trim().removePrefix("models/"))
             .putString(KEY_TEXT_MODEL, settings.textModel.trim().removePrefix("models/"))
+            .putString(
+                KEY_DECISION_MODEL,
+                settings.decisionModel.trim().removePrefix("models/").ifBlank { PilotSettings.DEFAULT_DECISION_MODEL }
+            )
+            .putBoolean(KEY_USE_DECISION_MODEL, settings.useDecisionModel)
             .putStringSet(KEY_DELETED_MODELS, settings.deletedModels.map { it.trim() }.filter { it.isNotBlank() }.toSet())
             .putBoolean(KEY_VERIFY_TASK_COMPLETION, settings.verifyTaskCompletion)
             .putString(KEY_VOICE_NAME, settings.voiceName.trim())
@@ -402,6 +413,8 @@ class PilotPreferences(context: Context) {
             .put("liveModel", settings.liveModel)
             .put("agentModel", settings.agentModel)
             .put("textModel", settings.textModel)
+            .put("decisionModel", settings.decisionModel)
+            .put("useDecisionModel", settings.useDecisionModel)
             .put("deletedModels", JSONArray(settings.deletedModels))
             .put("verifyTaskCompletion", settings.verifyTaskCompletion)
             .put("voiceName", settings.voiceName)
@@ -469,6 +482,9 @@ class PilotPreferences(context: Context) {
                     .ifBlank { PilotSettings.DEFAULT_AGENT_MODEL },
                 textModel = sObj.optString("textModel", PilotSettings.DEFAULT_TEXT_MODEL)
                     .ifBlank { PilotSettings.DEFAULT_TEXT_MODEL },
+                decisionModel = sObj.optString("decisionModel", PilotSettings.DEFAULT_DECISION_MODEL)
+                    .ifBlank { PilotSettings.DEFAULT_DECISION_MODEL },
+                useDecisionModel = sObj.optBoolean("useDecisionModel", true),
                 deletedModels = deletedModels,
                 verifyTaskCompletion = sObj.optBoolean("verifyTaskCompletion", true),
                 voiceName = sObj.optString("voiceName", PilotSettings.DEFAULT_VOICE)
@@ -529,6 +545,8 @@ class PilotPreferences(context: Context) {
         private const val KEY_LIVE_MODEL = "live_model_id"
         private const val KEY_AGENT_MODEL = "agent_model_id"
         private const val KEY_TEXT_MODEL = "text_model_id"
+        private const val KEY_DECISION_MODEL = "decision_model_id"
+        private const val KEY_USE_DECISION_MODEL = "use_decision_model_enabled"
         private const val KEY_VERIFY_TASK_COMPLETION = "verify_task_completion"
         private const val KEY_VOICE_NAME = "live_voice_name"
         private const val KEY_VOICE_LANGUAGE = "live_voice_language"

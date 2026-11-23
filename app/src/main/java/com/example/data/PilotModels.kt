@@ -312,6 +312,8 @@ data class PilotSettings(
     val liveModel: String = DEFAULT_LIVE_MODEL,
     val agentModel: String = DEFAULT_AGENT_MODEL,
     val textModel: String = DEFAULT_TEXT_MODEL,
+    val decisionModel: String = DEFAULT_DECISION_MODEL,
+    val useDecisionModel: Boolean = true,
     val deletedModels: List<String> = emptyList(),
     val verifyTaskCompletion: Boolean = true,
     val voiceName: String = DEFAULT_VOICE,
@@ -358,6 +360,7 @@ data class PilotSettings(
         const val DEFAULT_LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
         const val DEFAULT_AGENT_MODEL = "gemini-2.5-flash"
         const val DEFAULT_TEXT_MODEL = "gemini-2.5-flash"
+        const val DEFAULT_DECISION_MODEL = "gemini-decision-1"
         const val DEFAULT_VOICE = "Kore"
         const val DEFAULT_AUTO_REPLY_PERSONA =
             "Reply politely, naturally, and concisely in Bengali or English matching the sender's language as my personal assistant."
@@ -379,6 +382,10 @@ data class PilotSettings(
             "gemini-2.5-pro",
             "gemini-2.0-flash",
             "gemini-2.5-flash-lite"
+        )
+
+        val DECISION_MODEL_PRESETS = listOf(
+            "gemini-decision-1"
         )
 
         val VOICE_PRESETS = listOf(

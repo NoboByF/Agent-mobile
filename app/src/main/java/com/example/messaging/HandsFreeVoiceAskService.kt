@@ -28,6 +28,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.ai.GeminiDecisionClient
 import com.example.ai.GeminiRestClient
 import com.example.automation.PilotAccessibilityService
 import com.example.data.LogLevel
@@ -427,6 +428,38 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
             val personalFacts = PilotStateHub.personalData.value
             val transcriptSnapshot = synchronized(consultationTranscript) { consultationTranscript.toList() }
 
+            var calibratedHint: String? = null
+            if (settings.useDecisionModel) {
+                val intentDecision = GeminiDecisionClient.classifyOwnerVoiceIntent(
+                    apiKey = settings.effectiveApiKey,
+                    modelId = settings.decisionModel,
+                    senderName = currentSenderName,
+                    appName = currentAppName,
+                    incomingMessage = currentMessageText,
+                    consultationTranscript = transcriptSnapshot,
+                    ownerLatestUtterance = rawSpoken
+                ).getOrNull()
+
+                if (intentDecision != null) {
+                    val confPct = (intentDecision.confidence * 100).toInt()
+                    val sendPct = (intentDecision.explicitSendApprovalProb * 100).toInt()
+                    PilotStateHub.log(
+                        LogLevel.INFO,
+                        "Decision1",
+                        "VoiceConsult intent=${intentDecision.action} (conf=${confPct}%, sendProb=${sendPct}%, ${intentDecision.latencyMs}ms)"
+                    )
+                    if (intentDecision.action == "CANCEL" && intentDecision.confidence >= 0.84) {
+                        mainHandler.post {
+                            speakAloud("ঠিক আছে, কোনো উত্তর পাঠানো হলো না।", UTTERANCE_FINAL_DONE)
+                        }
+                        return@launch
+                    }
+                    if (intentDecision.confidence >= 0.72) {
+                        calibratedHint = "gemini-decision-1 calibrated action=${intentDecision.action} (confidence=${confPct}%, explicit_send_approval=${sendPct}%). Strongly prefer this action."
+                    }
+                }
+            }
+
             val consultRes = GeminiRestClient.consultOwnerOnIncomingMessage(
                 apiKey = settings.effectiveApiKey,
                 modelId = settings.textModel,
@@ -437,7 +470,8 @@ class HandsFreeVoiceAskService : Service(), TextToSpeech.OnInitListener {
                 ownerPersonalData = personalFacts,
                 consultationTranscript = transcriptSnapshot,
                 ownerLatestUtterance = rawSpoken,
-                ownerDisplayName = currentOwnerName
+                ownerDisplayName = currentOwnerName,
+                decisionHint = calibratedHint
             )
 
             consultRes.fold(

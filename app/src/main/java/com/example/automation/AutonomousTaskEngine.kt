@@ -1,6 +1,7 @@
 package com.example.automation
 
 import android.content.Context
+import com.example.ai.GeminiDecisionClient
 import com.example.ai.GeminiLiveClient
 import com.example.ai.GeminiRestClient
 import com.example.data.AgentActivity
@@ -672,6 +673,37 @@ class AutonomousTaskEngine(
                     )
                     return
                 }
+
+                // Calibrated Decision 1 safety check for borderline confirmation/submit buttons
+                if (settings.useDecisionModel && isBorderlineConfirmDescriptor(targetDescriptor, statusLabel)) {
+                    val safetyDecision = GeminiDecisionClient.evaluateDestructiveAction(
+                        apiKey = settings.effectiveApiKey,
+                        modelId = settings.decisionModel,
+                        userGoal = goal,
+                        actionLabel = statusLabel,
+                        targetDescriptor = targetDescriptor.ifBlank { statusLabel },
+                        currentPackage = beforePkg
+                    ).getOrNull()
+                    if (safetyDecision != null) {
+                        val riskPct = (safetyDecision.isDestructiveProb * 100).toInt()
+                        val confPct = (safetyDecision.confidence * 100).toInt()
+                        PilotStateHub.log(
+                            LogLevel.SAFETY,
+                            "Decision1",
+                            "Action safety '$targetDescriptor': destructive=${riskPct}% (conf=${confPct}%, ${safetyDecision.latencyMs}ms)"
+                        )
+                        if (safetyDecision.isDestructiveProb >= 0.80 && safetyDecision.confidence >= 0.75) {
+                            val safeLabel = targetDescriptor.ifBlank { statusLabel }.take(40)
+                            val msg = SafetyGuardrails.destructiveBlockedMessage(safeLabel)
+                            PilotStateHub.log(LogLevel.SAFETY, "AutoPilot", "Decision1 blocked: $msg")
+                            updateHudProgress(false, "🛡️ Safe stop: $safeLabel")
+                            notifyLiveVoice(
+                                "[SYSTEM EVENT: Autonomous task PAUSED SAFELY before a high-risk confirmation action ('$safeLabel'). Ask the user for explicit confirmation before proceeding.]"
+                            )
+                            return
+                        }
+                    }
+                }
             }
 
             updateHudProgress(true, "🤖 $step: $statusLabel")
@@ -819,6 +851,16 @@ class AutonomousTaskEngine(
         val evidence: String
     )
 
+    private fun isBorderlineConfirmDescriptor(targetDescriptor: String, statusLabel: String): Boolean {
+        val combined = "$targetDescriptor $statusLabel".lowercase()
+        val keywords = listOf(
+            "confirm", "submit", "proceed", "checkout", "order", "buy",
+            "transfer", "send money", "approve", "accept", "place order",
+            "নিশ্চিত", "পাঠান", "কিনুন", "অর্ডার", "পেমেন্ট"
+        )
+        return keywords.any { combined.contains(it) }
+    }
+
     private suspend fun verifyGoalCompleted(
         service: PilotAccessibilityService,
         modelId: String,
@@ -826,8 +868,47 @@ class AutonomousTaskEngine(
         stepHistory: List<String>,
         claimedReport: String
     ): AuditVerdict {
-        val shot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896)
+        val settings = PilotStateHub.settings.value
         val uiSummary = buildCompactUiSummary(service.getScreenUiJson())
+
+        // Fast calibrated pre-audit via Gemini Decision 1 before heavy vision verification
+        if (settings.useDecisionModel) {
+            val decisionAudit = GeminiDecisionClient.verifyTaskOutcome(
+                apiKey = settings.effectiveApiKey,
+                modelId = settings.decisionModel,
+                goal = goal,
+                claimedReport = claimedReport,
+                stepHistory = stepHistory,
+                compactUiSummary = uiSummary
+            ).getOrNull()
+
+            if (decisionAudit != null) {
+                val donePct = (decisionAudit.goalCompletedProb * 100).toInt()
+                val confPct = (decisionAudit.goalCompletedConfidence * 100).toInt()
+                val blockerPct = (decisionAudit.hitBlockerProb * 100).toInt()
+                PilotStateHub.log(
+                    LogLevel.INFO,
+                    "Decision1",
+                    "Task audit: completed=${donePct}% (conf=${confPct}%), blocker=${blockerPct}% (${decisionAudit.latencyMs}ms)"
+                )
+                if (decisionAudit.hitBlockerProb >= 0.78) {
+                    return AuditVerdict(
+                        verifiedDone = false,
+                        missingWork = "Decision engine detected an active blocker/error on screen (${blockerPct}% probability).",
+                        evidence = "Decision1 blocker=${blockerPct}%"
+                    )
+                }
+                if (decisionAudit.goalCompletedProb <= 0.25 && decisionAudit.goalCompletedConfidence >= 0.78) {
+                    return AuditVerdict(
+                        verifiedDone = false,
+                        missingWork = "Decision engine scored completion at only ${donePct}% (conf ${confPct}%). Finish the remaining steps visible on screen.",
+                        evidence = "Decision1 completed=${donePct}%"
+                    )
+                }
+            }
+        }
+
+        val shot = service.captureVisionJpegBytes(withCoordinateGrid = true, maxWidth = 896)
         val res = GeminiRestClient.generateVisionJson(
             modelId = modelId,
             systemPrompt = TASK_AUDITOR_SYSTEM_PROMPT,
