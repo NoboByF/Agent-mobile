@@ -101,20 +101,6 @@
             android:enabled="true"
             android:exported="false" />
 
-        <service
-            android:name=".service.HttpCustomVpnService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="specialUse"
-            android:permission="android.permission.BIND_VPN_SERVICE">
-            <intent-filter>
-                <action android:name="android.net.VpnService" />
-            </intent-filter>
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="SlowDNS and SSH tunnel connection diagnostics and local DNS VPN forwarding" />
-        </service>
-
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"

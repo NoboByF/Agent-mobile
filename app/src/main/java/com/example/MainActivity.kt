@@ -74,8 +74,6 @@ import com.example.ui.components.PilotTab
 import com.example.ui.screens.AskAiScreen
 import com.example.ui.screens.AuthGateScreen
 import com.example.ui.screens.AutoChatScreen
-import com.example.ui.screens.FreeExplorerScreen
-import com.example.ui.screens.HttpCustomInspectorScreen
 import com.example.ui.screens.HomeScreen
 import com.example.ui.screens.SettingsLogsScreen
 import com.example.ui.screens.signOutFromFirebase
@@ -111,8 +109,6 @@ class MainActivity : ComponentActivity() {
         requestedTabState.value = when (tabKey) {
             "AUTO_CHAT" -> PilotTab.AUTO_CHAT
             "ASK_AI" -> PilotTab.ASK_AI
-            "EXPLORER", "FREE_EXPLORER" -> PilotTab.EXPLORER
-            "HTTP_CUSTOM", "HTTP" -> PilotTab.HTTP_CUSTOM
             "SETTINGS" -> PilotTab.SETTINGS
             else -> PilotTab.HOME
         }
@@ -161,69 +157,13 @@ private fun LivePilotAppEntry(
         }
 
         val signedInUser = currentUser
-        var openOfflineExplorer by rememberSaveable { mutableStateOf(false) }
-        var openOfflineHttpCustom by rememberSaveable { mutableStateOf(false) }
-        var standaloneNotice by remember { mutableStateOf<String?>(null) }
         if (signedInUser == null) {
-            if (openOfflineExplorer) {
-                FreeExplorerScreen(
-                    standaloneMode = true,
-                    onExitStandalone = { openOfflineExplorer = false }
-                )
-            } else if (openOfflineHttpCustom) {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    HttpCustomInspectorScreen(
-                        onShowNotice = { standaloneNotice = it },
-                        standaloneMode = true,
-                        onExitStandalone = {
-                            standaloneNotice = null
-                            openOfflineHttpCustom = false
-                        }
-                    )
-                    AnimatedVisibility(
-                        visible = !standaloneNotice.isNullOrBlank(),
-                        enter = fadeIn(),
-                        exit = fadeOut(),
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .statusBarsPadding()
-                            .padding(horizontal = 16.dp, vertical = 8.dp)
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(14.dp),
-                            color = CobaltBlue
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = standaloneNotice.orEmpty(),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = Color.White,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                IconButton(onClick = { standaloneNotice = null }) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Close,
-                                        contentDescription = "Dismiss notice",
-                                        tint = Color.White
-                                    )
-                                }
-                            }
-                        }
-                    }
+            AuthGateScreen(
+                deviceProfile = deviceProfile,
+                onSignedIn = {
+                    currentUser = runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull()
                 }
-            } else {
-                AuthGateScreen(
-                    deviceProfile = deviceProfile,
-                    onSignedIn = {
-                        currentUser = runCatching { FirebaseRuntimeConfig.auth(context).currentUser }.getOrNull()
-                    },
-                    onOpenFreeExplorer = { openOfflineExplorer = true },
-                    onOpenHttpCustom = { openOfflineHttpCustom = true }
-                )
-            }
+            )
         } else {
             val sessionKey = "${firebaseConfigRev}_${signedInUser.uid}"
             key(sessionKey) {
@@ -545,14 +485,6 @@ private fun LivePilotAppRoot(
                                 viewModel.shareGeneratedImage(path, caption, pkg)
                             },
                             onClearFeed = { viewModel.clearIncomingFeed() }
-                        )
-
-                        PilotTab.EXPLORER -> FreeExplorerScreen(
-                            standaloneMode = false
-                        )
-
-                        PilotTab.HTTP_CUSTOM -> HttpCustomInspectorScreen(
-                            onShowNotice = { viewModel.showNotice(it) }
                         )
 
                         PilotTab.SETTINGS -> SettingsLogsScreen(
