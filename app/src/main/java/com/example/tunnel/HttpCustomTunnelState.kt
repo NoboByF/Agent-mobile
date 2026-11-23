@@ -248,7 +248,7 @@ object HttpCustomTunnelStateHolder {
     }
 
     /**
-     * Finds the active physical (non-VPN) network and its carrier/router IPv4 DNS servers.
+     * Finds the active physical (non-VPN) network and its carrier/router DNS servers (IPv4 prioritized, plus IPv6 on 464XLAT).
      */
     fun discoverUnderlyingNetworkAndDns(context: Context?): Pair<Network?, List<String>> {
         if (context == null) return null to emptyList()
@@ -272,7 +272,8 @@ object HttpCustomTunnelStateHolder {
                 cm.getNetworkCapabilities(net)?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
             } ?: nonVpnNetworks.firstOrNull()
 
-            val dnsIps = LinkedHashSet<String>()
+            val ipv4Dns = LinkedHashSet<String>()
+            val ipv6Dns = LinkedHashSet<String>()
             val orderedNetworks = buildList {
                 if (preferredNetwork != null) add(preferredNetwork)
                 addAll(nonVpnNetworks)
@@ -280,19 +281,21 @@ object HttpCustomTunnelStateHolder {
             for (net in orderedNetworks) {
                 val linkProps = cm.getLinkProperties(net) ?: continue
                 for (addr in linkProps.dnsServers) {
+                    val ip = addr.hostAddress?.substringBefore('%').orEmpty()
+                    if (ip.isBlank() ||
+                        ip == VIRTUAL_TUN_DNS_IP ||
+                        ip == VIRTUAL_TUN_CLIENT_IP ||
+                        ip.startsWith("127.") ||
+                        addr.isLoopbackAddress
+                    ) continue
                     if (addr is Inet4Address) {
-                        val ip = addr.hostAddress.orEmpty()
-                        if (ip.isNotBlank() &&
-                            ip != VIRTUAL_TUN_DNS_IP &&
-                            ip != VIRTUAL_TUN_CLIENT_IP &&
-                            !ip.startsWith("127.")
-                        ) {
-                            dnsIps.add(ip)
-                        }
+                        ipv4Dns.add(ip)
+                    } else {
+                        ipv6Dns.add(ip)
                     }
                 }
             }
-            preferredNetwork to dnsIps.toList()
+            preferredNetwork to (ipv4Dns.toList() + ipv6Dns.toList())
         }.getOrDefault(null to emptyList())
     }
 
@@ -843,47 +846,56 @@ object HttpCustomTunnelStateHolder {
             bestDns = fallbackDoh.filter { it.reachable }.minByOrNull { it.rttMs ?: Long.MAX_VALUE }
         }
 
-        // 5. Quick Direct TCP + SSH-2.0 check (fast 1800ms timeout so it never stalls SlowDNS startup)
+        // 5. Resolve host A-record fast via the working DNS resolver (never stall 45s on OS getAllByName)
         var sshReachable = false
         var sshBanner: String? = null
         var sshRttMs: Long? = null
         var sshError: String? = null
 
         val resolvedIps = bestDns?.resolvedIps.orEmpty().ifEmpty {
-            runCatching {
-                val addrs = if (activeNet != null) {
-                    activeNet.getAllByName(profile.host)
-                } else {
-                    InetAddress.getAllByName(profile.host)
-                }
-                addrs.filterIsInstance<Inet4Address>().mapNotNull { it.hostAddress }
-            }.getOrDefault(emptyList())
+            val dnsIp = bestDns?.serverIp
+            if (!dnsIp.isNullOrBlank() && bestDns?.transport == "UDP:53") {
+                probeSingleUdpDns(
+                    dnsIp = dnsIp,
+                    isCarrier = bestDns.isCarrierDns,
+                    targetDomain = profile.host,
+                    queryType = DnsPacketCodec.TYPE_A,
+                    ednsPayloadSize = 512,
+                    timeoutMs = 1500,
+                    underlyingNetwork = activeNet,
+                    protectUdp = protectUdp
+                ).resolvedIps
+            } else {
+                emptyList()
+            }
         }
 
-        val connectTarget = resolvedIps.firstOrNull() ?: profile.host
-        runCatching {
-            Socket().use { tcp ->
-                protectTcp?.invoke(tcp)
-                if (activeNet != null) {
-                    runCatching { activeNet.bindSocket(tcp) }
+        val connectTarget = resolvedIps.firstOrNull()
+        if (!connectTarget.isNullOrBlank()) {
+            runCatching {
+                Socket().use { tcp ->
+                    protectTcp?.invoke(tcp)
+                    if (activeNet != null) {
+                        runCatching { activeNet.bindSocket(tcp) }
+                    }
+                    val t0 = System.currentTimeMillis()
+                    tcp.connect(InetSocketAddress(connectTarget, profile.port), 1200)
+                    tcp.soTimeout = 1200
+                    val reader = tcp.getInputStream().bufferedReader(Charsets.UTF_8)
+                    val bannerLine = reader.readLine()?.trim().orEmpty()
+                    if (bannerLine.startsWith("SSH-", ignoreCase = true)) {
+                        tcp.getOutputStream().write("SSH-2.0-LivePilot_1.0\r\n".toByteArray(Charsets.US_ASCII))
+                        tcp.getOutputStream().flush()
+                        sshBanner = bannerLine
+                    } else {
+                        sshBanner = bannerLine.ifBlank { "TCP:${profile.port} Open" }
+                    }
+                    sshReachable = true
+                    sshRttMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                 }
-                val t0 = System.currentTimeMillis()
-                tcp.connect(InetSocketAddress(connectTarget, profile.port), 1800)
-                tcp.soTimeout = 1800
-                val reader = tcp.getInputStream().bufferedReader(Charsets.UTF_8)
-                val bannerLine = reader.readLine()?.trim().orEmpty()
-                if (bannerLine.startsWith("SSH-", ignoreCase = true)) {
-                    tcp.getOutputStream().write("SSH-2.0-LivePilot_1.0\r\n".toByteArray(Charsets.US_ASCII))
-                    tcp.getOutputStream().flush()
-                    sshBanner = bannerLine
-                } else {
-                    sshBanner = bannerLine.ifBlank { "TCP:${profile.port} Open" }
-                }
-                sshReachable = true
-                sshRttMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+            }.onFailure { err ->
+                sshError = "SSH(${connectTarget}:${profile.port}): ${err.localizedMessage ?: err::class.java.simpleName}"
             }
-        }.onFailure { err ->
-            sshError = "SSH(${profile.host}:${profile.port}): ${err.localizedMessage ?: err::class.java.simpleName}"
         }
 
         val errorSummary = if (bestDns == null && !sshReachable) {

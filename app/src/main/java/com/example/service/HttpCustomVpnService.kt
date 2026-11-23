@@ -303,6 +303,8 @@ class HttpCustomVpnService : VpnService() {
                     profile = profile,
                     tuning = tuning,
                     upstreamDnsIp = upstreamDnsIp,
+                    carrierDnsList = carrierDnsList,
+                    resolvedHostIp = probe.resolvedIps.firstOrNull(),
                     transport = transport,
                     activeDohUrl = activeDohUrl,
                     dohClient = dohClient,
@@ -477,6 +479,8 @@ class HttpCustomVpnService : VpnService() {
         profile: HttpCustomTunnelProfile,
         tuning: TunnelTuningConfig,
         upstreamDnsIp: String,
+        carrierDnsList: List<String>,
+        resolvedHostIp: String?,
         transport: String,
         activeDohUrl: String?,
         dohClient: OkHttpClient,
@@ -505,17 +509,29 @@ class HttpCustomVpnService : VpnService() {
             onLog = { msg -> HttpCustomTunnelStateHolder.appendLog(msg) }
         )
 
-        val (dnsttReachable, dnsttRtt) = dnstt.verifyDnsttServerReachable(timeoutMs = 4200)
-        if (!dnsttReachable) {
+        val probeCandidates = (listOf(upstreamDnsIp) + carrierDnsList).distinct()
+        if (!resolvedHostIp.isNullOrBlank()) {
+            HttpCustomTunnelStateHolder.appendLog("Resolved ${profile.host} -> $resolvedHostIp (testing Carrier + Direct :53)")
+        }
+        val dnsttProbe = dnstt.verifyDnsttServerReachable(
+            timeoutMs = 2400,
+            candidateResolverIps = probeCandidates,
+            directServerIp = resolvedHostIp
+        )
+        dnsttProbe.diagnostics.forEach { diag ->
+            HttpCustomTunnelStateHolder.appendLog("SlowDNS probe: $diag")
+        }
+        if (!dnsttProbe.reachable) {
+            val diagSummary = dnsttProbe.diagnostics.lastOrNull() ?: "No TXT reply"
             HttpCustomTunnelStateHolder.appendLog(
-                "SlowDNS TXT poll failed on ${profile.nameserver} via $upstreamDnsIp (no TXT reply from dnstt-server)"
+                "SlowDNS TXT poll failed on ${profile.nameserver} ($diagSummary)"
             )
             updatePipeline {
                 it.copy(
                     slowDnsServer = PipelineStageState.FAILED,
                     noiseSmux = PipelineStageState.FAILED,
                     sshAuth = PipelineStageState.FAILED,
-                    failureHintBn = "${profile.nameserver} সার্ভার থেকে SlowDNS TXT রেসপন্স আসেনি। নতুন চালু SlowDNS সার্ভার/কনফিগ ইমপোর্ট করুন।"
+                    failureHintBn = "${profile.nameserver} সার্ভার থেকে SlowDNS TXT রেসপন্স আসেনি ($diagSummary)। নতুন চালু SlowDNS সার্ভার/কনফিগ ইমপোর্ট করুন।"
                 )
             }
             dnstt.close()
@@ -523,7 +539,7 @@ class HttpCustomVpnService : VpnService() {
         }
 
         HttpCustomTunnelStateHolder.appendLog(
-            "OK SlowDNS dnstt-server TXT reply (${dnsttRtt ?: 0} ms, KCP MTU=${dnstt.maxKcpMtu}B)"
+            "OK SlowDNS dnstt-server via ${dnsttProbe.workingResolverIp} (${dnsttProbe.workingTransport}, EDNS=${dnsttProbe.includeEdns0}, ${dnsttProbe.rttMs ?: 0} ms, KCP MTU=${dnstt.maxKcpMtu}B)"
         )
         updatePipeline {
             it.copy(

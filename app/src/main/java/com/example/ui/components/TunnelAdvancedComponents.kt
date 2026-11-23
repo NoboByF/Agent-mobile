@@ -8,6 +8,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -128,16 +130,16 @@ fun GpCarrierStatusCard(
                 Column(modifier = Modifier.weight(1f)) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
                         Text(
-                            text = snapshot.operatorName,
+                            text = if (snapshot.isGrameenphone) "Grameenphone" else snapshot.operatorName,
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
                             color = palette.inkPrimary,
                             maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.weight(1f, fill = false)
+                            overflow = TextOverflow.Ellipsis
                         )
                         if (snapshot.isGrameenphone) {
                             StatusPillBadge(
@@ -149,8 +151,8 @@ fun GpCarrierStatusCard(
                         }
                     }
                     Text(
-                        text = "${snapshot.transportLabel} • IP: ${snapshot.localIpv4 ?: "--"}",
-                        style = MaterialTheme.typography.bodySmall,
+                        text = "${snapshot.transportLabel} • ${snapshot.localIpv4 ?: "--"}",
+                        style = MaterialTheme.typography.labelSmall,
                         color = palette.inkSecondary,
                         fontFamily = JetBrainsMonoFontFamily,
                         maxLines = 1,
@@ -767,6 +769,7 @@ fun EditTunnelProfileDialog(
     )
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun TunnelPipelineAndInternetBanner(
     stages: TunnelPipelineStages,
@@ -793,7 +796,7 @@ fun TunnelPipelineAndInternetBanner(
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        // 5-Stage Live Pipeline Strip
+        // 5-Stage Live Pipeline Strip (wrapped cleanly so all 5 stages stay visible)
         val stageItems = listOf(
             "GP DNS" to stages.carrierDns,
             "SlowDNS" to stages.slowDnsServer,
@@ -801,11 +804,12 @@ fun TunnelPipelineAndInternetBanner(
             "SSH Auth" to stages.sshAuth,
             "Internet" to stages.internetCheck
         )
-        LazyRow(
+        FlowRow(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            items(stageItems, key = { it.first }) { (label, state) ->
+            stageItems.forEach { (label, state) ->
                 val stageColor = when (state) {
                     PipelineStageState.PASSED -> EmeraldGreen
                     PipelineStageState.RUNNING -> CobaltBlue

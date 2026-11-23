@@ -52,12 +52,12 @@ data class TunnelPipelineStages(
 object InternetConnectivityVerifier {
 
     private val CONNECTIVITY_URLS = listOf(
-        "http://connectivitycheck.gstatic.com/generate_204",
-        "http://cp.cloudflare.com/generate_204",
-        "http://clients3.google.com/generate_204"
+        "https://connectivitycheck.gstatic.com/generate_204",
+        "https://cp.cloudflare.com/generate_204",
+        "https://www.google.com/generate_204"
     )
 
-    private const val EXIT_IP_URL = "http://api.ipify.org?format=text"
+    private const val EXIT_IP_URL = "https://api.ipify.org?format=text"
 
     suspend fun verifyInternet(
         localProxyPort: Int?,

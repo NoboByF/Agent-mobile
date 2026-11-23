@@ -238,15 +238,25 @@ object DnsttCodec {
     }
 }
 
+data class DnsttProbeResult(
+    val reachable: Boolean,
+    val rttMs: Long? = null,
+    val workingResolverIp: String? = null,
+    val workingTransport: String? = null,
+    val includeEdns0: Boolean = true,
+    val ednsSize: Int = 512,
+    val diagnostics: List<String> = emptyList()
+)
+
 /**
  * Full-duplex asynchronous DNS packet transport for dnstt over UDP:53, TCP:53, or DoH:443.
  * Supports concurrent worker threads so SlowDNS throughput stays responsive even on high-latency 4G links.
  */
 class DnsttPacketTransport(
-    private val resolverIp: String,
-    private val transportType: String,
+    private var resolverIp: String,
+    private var transportType: String,
     private val tunnelDomain: String,
-    private val ednsPayloadSize: Int,
+    private var ednsPayloadSize: Int,
     private val dohUrl: String? = null,
     private val dohClient: OkHttpClient? = null,
     private val underlyingNetwork: Network? = null,
@@ -264,6 +274,9 @@ class DnsttPacketTransport(
     private val workers = mutableListOf<Thread>()
     private val lastValidResponseAtMs = AtomicLong(0L)
     private val totalResponsesReceived = AtomicLong(0L)
+
+    @Volatile
+    private var includeEdns0InLoop: Boolean = true
 
     @Volatile
     private var resolverAddr: InetAddress? = null
@@ -286,10 +299,7 @@ class DnsttPacketTransport(
 
     fun enqueueSend(kcpPacket: ByteArray) {
         if (!running.get()) return
-        if (kcpPacket.size > maxKcpMtu) {
-            // Trim safety; KCP MSS guarantees <= maxKcpMtu
-            return
-        }
+        if (kcpPacket.size > maxKcpMtu) return
         if (!sendQueue.offer(kcpPacket)) {
             sendQueue.poll()
             sendQueue.offer(kcpPacket)
@@ -303,40 +313,116 @@ class DnsttPacketTransport(
     }
 
     /**
-     * Sends a single synchronous dnstt poll query to verify whether the authoritative dnstt-server
-     * responds with a valid DNS TXT record through the chosen resolver (e.g. GP 192.0.0.1).
+     * Probes SlowDNS (dnstt-server) across multiple wire strategies:
+     * 1) Active resolver (e.g. GP 192.0.0.1 / IPv6 DNS) with EDNS0=512
+     * 2) Active resolver WITHOUT EDNS0 OPT (for strict carrier resolvers that drop OPT on TXT queries)
+     * 3) Direct UDP:53 to the SlowDNS server IP itself (HTTP Custom "slowDnsHandling: direct")
+     * 4) TCP:53 fallback
+     * Returns detailed wire RCODE/timeout diagnostics for every tested path.
      */
-    fun verifyDnsttServerReachable(timeoutMs: Int = 3500): Pair<Boolean, Long?> {
-        val addr = resolverAddr ?: runCatching { InetAddress.getByName(resolverIp) }.getOrNull()
-            ?: return false to null
-        resolverAddr = addr
+    fun verifyDnsttServerReachable(
+        timeoutMs: Int = 2500,
+        candidateResolverIps: List<String> = listOf(resolverIp),
+        directServerIp: String? = null
+    ): DnsttProbeResult {
+        val diagNotes = mutableListOf<String>()
         val qname = DnsttCodec.encodeQueryDomain(clientId, ByteArray(0), tunnelDomain)
-        val txId = ((System.nanoTime() xor 0x5A3CL) and 0xFFFFL).toInt()
-        // Try configured EDNS size first, then safe 512B fallback for strict carrier resolvers
-        val ednsSizes = listOf(ednsPayloadSize, 512).distinct()
-        for (edns in ednsSizes) {
+
+        data class ProbeAttempt(
+            val label: String,
+            val targetIp: String,
+            val mode: String,
+            val useEdns: Boolean,
+            val ednsBytes: Int
+        )
+
+        val attempts = buildList {
+            for (ip in candidateResolverIps.distinct()) {
+                if (transportType == "DoH:443") {
+                    add(ProbeAttempt("DoH($ip)", ip, "DoH:443", true, 512))
+                } else {
+                    add(ProbeAttempt("Carrier($ip,EDNS512)", ip, "UDP:53", true, 512))
+                    add(ProbeAttempt("Carrier($ip,NoEDNS)", ip, "UDP:53", false, 512))
+                }
+            }
+            if (!directServerIp.isNullOrBlank() && directServerIp !in candidateResolverIps) {
+                add(ProbeAttempt("Direct($directServerIp:53)", directServerIp, "UDP:53", true, 512))
+                add(ProbeAttempt("Direct($directServerIp:53,NoEDNS)", directServerIp, "UDP:53", false, 512))
+            }
+            if (transportType != "DoH:443") {
+                add(ProbeAttempt("TCP:53(${candidateResolverIps.firstOrNull() ?: resolverIp})", candidateResolverIps.firstOrNull() ?: resolverIp, "TCP:53", true, 512))
+            }
+        }
+
+        for (att in attempts) {
+            val addr = runCatching { InetAddress.getByName(att.targetIp) }.getOrNull()
+            if (addr == null) {
+                diagNotes.add("${att.label}: invalid IP")
+                continue
+            }
+            val txId = ((System.nanoTime() xor att.hashCode().toLong()) and 0xFFFFL).toInt()
             val query = DnsPacketCodec.buildDnsQueryPacket(
                 domain = qname,
                 queryType = DnsPacketCodec.TYPE_TXT,
                 transactionId = txId,
-                includeEdns0 = true,
-                ednsUdpPayloadSize = edns
+                includeEdns0 = att.useEdns,
+                ednsUdpPayloadSize = att.ednsBytes
             )
             val t0 = System.currentTimeMillis()
+            val prevTransport = transportType
+            transportType = att.mode
             val reply = exchangeDnsWire(query, addr, timeoutMs)
-            if (reply != null) {
-                val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-                val txt = DnsttCodec.extractTxtPayloadFromDnsResponse(reply, reply.size)
-                if (txt != null) {
+            transportType = prevTransport
+
+            if (reply == null) {
+                diagNotes.add("${att.label} -> Timeout(${timeoutMs}ms)")
+                continue
+            }
+
+            val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+            val info = DnsPacketCodec.parseDnsResponse(reply, reply.size)
+            val txt = DnsttCodec.extractTxtPayloadFromDnsResponse(reply, reply.size)
+            if (txt != null) {
+                val unpacked = DnsttCodec.unpackDownstreamPackets(txt)
+                if (info?.answerCount ?: 0 > 0) {
+                    diagNotes.add("${att.label} -> TXT OK (${txt.size}B, ${rtt}ms)")
+                    resolverIp = att.targetIp
+                    resolverAddr = addr
+                    transportType = att.mode
+                    includeEdns0InLoop = att.useEdns
+                    ednsPayloadSize = att.ednsBytes
                     lastValidResponseAtMs.set(System.currentTimeMillis())
                     totalResponsesReceived.incrementAndGet()
-                    DnsttCodec.unpackDownstreamPackets(txt).forEach { recvQueue.offer(it) }
+                    unpacked.forEach { recvQueue.offer(it) }
                     onBytesTransferred?.invoke(query.size.toLong(), reply.size.toLong(), rtt)
-                    return true to rtt
+                    return DnsttProbeResult(
+                        reachable = true,
+                        rttMs = rtt,
+                        workingResolverIp = att.targetIp,
+                        workingTransport = att.mode,
+                        includeEdns0 = att.useEdns,
+                        ednsSize = att.ednsBytes,
+                        diagnostics = diagNotes
+                    )
+                } else {
+                    diagNotes.add("${att.label} -> NOERROR AN=0 (${rtt}ms)")
                 }
+            } else {
+                val rcodeName = when (info?.responseCode) {
+                    1 -> "FORMERR"
+                    2 -> "SERVFAIL"
+                    3 -> "NXDOMAIN"
+                    5 -> "REFUSED"
+                    else -> "RCODE=${info?.responseCode}"
+                }
+                diagNotes.add("${att.label} -> $rcodeName AN=${info?.answerCount ?: 0} (${rtt}ms)")
             }
         }
-        return false to null
+
+        return DnsttProbeResult(
+            reachable = false,
+            diagnostics = diagNotes
+        )
     }
 
     private fun workerLoop(workerIndex: Int) {
@@ -363,7 +449,7 @@ class DnsttPacketTransport(
                 domain = qname,
                 queryType = DnsPacketCodec.TYPE_TXT,
                 transactionId = txSeq,
-                includeEdns0 = true,
+                includeEdns0 = includeEdns0InLoop,
                 ednsUdpPayloadSize = ednsPayloadSize
             )
 
