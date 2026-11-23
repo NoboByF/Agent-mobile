@@ -175,7 +175,10 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                             cloudSettings.ownerDisplayName
                         },
                         decisionModel = currentLocal.decisionModel,
-                        useDecisionModel = currentLocal.useDecisionModel
+                        useDecisionModel = currentLocal.useDecisionModel,
+                        autoReplyDelaySec = currentLocal.autoReplyDelaySec,
+                        pauseAutoReplyWhenOwnerActive = currentLocal.pauseAutoReplyWhenOwnerActive,
+                        smartConversationClosingEnabled = currentLocal.smartConversationClosingEnabled
                     )
                     PilotStateHub.applySettingsFromCloud(merged)
                     _cloudSyncStatus.value = "Account Cloud Synced • $accountLabel"
@@ -728,6 +731,33 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
         PilotStateHub.updateSettings { it.copy(handsFreeVoiceEscalationEnabled = enabled) }
     }
 
+    fun updateAutoReplyDelaySec(seconds: Int) {
+        val clamped = seconds.coerceIn(3, 60)
+        PilotStateHub.updateSettings { it.copy(autoReplyDelaySec = clamped) }
+    }
+
+    fun updatePauseWhenOwnerActive(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(pauseAutoReplyWhenOwnerActive = enabled) }
+    }
+
+    fun updateSmartConversationClosing(enabled: Boolean) {
+        PilotStateHub.updateSettings { it.copy(smartConversationClosingEnabled = enabled) }
+    }
+
+    fun cancelPendingAutoReplyFromFeed(record: IncomingMessageRecord) {
+        IncomingMessageListener.markOwnerTookOverConversation(
+            packageName = record.packageName,
+            senderName = record.senderName,
+            reasonNote = "আপনি নিজে রিপ্লাই দেবেন — AI বাতিল করা হয়েছে"
+        )
+        PilotStateHub.markMessageStatus(
+            recordId = record.id,
+            status = "SKIPPED_OWNER_ACTIVE",
+            note = "আপনি নিজে রিপ্লাই দেবেন — AI বাতিল করা হয়েছে"
+        )
+        _bannerMessage.value = "✓ ${record.senderName}-এর জন্য AI রিপ্লাই বাতিল — আপনি নিজে মেসেজ দিন।"
+    }
+
     fun updateOwnerDisplayName(name: String) {
         val clean = name.trim().take(80)
         PilotStateHub.updateSettings { it.copy(ownerDisplayName = clean) }
@@ -1077,6 +1107,11 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     // --- Auto-Chat Quick Actions ---
 
     fun openChatFromFeed(record: IncomingMessageRecord) {
+        IncomingMessageListener.markOwnerTookOverConversation(
+            packageName = record.packageName,
+            senderName = record.senderName,
+            reasonNote = "আপনি নিজে চ্যাট খুলেছেন — AI বিরতিতে"
+        )
         val handle = PilotStateHub.getNotificationHandleById(record.id)
         if (handle?.contentIntent != null) {
             runCatching { handle.contentIntent.send() }
@@ -1096,6 +1131,11 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     fun sendOwnerSensitiveAnswer(record: IncomingMessageRecord, ownerAnswer: String) {
         val clean = ownerAnswer.trim()
         if (clean.isBlank()) return
+        IncomingMessageListener.markOwnerTookOverConversation(
+            packageName = record.packageName,
+            senderName = record.senderName,
+            reasonNote = "আপনি নিজে উত্তর পাঠিয়েছেন"
+        )
         val handle = PilotStateHub.getNotificationHandleById(record.id)
         val directAction = handle?.replyAction
         if (directAction != null) {
@@ -1146,6 +1186,11 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun sendTemplateDirectReply(record: IncomingMessageRecord, replyText: String) {
+        IncomingMessageListener.markOwnerTookOverConversation(
+            packageName = record.packageName,
+            senderName = record.senderName,
+            reasonNote = "আপনি নিজে কুইক রিপ্লাই দিয়েছেন"
+        )
         val handle = PilotStateHub.getNotificationHandleById(record.id)
         val directAction = handle?.replyAction
         if (directAction != null) {
@@ -1157,7 +1202,12 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                 senderName = record.senderName
             )
             if (sent) {
-                PilotStateHub.markMessageAutoReplied(record.id, replyText)
+                IncomingMessageListener.appendConversationHistory(
+                    record.packageName,
+                    record.senderName,
+                    "Me (Owner): $replyText"
+                )
+                PilotStateHub.markMessageAutoReplied(record.id, replyText, "আপনি নিজে পাঠিয়েছেন")
                 _bannerMessage.value = "Replied to ${record.senderName}: \"$replyText\""
             } else {
                 _bannerMessage.value = "Direct reply failed; tap Open Chat to reply."
@@ -1175,16 +1225,34 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        // Prevent duplicate sending if a countdown timer was already waiting for this sender
+        IncomingMessageListener.cancelPendingAutoReply(
+            packageName = record.packageName,
+            senderName = record.senderName,
+            reasonNote = "এখনই AI রিপ্লাই তৈরি হচ্ছে..."
+        )
+
         viewModelScope.launch {
-            val replyResult = GeminiRestClient.generateAutoReply(
+            val history = IncomingMessageListener.getConversationHistory(record.packageName, record.senderName)
+            val replyResult = GeminiRestClient.generateSmartAutoReply(
                 apiKey = currentSettings.effectiveApiKey,
                 modelId = currentSettings.textModel,
                 personaPrompt = currentSettings.autoReplyPersona,
                 appName = record.app.displayName,
                 senderName = record.senderName,
-                incomingText = record.messageText
+                incomingText = record.messageText,
+                conversationHistory = history,
+                sensitiveGuardEnabled = currentSettings.sensitiveQuestionGuardEnabled,
+                personalDataFacts = PilotStateHub.personalData.value
             )
-            replyResult.onSuccess { replyText ->
+            replyResult.onSuccess { smart ->
+                if (!smart.shouldReply || smart.replyText.isBlank()) {
+                    val note = smart.decisionReason.ifBlank { "কথা শেষ — AI মনে করছে আর রিপ্লাই দরকার নেই" }
+                    PilotStateHub.markMessageStatus(record.id, "SKIPPED_ENDED", note)
+                    _bannerMessage.value = "AI বুঝেছে: $note"
+                    return@onSuccess
+                }
+                val replyText = smart.replyText
                 val directAction = handle?.replyAction
                 if (directAction != null) {
                     val sent = IncomingMessageListener.sendDirectReply(
@@ -1195,7 +1263,12 @@ class PilotViewModel(application: Application) : AndroidViewModel(application) {
                         senderName = record.senderName
                     )
                     if (sent) {
-                        PilotStateHub.markMessageAutoReplied(record.id, replyText)
+                        IncomingMessageListener.appendConversationHistory(
+                            record.packageName,
+                            record.senderName,
+                            "Me: $replyText"
+                        )
+                        PilotStateHub.markMessageAutoReplied(record.id, replyText, smart.decisionReason.ifBlank { null })
                         _bannerMessage.value = "Sent AI reply to ${record.senderName}: \"$replyText\""
                     } else {
                         _bannerMessage.value = "Direct reply failed; tap Open Chat to reply visually."

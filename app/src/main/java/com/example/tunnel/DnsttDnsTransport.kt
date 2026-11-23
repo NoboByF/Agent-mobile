@@ -324,11 +324,11 @@ class DnsttPacketTransport(
      * Returns detailed wire RCODE/timeout diagnostics for every tested path.
      */
     fun verifyDnsttServerReachable(
-        timeoutMs: Int = 3600,
+        timeoutMs: Int = 3200,
         candidateResolverIps: List<String> = listOf(resolverIp),
         directServerIp: String? = null
     ): DnsttProbeResult {
-        val diagNotes = mutableListOf<String>()
+        val diagNotes = java.util.Collections.synchronizedList(mutableListOf<String>())
         val qname = DnsttCodec.encodeQueryDomain(clientId, ByteArray(0), tunnelDomain)
 
         data class ProbeAttempt(
@@ -348,115 +348,155 @@ class DnsttPacketTransport(
             .distinct()
             .sortedBy { if (it.contains(':')) 1 else 0 }
 
-        val attempts = buildList {
-            // 1. Carrier resolvers (IPv4 first, EDNS512 + EDNS1232 + NoEDNS)
-            for (ip in orderedIps) {
-                if (transportType == "DoH:443") {
-                    add(ProbeAttempt("DoH($ip)", ip, "DoH:443", true, 512, dohUrl ?: GpNetworkInspector.CLOUDFLARE_DOH_URL))
-                } else {
-                    add(ProbeAttempt("Carrier($ip,EDNS512)", ip, "UDP:53", true, 512))
-                    add(ProbeAttempt("Carrier($ip,EDNS1232)", ip, "UDP:53", true, 1232))
-                    add(ProbeAttempt("Carrier($ip,NoEDNS)", ip, "UDP:53", false, 512))
-                }
+        val primaryIp = orderedIps.firstOrNull() ?: resolverIp
+        val secondaryIps = orderedIps.drop(1)
+
+        // Wave 1 (fast parallel): Primary Carrier (EDNS512 + NoEDNS) + DoH:443 (1.1.1.1 & 8.8.8.8) + DoT:853 (1.1.1.1) + Public 1.1.1.1
+        val wave1 = buildList {
+            if (transportType == "DoH:443") {
+                add(ProbeAttempt("DoH($primaryIp)", primaryIp, "DoH:443", true, 512, dohUrl ?: GpNetworkInspector.CLOUDFLARE_DOH_URL))
+            } else {
+                add(ProbeAttempt("Carrier($primaryIp,EDNS512)", primaryIp, "UDP:53", true, 512))
+                add(ProbeAttempt("Carrier($primaryIp,NoEDNS)", primaryIp, "UDP:53", false, 512))
             }
-            // 2. Encrypted DoH:443 (bypasses GP 192.0.0.1 TXT filter completely when Port 443 is open!)
             if (dohClient != null) {
                 add(ProbeAttempt("DoH:443(1.1.1.1)", "1.1.1.1", "DoH:443", true, 512, "https://1.1.1.1/dns-query"))
                 add(ProbeAttempt("DoH:443(8.8.8.8)", "8.8.8.8", "DoH:443", true, 512, GpNetworkInspector.GOOGLE_DOH_URL))
             }
-            // 3. Encrypted DoT:853 (DNS-over-TLS — official dnstt -dot mode!)
             add(ProbeAttempt("DoT:853(1.1.1.1)", "1.1.1.1", "DoT:853", true, 512, dotSni = "cloudflare-dns.com"))
+            if ("1.1.1.1" !in orderedIps) {
+                add(ProbeAttempt("Public(1.1.1.1,EDNS512)", "1.1.1.1", "UDP:53", true, 512))
+            }
+        }
+
+        // Wave 2 (backup parallel): Secondary Carrier IPs (IPv6) + DoT:853(8.8.8.8) + Public 8.8.8.8/9.9.9.9 + Direct :53 + TCP:53
+        val wave2 = buildList {
+            for (ip in secondaryIps.take(2)) {
+                add(ProbeAttempt("Carrier($ip,EDNS512)", ip, "UDP:53", true, 512))
+            }
             add(ProbeAttempt("DoT:853(8.8.8.8)", "8.8.8.8", "DoT:853", true, 512, dotSni = "dns.google"))
-            // 4. Public UDP:53 resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9)
-            for (pubIp in listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")) {
+            for (pubIp in listOf("8.8.8.8", "9.9.9.9")) {
                 if (pubIp !in orderedIps) {
                     add(ProbeAttempt("Public($pubIp,EDNS512)", pubIp, "UDP:53", true, 512))
                 }
             }
-            // 5. Direct SlowDNS server UDP:53 & Carrier TCP:53
             if (!directServerIp.isNullOrBlank() && directServerIp !in orderedIps) {
                 add(ProbeAttempt("Direct($directServerIp:53)", directServerIp, "UDP:53", true, 512))
-                add(ProbeAttempt("Direct($directServerIp:53,NoEDNS)", directServerIp, "UDP:53", false, 512))
             }
             if (transportType != "DoH:443") {
-                val tcpIp = orderedIps.firstOrNull() ?: resolverIp
-                add(ProbeAttempt("TCP:53($tcpIp)", tcpIp, "TCP:53", true, 512))
+                add(ProbeAttempt("TCP:53($primaryIp)", primaryIp, "TCP:53", true, 512))
             }
         }
 
-        for (att in attempts) {
-            val addr = runCatching { InetAddress.getByName(att.targetIp) }.getOrNull()
-            if (addr == null) {
-                diagNotes.add("${att.label}: invalid IP")
-                continue
+        data class SingleOutcome(
+            val attempt: ProbeAttempt,
+            val addr: InetAddress,
+            val rttMs: Long,
+            val querySize: Int,
+            val replySize: Int,
+            val unpacked: List<ByteArray>
+        )
+
+        fun runWave(wave: List<ProbeAttempt>, waveTimeoutMs: Int): SingleOutcome? {
+            if (wave.isEmpty()) return null
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(wave.size.coerceIn(1, 6))
+            val completion = java.util.concurrent.ExecutorCompletionService<SingleOutcome?>(pool)
+            return try {
+                wave.forEach { att ->
+                    completion.submit {
+                        val addr = runCatching { InetAddress.getByName(att.targetIp) }.getOrNull()
+                        if (addr == null) {
+                            diagNotes.add("${att.label}: invalid IP")
+                            return@submit null
+                        }
+                        val txId = ((System.nanoTime() xor att.hashCode().toLong()) and 0xFFFFL).toInt()
+                        val query = DnsPacketCodec.buildDnsQueryPacket(
+                            domain = qname,
+                            queryType = DnsPacketCodec.TYPE_TXT,
+                            transactionId = txId,
+                            includeEdns0 = att.useEdns,
+                            ednsUdpPayloadSize = att.ednsBytes
+                        )
+                        val t0 = System.currentTimeMillis()
+                        val reply = exchangeDnsWireWithMode(
+                            query = query,
+                            addr = addr,
+                            timeoutMs = waveTimeoutMs,
+                            mode = att.mode,
+                            attemptDohUrl = att.attemptDohUrl,
+                            dotSni = att.dotSni
+                        )
+                        if (reply == null) {
+                            diagNotes.add("${att.label} -> Timeout(${waveTimeoutMs}ms)")
+                            return@submit null
+                        }
+                        val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+                        val info = DnsPacketCodec.parseDnsResponse(reply, reply.size)
+                        val txt = DnsttCodec.extractTxtPayloadFromDnsResponse(reply, reply.size)
+                        if (txt != null && (info?.answerCount ?: 0) > 0) {
+                            val unpacked = DnsttCodec.unpackDownstreamPackets(txt)
+                            diagNotes.add("${att.label} -> TXT OK (${txt.size}B, ${rtt}ms)")
+                            SingleOutcome(att, addr, rtt, query.size, reply.size, unpacked)
+                        } else if (txt != null) {
+                            diagNotes.add("${att.label} -> NOERROR AN=0 (${rtt}ms)")
+                            null
+                        } else {
+                            val rcodeName = when (info?.responseCode) {
+                                1 -> "FORMERR"
+                                2 -> "SERVFAIL"
+                                3 -> "NXDOMAIN"
+                                5 -> "REFUSED"
+                                else -> "RCODE=${info?.responseCode}"
+                            }
+                            diagNotes.add("${att.label} -> $rcodeName AN=${info?.answerCount ?: 0} (${rtt}ms)")
+                            null
+                        }
+                    }
+                }
+                val deadlineMs = System.currentTimeMillis() + waveTimeoutMs + 700L
+                for (i in wave.indices) {
+                    val remain = (deadlineMs - System.currentTimeMillis()).coerceAtLeast(100L)
+                    val fut = runCatching { completion.poll(remain, TimeUnit.MILLISECONDS) }.getOrNull() ?: break
+                    val outcome = runCatching { fut.get() }.getOrNull()
+                    if (outcome != null) {
+                        return outcome
+                    }
+                }
+                null
+            } finally {
+                pool.shutdownNow()
             }
-            val txId = ((System.nanoTime() xor att.hashCode().toLong()) and 0xFFFFL).toInt()
-            val query = DnsPacketCodec.buildDnsQueryPacket(
-                domain = qname,
-                queryType = DnsPacketCodec.TYPE_TXT,
-                transactionId = txId,
-                includeEdns0 = att.useEdns,
-                ednsUdpPayloadSize = att.ednsBytes
-            )
-            val t0 = System.currentTimeMillis()
-            val prevTransport = transportType
-            val prevDohUrl = dohUrl
+        }
+
+        val winner = runWave(wave1, timeoutMs.coerceIn(2200, 3400))
+            ?: runWave(wave2, minOf(timeoutMs, 2600))
+
+        if (winner != null) {
+            val att = winner.attempt
+            resolverIp = att.targetIp
+            resolverAddr = winner.addr
             transportType = att.mode
             if (att.attemptDohUrl != null) dohUrl = att.attemptDohUrl
-            val attemptTimeout = if (att.mode == "UDP:53" && att.targetIp in orderedIps) timeoutMs else minOf(timeoutMs, 2400)
-            val reply = exchangeDnsWire(query, addr, attemptTimeout, att.dotSni)
-            transportType = prevTransport
-            dohUrl = prevDohUrl
-
-            if (reply == null) {
-                diagNotes.add("${att.label} -> Timeout(${attemptTimeout}ms)")
-                continue
-            }
-
-            val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
-            val info = DnsPacketCodec.parseDnsResponse(reply, reply.size)
-            val txt = DnsttCodec.extractTxtPayloadFromDnsResponse(reply, reply.size)
-            if (txt != null) {
-                val unpacked = DnsttCodec.unpackDownstreamPackets(txt)
-                if (info?.answerCount ?: 0 > 0) {
-                    diagNotes.add("${att.label} -> TXT OK (${txt.size}B, ${rtt}ms)")
-                    resolverIp = att.targetIp
-                    resolverAddr = addr
-                    transportType = att.mode
-                    if (att.attemptDohUrl != null) dohUrl = att.attemptDohUrl
-                    includeEdns0InLoop = att.useEdns
-                    ednsPayloadSize = att.ednsBytes
-                    lastValidResponseAtMs.set(System.currentTimeMillis())
-                    totalResponsesReceived.incrementAndGet()
-                    unpacked.forEach { recvQueue.offer(it) }
-                    onBytesTransferred?.invoke(query.size.toLong(), reply.size.toLong(), rtt)
-                    return DnsttProbeResult(
-                        reachable = true,
-                        rttMs = rtt,
-                        workingResolverIp = att.targetIp,
-                        workingTransport = att.mode,
-                        includeEdns0 = att.useEdns,
-                        ednsSize = att.ednsBytes,
-                        diagnostics = diagNotes
-                    )
-                } else {
-                    diagNotes.add("${att.label} -> NOERROR AN=0 (${rtt}ms)")
-                }
-            } else {
-                val rcodeName = when (info?.responseCode) {
-                    1 -> "FORMERR"
-                    2 -> "SERVFAIL"
-                    3 -> "NXDOMAIN"
-                    5 -> "REFUSED"
-                    else -> "RCODE=${info?.responseCode}"
-                }
-                diagNotes.add("${att.label} -> $rcodeName AN=${info?.answerCount ?: 0} (${rtt}ms)")
-            }
+            includeEdns0InLoop = att.useEdns
+            ednsPayloadSize = att.ednsBytes
+            lastValidResponseAtMs.set(System.currentTimeMillis())
+            totalResponsesReceived.incrementAndGet()
+            winner.unpacked.forEach { recvQueue.offer(it) }
+            onBytesTransferred?.invoke(winner.querySize.toLong(), winner.replySize.toLong(), winner.rttMs)
+            return DnsttProbeResult(
+                reachable = true,
+                rttMs = winner.rttMs,
+                workingResolverIp = att.targetIp,
+                workingTransport = att.mode,
+                includeEdns0 = att.useEdns,
+                ednsSize = att.ednsBytes,
+                diagnostics = diagNotes.toList()
+            )
         }
 
         return DnsttProbeResult(
             reachable = false,
-            diagnostics = diagNotes
+            diagnostics = diagNotes.toList()
         )
     }
 
@@ -522,11 +562,27 @@ class DnsttPacketTransport(
         addr: InetAddress,
         timeoutMs: Int,
         dotSni: String? = null
+    ): ByteArray? = exchangeDnsWireWithMode(
+        query = query,
+        addr = addr,
+        timeoutMs = timeoutMs,
+        mode = transportType,
+        attemptDohUrl = dohUrl,
+        dotSni = dotSni
+    )
+
+    private fun exchangeDnsWireWithMode(
+        query: ByteArray,
+        addr: InetAddress,
+        timeoutMs: Int,
+        mode: String,
+        attemptDohUrl: String?,
+        dotSni: String? = null
     ): ByteArray? {
-        return when (transportType) {
+        return when (mode) {
             "DoH:443" -> {
                 val client = dohClient ?: return null
-                val url = dohUrl ?: GpNetworkInspector.CLOUDFLARE_DOH_URL
+                val url = attemptDohUrl ?: dohUrl ?: GpNetworkInspector.CLOUDFLARE_DOH_URL
                 GpNetworkInspector.sendDohQuery(client, url, query)?.first
             }
 

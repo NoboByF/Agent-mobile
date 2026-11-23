@@ -167,7 +167,9 @@ data class IncomingMessageRecord(
     val needsOwnerAnswer: Boolean = false,
     val ownerQuestion: String? = null,
     val ownerResolvedReply: String? = null,
-    val generatedImagePath: String? = null
+    val generatedImagePath: String? = null,
+    val aiStatus: String? = null, // WAITING | REPLIED | SKIPPED_ENDED | SKIPPED_OWNER_ACTIVE | SKIPPED_MODERATION | SENSITIVE
+    val aiStatusNote: String? = null
 )
 
 data class WebCitation(
@@ -330,6 +332,9 @@ data class PilotSettings(
     val autoReplyPersona: String = DEFAULT_AUTO_REPLY_PERSONA,
     val sensitiveQuestionGuardEnabled: Boolean = true,
     val handsFreeVoiceEscalationEnabled: Boolean = true,
+    val autoReplyDelaySec: Int = 15,
+    val pauseAutoReplyWhenOwnerActive: Boolean = true,
+    val smartConversationClosingEnabled: Boolean = true,
     val enabledMessagingApps: Set<MessagingApp> = setOf(
         MessagingApp.IMO,
         MessagingApp.WHATSAPP,

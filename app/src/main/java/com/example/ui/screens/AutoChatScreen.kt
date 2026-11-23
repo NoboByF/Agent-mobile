@@ -28,16 +28,20 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.NotificationsOff
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shield
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.WarningAmber
@@ -118,10 +122,14 @@ fun AutoChatScreen(
     onUpdatePersona: (String) -> Unit,
     onToggleSensitiveGuard: (Boolean) -> Unit,
     onToggleHandsFreeVoiceEscalation: (Boolean) -> Unit,
+    onUpdateAutoReplyDelaySec: (Int) -> Unit,
+    onTogglePauseWhenOwnerActive: (Boolean) -> Unit,
+    onToggleSmartConversationClosing: (Boolean) -> Unit,
     onToggleApp: (MessagingApp) -> Unit,
     onOpenNotificationSettings: () -> Unit,
     onOpenChat: (IncomingMessageRecord) -> Unit,
     onQuickAiReply: (IncomingMessageRecord) -> Unit,
+    onCancelPendingAiReply: (IncomingMessageRecord) -> Unit,
     onTemplateReply: (IncomingMessageRecord, String) -> Unit,
     onSendOwnerSensitiveAnswer: (IncomingMessageRecord, String) -> Unit,
     onSavePersonalData: (existingId: String?, title: String, content: String, category: String, shareInAutoReply: Boolean) -> Unit,
@@ -187,7 +195,7 @@ fun AutoChatScreen(
                         )
                         Text(
                             text = if (isFullAuto) {
-                                "Using ${settings.textModel} • ${settings.enabledMessagingApps.size} apps"
+                                "${settings.autoReplyDelaySec}s অপেক্ষা • ${if (settings.pauseAutoReplyWhenOwnerActive) "আপনি সক্রিয় থাকলে বিরতি" else "অবিরত"} • ${settings.enabledMessagingApps.size} apps"
                             } else {
                                 "Announces messages on call • ${settings.enabledMessagingApps.size} apps"
                             },
@@ -436,6 +444,7 @@ fun AutoChatScreen(
                         record = msg,
                         onOpenChat = { onOpenChat(msg) },
                         onQuickReply = { onQuickAiReply(msg) },
+                        onCancelPendingReply = { onCancelPendingAiReply(msg) },
                         onTemplateReply = { replyText -> onTemplateReply(msg, replyText) },
                         onSaveGeneratedImage = { path -> onSaveGeneratedImage(path) },
                         onShareGeneratedImage = { path ->
@@ -542,6 +551,173 @@ fun AutoChatScreen(
                         testTag = "mode_full_auto_reply_card",
                         onClick = { onUpdateMode(AutoChatMode.FULL_AUTO_REPLY) }
                     )
+                }
+            }
+
+            // Smart Human-First & Conversation-Ending Control Card
+            item {
+                StudioCardContainer {
+                    Text(
+                        text = "স্মার্ট রিপ্লাই ও অ্যান্টি-লুপ কন্ট্রোল",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = palette.inkPrimary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    // Toggle 1: Pause AI when owner is actively chatting / typing / opened chat
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(palette.cobaltSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Person,
+                                    contentDescription = "Pause when owner active",
+                                    tint = palette.cobaltAccent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "আপনি চ্যাটে থাকলে AI থেমে থাকবে",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = palette.inkPrimary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "আপনি মেসেজিং অ্যাপে থাকলে, টাইপ করলে, নোটিফিকেশন খুললে বা নিজে রিপ্লাই দিলে AI সাথে সাথে বিরতি নেবে।",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.inkSecondary
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = settings.pauseAutoReplyWhenOwnerActive,
+                            onCheckedChange = onTogglePauseWhenOwnerActive,
+                            modifier = Modifier.testTag("pause_when_owner_active_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = CobaltBlue
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    // Toggle 2: Smart Conversation Closing (No-Reply when finished)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(40.dp)
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .background(palette.emeraldSoft),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.AutoAwesome,
+                                    contentDescription = "Smart conversation closing",
+                                    tint = palette.emeraldAccent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column {
+                                Text(
+                                    text = "কথা শেষ হলে নিজে থেকে থামবে (Smart No-Reply)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = palette.inkPrimary,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = "ধন্যবাদ, আচ্ছা, ঠিক আছে, ওয়েলকাম, আল্লাহ হাফেজ বা কথা শেষ হয়ে গেলে AI বুঝে চুপ থাকবে — আর অযথা লুপ হবে না।",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = palette.inkSecondary
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Switch(
+                            checked = settings.smartConversationClosingEnabled,
+                            onCheckedChange = onToggleSmartConversationClosing,
+                            modifier = Modifier.testTag("smart_conversation_closing_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Color.White,
+                                checkedTrackColor = EmeraldGreen
+                            )
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    // Human Grace Period Delay Chips
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Filled.Timer,
+                            contentDescription = "Reply wait delay",
+                            tint = palette.violetAccent,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "AI রিপ্লাই দেওয়ার আগে অপেক্ষা (আপনার সুযোগ)",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = palette.inkPrimary,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "মেসেজ এলে AI এত সেকেন্ড অপেক্ষা করবে। এর মধ্যে আপনি চ্যাট খুললে বা নিজে মেসেজ দিলে AI আর রিপ্লাই দেবে না।",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.inkSecondary
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val delayOptions = listOf(
+                            5 to "5s (দ্রুত)",
+                            15 to "15s (প্রস্তাবিত)",
+                            30 to "30s",
+                            60 to "60s"
+                        )
+                        delayOptions.forEach { (sec, label) ->
+                            val selected = settings.autoReplyDelaySec == sec
+                            FilterChip(
+                                selected = selected,
+                                onClick = { onUpdateAutoReplyDelaySec(sec) },
+                                modifier = Modifier.testTag("auto_reply_delay_${sec}s_chip"),
+                                label = { Text(label) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = palette.violetSoft,
+                                    selectedLabelColor = palette.violetAccent
+                                )
+                            )
+                        }
+                    }
                 }
             }
 
@@ -877,6 +1053,7 @@ private fun IncomingMessageCard(
     record: IncomingMessageRecord,
     onOpenChat: () -> Unit,
     onQuickReply: () -> Unit,
+    onCancelPendingReply: () -> Unit,
     onTemplateReply: (String) -> Unit,
     onSaveGeneratedImage: (String) -> Unit,
     onShareGeneratedImage: (String) -> Unit
@@ -916,6 +1093,109 @@ private fun IncomingMessageCard(
             style = MaterialTheme.typography.bodyMedium,
             color = palette.inkPrimary
         )
+
+        // Smart AI Status Banner: Waiting (with Cancel button), Smart No-Reply (Conversation Ended), or Owner Active
+        when (record.aiStatus) {
+            "WAITING" -> {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = palette.amberSoft,
+                    border = BorderStroke(1.dp, palette.amberAccent.copy(alpha = 0.45f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(
+                            text = "⏳ ${record.aiStatusNote ?: "অপেক্ষা করছে..."}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = palette.amberAccent,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable(onClick = onCancelPendingReply)
+                                .testTag("cancel_pending_ai_${record.id}"),
+                            shape = RoundedCornerShape(10.dp),
+                            color = palette.card,
+                            border = BorderStroke(1.dp, palette.amberAccent)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Close,
+                                    contentDescription = "Cancel AI reply",
+                                    tint = palette.amberAccent,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text(
+                                    text = "আমি নিজে দেব",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = palette.amberAccent,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            "SKIPPED_ENDED" -> {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.surfaceSubtle,
+                    border = BorderStroke(1.dp, palette.outline),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "✓ AI চুপ ছিল: ${record.aiStatusNote ?: "কথা শেষ হয়েছে — বাড়তি রিপ্লাই প্রয়োজন নেই"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.inkSecondary,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+            "SKIPPED_OWNER_ACTIVE" -> {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.cobaltSoft,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "👤 ${record.aiStatusNote ?: "আপনি নিজে চ্যাটে আছেন — AI বিরতিতে"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.cobaltAccent,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+            "SKIPPED_MODERATION" -> {
+                Spacer(modifier = Modifier.height(8.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = palette.surfaceSubtle,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "🛡️ ${record.aiStatusNote ?: "এড়িয়ে যাওয়া হয়েছে"}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = palette.inkMuted,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
 
         if (!record.autoRepliedText.isNullOrBlank()) {
             Spacer(modifier = Modifier.height(8.dp))

@@ -57,6 +57,9 @@ data class TunnelConnectionState(
     val pingHistoryMs: List<Long> = emptyList(),
     val connectedSinceMs: Long? = null,
     val lastError: String? = null,
+    val diagnosis: TunnelDiagnosis? = null,
+    val isAutoFixing: Boolean = false,
+    val autoFixStatusText: String? = null,
     val logs: List<String> = emptyList()
 )
 
@@ -208,6 +211,66 @@ object HttpCustomTunnelStateHolder {
             }
         }
         appendLog("Applied GP Bug Host: ${entry.label} (${entry.connectTarget}:${entry.port}, TLS=${entry.useTls})")
+    }
+
+    /**
+     * 1-Tap Self-Healing Auto-Fix:
+     * Parallel-scans all 16 GP Bug Hosts / Cloudflare Edge IPs + all Carrier/Public/DoH DNS resolvers,
+     * automatically applies the best working route/profile/DPI fix, and signals whether to auto-reconnect.
+     */
+    suspend fun runSmartAutoFix(
+        context: Context,
+        profile: HttpCustomTunnelProfile
+    ): AutoFixPlan = withContext(Dispatchers.IO) {
+        _state.update {
+            it.copy(
+                isAutoFixing = true,
+                autoFixStatusText = "GP সিম, ১৬টি Bug Host ও সব DNS একসাথে স্ক্যান করে সমাধান খোঁজা হচ্ছে..."
+            )
+        }
+        appendLog("Auto-Doctor started: parallel scanning GP Bug Hosts, CF Edge IPs & DNS/DoH...")
+        try {
+            refreshCarrierSnapshot(context)
+            val (bugResults, dnsResults) = coroutineScope {
+                val bugJob = async { runGpBugHostScan(context, profile) }
+                val dnsJob = async { runDnsBenchmark(context, profile) }
+                bugJob.await() to dnsJob.await()
+            }
+            val plan = TunnelAutoDoctor.buildAutoFixPlan(
+                currentProfile = profile,
+                allProfiles = _profiles.value,
+                currentDiagnosis = _state.value.diagnosis,
+                bugHostResults = bugResults,
+                dnsResults = dnsResults
+            )
+            plan.updatedProfile?.let { updateProfile(it) }
+            plan.selectProfileId?.let { selectProfile(it) }
+            plan.recommendedTransportMode?.let { mode ->
+                updateTuning { it.copy(transportMode = mode) }
+            }
+            _state.update { current ->
+                current.copy(
+                    isAutoFixing = false,
+                    autoFixStatusText = null,
+                    diagnosis = plan.updatedDiagnosis ?: if (plan.shouldReconnect) null else current.diagnosis
+                )
+            }
+            appendLog("Auto-Doctor result: ${plan.summaryBn}")
+            plan
+        } catch (e: Exception) {
+            val errMsg = e.localizedMessage ?: e::class.java.simpleName
+            _state.update {
+                it.copy(isAutoFixing = false, autoFixStatusText = null)
+            }
+            appendLog("Auto-Doctor error: $errMsg")
+            AutoFixPlan(
+                shouldReconnect = false,
+                updatedProfile = null,
+                selectProfileId = null,
+                recommendedTransportMode = null,
+                summaryBn = "অটো স্ক্যানে সমস্যা হয়েছে: $errMsg"
+            )
+        }
     }
 
     fun updateTuning(transform: (TunnelTuningConfig) -> TunnelTuningConfig) {

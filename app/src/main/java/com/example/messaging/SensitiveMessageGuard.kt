@@ -20,7 +20,8 @@ data class ExtractedNotificationMessage(
     val messageText: String,
     val conversationTitle: String?,
     val isSelfOrSystem: Boolean,
-    val skipReason: String? = null
+    val skipReason: String? = null,
+    val isSelfOutgoing: Boolean = false
 )
 
 data class SensitiveAssessment(
@@ -127,7 +128,8 @@ object SensitiveMessageGuard {
                     messageText = msgText,
                     conversationTitle = rawConvTitle,
                     isSelfOrSystem = true,
-                    skipReason = "Own outgoing RemoteInput message in MessagingStyle"
+                    skipReason = "Own outgoing RemoteInput message in MessagingStyle",
+                    isSelfOutgoing = true
                 )
             }
 
@@ -175,7 +177,8 @@ object SensitiveMessageGuard {
                 messageText = effectiveText,
                 conversationTitle = rawConvTitle,
                 isSelfOrSystem = true,
-                skipReason = "Self-prefixed line in notification text"
+                skipReason = "Self-prefixed line in notification text",
+                isSelfOutgoing = true
             )
         }
 

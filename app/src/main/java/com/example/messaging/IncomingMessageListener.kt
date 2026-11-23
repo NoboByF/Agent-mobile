@@ -38,14 +38,12 @@ class IncomingMessageListener : NotificationListenerService() {
     private val recentFingerprints = ConcurrentHashMap<String, Long>()
     private val inFlightConversations = ConcurrentHashMap<String, Boolean>()
     private val lastAutoReplyAtMs = ConcurrentHashMap<String, Long>()
-    private val pendingDebounceJobs = ConcurrentHashMap<String, Job>()
-    private val pendingBatchMessages = ConcurrentHashMap<String, MutableList<Pair<IncomingMessageRecord, Notification.Action?>>>()
 
     override fun onListenerConnected() {
         super.onListenerConnected()
         connectedAtMs = System.currentTimeMillis()
         PilotStateHub.ensureInitialized(applicationContext)
-        PilotStateHub.log(LogLevel.INFO, "AutoChat", "IncomingMessageListener connected (anti-loop + sensitive guard active).")
+        PilotStateHub.log(LogLevel.INFO, "AutoChat", "IncomingMessageListener connected (human-first + smart no-reply active).")
     }
 
     override fun onDestroy() {
@@ -54,6 +52,47 @@ class IncomingMessageListener : NotificationListenerService() {
         pendingBatchMessages.clear()
         scope.cancel()
         super.onDestroy()
+    }
+
+    override fun onNotificationRemoved(
+        sbn: StatusBarNotification?,
+        rankingMap: RankingMap?,
+        reason: Int
+    ) {
+        if (sbn == null) return
+        val pkg = sbn.packageName ?: return
+        val messagingApp = MessagingApp.fromPackage(pkg) ?: return
+        val notification = sbn.notification ?: return
+        if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+
+        val extracted = SensitiveMessageGuard.extractIncomingMessage(notification)
+        val fallbackTitle = notification.extras?.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)?.toString()?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: notification.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val sender = extracted.senderName.ifBlank { fallbackTitle }.trim()
+        if (sender.isBlank()) return
+
+        val now = System.currentTimeMillis()
+        val convKey = conversationKey(pkg, sender)
+
+        // Ignore automatic notification refresh/dismissal immediately caused by our OWN AI Direct Reply
+        val aiJustReplied = lastAiDirectReplyAtMs[convKey]?.let { (now - it) in 0L..AI_DIRECT_REPLY_SUPPRESS_REMOVE_MS } == true
+        if (aiJustReplied && (reason == REASON_APP_CANCEL || reason == REASON_APP_CANCEL_ALL)) {
+            return
+        }
+
+        // User tapped notification (REASON_CLICK), swiped it (REASON_CANCEL), or opened the chat directly (REASON_APP_CANCEL)
+        val isOwnerInteraction = reason == REASON_CLICK ||
+            reason == REASON_CANCEL ||
+            reason == REASON_APP_CANCEL ||
+            reason == REASON_APP_CANCEL_ALL
+        if (isOwnerInteraction) {
+            markOwnerTookOverConversation(
+                packageName = pkg,
+                senderName = sender,
+                reasonNote = "আপনি নিজে ${messagingApp.displayName} চ্যাট খুলেছেন — AI বিরতিতে"
+            )
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
@@ -80,6 +119,21 @@ class IncomingMessageListener : NotificationListenerService() {
         // 2. Extract real latest message via MessagingStyle (CRITICAL: filters out our own RemoteInput replies!)
         val extracted = SensitiveMessageGuard.extractIncomingMessage(notification)
         if (extracted.isSelfOrSystem) {
+            // If this is an outgoing message sent manually by the HUMAN OWNER (NOT our own AI reply echo),
+            // record it in history and pause AI for this chat so the owner can talk freely!
+            if (extracted.isSelfOutgoing &&
+                extracted.senderName.isNotBlank() &&
+                extracted.messageText.isNotBlank() &&
+                !isRecentSelfEcho(pkg, extracted.senderName, extracted.messageText, now)
+            ) {
+                val ownerConvKey = conversationKey(pkg, extracted.senderName)
+                appendConversationHistory(ownerConvKey, "Me (Owner): ${extracted.messageText}")
+                markOwnerTookOverConversation(
+                    packageName = pkg,
+                    senderName = extracted.senderName,
+                    reasonNote = "আপনি নিজে রিপ্লাই দিয়েছেন — AI বিরতিতে"
+                )
+            }
             return
         }
         val sender = extracted.senderName.trim()
@@ -148,22 +202,79 @@ class IncomingMessageListener : NotificationListenerService() {
     }
 
     /**
-     * Batches rapid consecutive messages from the same sender (2.5s debounce window)
-     * and guarantees ONLY ONE reply is generated & sent per turn, eliminating reply floods.
+     * Human-First Grace Period & Smart Debounce:
+     * - Immediately steps aside if the human owner is currently inside the messaging app,
+     *   recently interacted/typed there, or took over this conversation.
+     * - Waits `settings.autoReplyDelaySec` seconds (checked every 1s) so the owner ALWAYS gets
+     *   first chance to read, open the chat, or type their own message before AI replies.
+     * - Batches rapid consecutive messages from the same sender into a single smart reply.
      */
     private fun enqueueDebouncedAutoReply(
         convKey: String,
         record: IncomingMessageRecord,
         replyAction: Notification.Action?
     ) {
+        val currentSettings = PilotStateHub.settings.value
+        if (currentSettings.pauseAutoReplyWhenOwnerActive) {
+            val immediatePause = getOwnerActivePauseReason(
+                packageName = record.packageName,
+                convKey = convKey,
+                appDisplayName = record.app.displayName
+            )
+            if (immediatePause != null) {
+                PilotStateHub.markMessageStatus(record.id, "SKIPPED_OWNER_ACTIVE", immediatePause)
+                PilotStateHub.log(LogLevel.INFO, "AutoReply", "Paused for ${record.senderName}: $immediatePause")
+                return
+            }
+        }
+
         val batch = pendingBatchMessages.computeIfAbsent(convKey) { mutableListOf() }
         synchronized(batch) {
             batch.add(record to replyAction)
         }
 
+        val delaySec = currentSettings.autoReplyDelaySec.coerceIn(3, 60)
+        PilotStateHub.markMessageStatus(
+            recordId = record.id,
+            status = "WAITING",
+            note = "${delaySec} সেকেন্ড অপেক্ষা করছে — আপনি চাইলে নিজে রিপ্লাই দিন"
+        )
+
         pendingDebounceJobs.remove(convKey)?.cancel()
         pendingDebounceJobs[convKey] = scope.launch {
-            delay(DEBOUNCE_WINDOW_MS)
+            // Check every 1 second during the grace window so if the owner opens the chat app
+            // or starts typing, we cancel IMMEDIATELY instead of hijacking their message!
+            var remainingMs = delaySec * 1000L
+            while (remainingMs > 0L) {
+                val step = minOf(1_000L, remainingMs)
+                delay(step)
+                remainingMs -= step
+
+                val liveSettings = PilotStateHub.settings.value
+                if (liveSettings.autoChatMode != AutoChatMode.FULL_AUTO_REPLY) {
+                    pendingBatchMessages.remove(convKey)
+                    PilotStateHub.markMessageStatus(record.id, null, null)
+                    return@launch
+                }
+                if (liveSettings.pauseAutoReplyWhenOwnerActive) {
+                    val activePause = getOwnerActivePauseReason(
+                        packageName = record.packageName,
+                        convKey = convKey,
+                        appDisplayName = record.app.displayName
+                    )
+                    if (activePause != null) {
+                        pendingBatchMessages.remove(convKey)
+                        PilotStateHub.markWaitingMessagesForConversationStatus(
+                            packageName = record.packageName,
+                            senderName = record.senderName,
+                            status = "SKIPPED_OWNER_ACTIVE",
+                            note = activePause
+                        )
+                        PilotStateHub.log(LogLevel.INFO, "AutoReply", "Cancelled waiting reply for ${record.senderName}: $activePause")
+                        return@launch
+                    }
+                }
+            }
             pendingDebounceJobs.remove(convKey)
 
             // Wait briefly if a previous reply for this exact sender is still sending
@@ -189,6 +300,21 @@ class IncomingMessageListener : NotificationListenerService() {
                 if (elapsed < PER_SENDER_COOLDOWN_MS) {
                     val waitLeft = PER_SENDER_COOLDOWN_MS - elapsed
                     delay(waitLeft)
+                }
+
+                // Final owner-active check right before calling Gemini
+                val preAiSettings = PilotStateHub.settings.value
+                if (preAiSettings.pauseAutoReplyWhenOwnerActive) {
+                    val activePause = getOwnerActivePauseReason(
+                        packageName = latestRecord.packageName,
+                        convKey = convKey,
+                        appDisplayName = latestRecord.app.displayName
+                    )
+                    if (activePause != null) {
+                        PilotStateHub.markMessageStatus(latestRecord.id, "SKIPPED_OWNER_ACTIVE", activePause)
+                        PilotStateHub.log(LogLevel.INFO, "AutoReply", "Owner became active; skipped AI reply to ${latestRecord.senderName}.")
+                        return@launch
+                    }
                 }
 
                 // Combine multi-bubble rapid texts into one clean prompt
@@ -218,13 +344,31 @@ class IncomingMessageListener : NotificationListenerService() {
         val settings = PilotStateHub.settings.value
         val personalData = PilotStateHub.personalData.value
         val ownerName = ChatModerationEngine.resolveOwnerDisplayName(settings, personalData)
+        val historySnapshot = getConversationHistory(convKey)
 
-        // Step 1: Fast Local Moderation (Abuse 3-strike guard + Spam/Abul-Tabul guard).
-        // Polite/normal messages from any sender ALWAYS proceed to AI normally!
-        val localMod = ChatModerationEngine.evaluateIncomingLocally(convKey, combinedIncomingText)
+        // Step 1: Fast Local Understanding & Moderation:
+        // - Abuse 3-strike guard
+        // - Smart Conversation Closing / Thank-You / Acknowledgement / Reaction No-Reply (zero loops!)
+        // - Spam / Abul-Tabul guard
+        val localMod = ChatModerationEngine.evaluateIncomingLocally(
+            convKey = convKey,
+            incomingText = combinedIncomingText,
+            conversationHistory = historySnapshot,
+            smartClosingEnabled = settings.smartConversationClosingEnabled
+        )
         when (localMod.action) {
+            ModerationAction.SILENT_CONVERSATION_ENDED -> {
+                PilotStateHub.markMessageStatus(record.id, "SKIPPED_ENDED", localMod.reason)
+                PilotStateHub.log(
+                    LogLevel.INFO,
+                    "AutoReply",
+                    "Smart No-Reply for ${record.senderName}: ${localMod.reason}"
+                )
+                return
+            }
             ModerationAction.SILENT_IGNORE_ABUSE,
             ModerationAction.SILENT_IGNORE_SPAM -> {
+                PilotStateHub.markMessageStatus(record.id, "SKIPPED_MODERATION", localMod.reason)
                 PilotStateHub.log(
                     LogLevel.SAFETY,
                     "Moderation",
@@ -246,7 +390,7 @@ class IncomingMessageListener : NotificationListenerService() {
                     )
                     if (delivered) {
                         appendConversationHistory(convKey, "Me: $warnReply")
-                        PilotStateHub.markMessageAutoReplied(record.id, warnReply)
+                        PilotStateHub.markMessageAutoReplied(record.id, warnReply, localMod.reason)
                         PilotStateHub.log(
                             LogLevel.SAFETY,
                             "Moderation",
@@ -314,11 +458,23 @@ class IncomingMessageListener : NotificationListenerService() {
                 val confPct = (decision.categoryConfidence * 100).toInt()
                 val ownerPct = (decision.needsOwnerProb * 100).toInt()
                 val pdPct = (decision.answerableByPersonalDataProb * 100).toInt()
+                val replyPct = (decision.needsReplyProb * 100).toInt()
                 PilotStateHub.log(
                     LogLevel.INFO,
                     "Decision1",
-                    "Triage [${record.senderName}]: cat=${decision.category} (${confPct}%), needsOwner=${ownerPct}%, inMyData=${pdPct}%, urgency=${"%.1f".format(decision.urgencyScore)} (${decision.latencyMs}ms)"
+                    "Triage [${record.senderName}]: cat=${decision.category} (${confPct}%), needsReply=${replyPct}%, needsOwner=${ownerPct}%, inMyData=${pdPct}%, urgency=${"%.1f".format(decision.urgencyScore)} (${decision.latencyMs}ms)"
                 )
+
+                // Smart No-Reply via calibrated Decision Brain: conversation finished / thank-you loop / no reply needed
+                if (settings.smartConversationClosingEnabled &&
+                    ((decision.category == "NO_REPLY" && decision.categoryConfidence >= 0.62) ||
+                        (decision.needsReplyProb < 0.35 && decision.category != "ABUSIVE" && decision.category != "SENSITIVE_OWNER_ONLY"))
+                ) {
+                    val note = "AI মেসেজ পড়ে বুঝেছে কথা শেষ — রিপ্লাই প্রয়োজন নেই"
+                    PilotStateHub.markMessageStatus(record.id, "SKIPPED_ENDED", note)
+                    PilotStateHub.log(LogLevel.INFO, "Decision1", "Smart No-Reply for ${record.senderName}: cat=${decision.category}, needsReply=${replyPct}%")
+                    return
+                }
 
                 when (decision.category) {
                     "ABUSIVE" -> if (decision.categoryConfidence >= 0.72) {
@@ -328,8 +484,10 @@ class IncomingMessageListener : NotificationListenerService() {
                             lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
                             if (deliverReply(settings.autoReplyDelivery, record, replyAction, mod.replyText)) {
                                 appendConversationHistory(convKey, "Me: ${mod.replyText}")
-                                PilotStateHub.markMessageAutoReplied(record.id, mod.replyText)
+                                PilotStateHub.markMessageAutoReplied(record.id, mod.replyText, mod.reason)
                             }
+                        } else {
+                            PilotStateHub.markMessageStatus(record.id, "SKIPPED_MODERATION", mod.reason)
                         }
                         PilotStateHub.log(LogLevel.SAFETY, "Decision1", "Calibrated abuse detected for ${record.senderName}: ${mod.reason}")
                         return
@@ -341,8 +499,10 @@ class IncomingMessageListener : NotificationListenerService() {
                             lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
                             if (deliverReply(settings.autoReplyDelivery, record, replyAction, mod.replyText)) {
                                 appendConversationHistory(convKey, "Me: ${mod.replyText}")
-                                PilotStateHub.markMessageAutoReplied(record.id, mod.replyText)
+                                PilotStateHub.markMessageAutoReplied(record.id, mod.replyText, mod.reason)
                             }
+                        } else {
+                            PilotStateHub.markMessageStatus(record.id, "SKIPPED_MODERATION", mod.reason)
                         }
                         PilotStateHub.log(LogLevel.SAFETY, "Decision1", "Calibrated spam detected for ${record.senderName}: ${mod.reason}")
                         return
@@ -372,8 +532,11 @@ class IncomingMessageListener : NotificationListenerService() {
             }
         }
 
+        var aiDecisionNote: String? = null
+
         if (!isSensitive) {
-            // Step 3: Context-aware Gemini Smart Auto-Reply + AI Classifier (NORMAL / ABUSIVE / SPAM_NONSENSE / SENSITIVE_OWNER_ONLY)
+            // Step 3: Context-aware Gemini Smart Auto-Reply + Full Understanding
+            // (NORMAL / NO_REPLY / ABUSIVE / SPAM_NONSENSE / SENSITIVE_OWNER_ONLY)
             val screenContext = if (settings.autoReplyDelivery == AutoReplyDelivery.VISUAL_ACCESSIBILITY || replyAction == null) {
                 val accessibility = PilotAccessibilityService.instance
                 if (accessibility != null) {
@@ -387,7 +550,6 @@ class IncomingMessageListener : NotificationListenerService() {
                 null
             }
 
-            val historySnapshot = getConversationHistory(convKey)
             val aiResult = GeminiRestClient.generateSmartAutoReply(
                 apiKey = settings.effectiveApiKey,
                 modelId = settings.textModel,
@@ -403,7 +565,22 @@ class IncomingMessageListener : NotificationListenerService() {
             )
 
             val smart = aiResult.getOrElse { err ->
+                PilotStateHub.markMessageStatus(record.id, null, null)
                 PilotStateHub.log(LogLevel.ERROR, "AutoReply", "AI reply generation failed: ${err.message}")
+                return
+            }
+
+            // Handle AI-understood NO_REPLY (conversation ended, thank-you/welcome/ok/bye, no response expected)
+            if (settings.smartConversationClosingEnabled &&
+                (!smart.shouldReply || smart.messageType == "NO_REPLY")
+            ) {
+                val note = smart.decisionReason.ifBlank { "AI মেসেজ পড়ে বুঝেছে এখানে আর রিপ্লাই দরকার নেই" }
+                PilotStateHub.markMessageStatus(record.id, "SKIPPED_ENDED", note)
+                PilotStateHub.log(
+                    LogLevel.INFO,
+                    "AutoReply",
+                    "AI decided NO_REPLY for ${record.senderName}: $note"
+                )
                 return
             }
 
@@ -415,8 +592,10 @@ class IncomingMessageListener : NotificationListenerService() {
                     lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
                     if (deliverReply(settings.autoReplyDelivery, record, replyAction, decision.replyText)) {
                         appendConversationHistory(convKey, "Me: ${decision.replyText}")
-                        PilotStateHub.markMessageAutoReplied(record.id, decision.replyText)
+                        PilotStateHub.markMessageAutoReplied(record.id, decision.replyText, decision.reason)
                     }
+                } else {
+                    PilotStateHub.markMessageStatus(record.id, "SKIPPED_MODERATION", decision.reason)
                 }
                 PilotStateHub.log(LogLevel.SAFETY, "Moderation", "AI detected abuse from ${record.senderName}: ${decision.reason}")
                 return
@@ -430,8 +609,10 @@ class IncomingMessageListener : NotificationListenerService() {
                     lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
                     if (deliverReply(settings.autoReplyDelivery, record, replyAction, decision.replyText)) {
                         appendConversationHistory(convKey, "Me: ${decision.replyText}")
-                        PilotStateHub.markMessageAutoReplied(record.id, decision.replyText)
+                        PilotStateHub.markMessageAutoReplied(record.id, decision.replyText, decision.reason)
                     }
+                } else {
+                    PilotStateHub.markMessageStatus(record.id, "SKIPPED_MODERATION", decision.reason)
                 }
                 PilotStateHub.log(LogLevel.SAFETY, "Moderation", "AI detected spam/nonsense from ${record.senderName}: ${decision.reason}")
                 return
@@ -441,6 +622,7 @@ class IncomingMessageListener : NotificationListenerService() {
             sensitivityReason = smart.sensitivityReason
             ownerQuestion = smart.questionForOwner
             finalReplyText = smart.replyText
+            aiDecisionNote = smart.decisionReason.ifBlank { null }
         }
 
         // Step 4: Truly Owner-Only Sensitive Message -> Smart Non-Nagging Escalation
@@ -526,8 +708,22 @@ class IncomingMessageListener : NotificationListenerService() {
             return
         }
 
-        // Step 5: Normal / Creative / Personal-Data Reply -> Send ONCE cleanly!
+        // Step 5: Normal / Creative / Personal-Data Reply -> Final owner-active check, then send ONCE cleanly!
         if (finalReplyText.isBlank()) return
+        val latestSettingsBeforeSend = PilotStateHub.settings.value
+        if (latestSettingsBeforeSend.pauseAutoReplyWhenOwnerActive) {
+            val latePause = getOwnerActivePauseReason(
+                packageName = record.packageName,
+                convKey = convKey,
+                appDisplayName = record.app.displayName
+            )
+            if (latePause != null) {
+                PilotStateHub.markMessageStatus(record.id, "SKIPPED_OWNER_ACTIVE", latePause)
+                PilotStateHub.log(LogLevel.INFO, "AutoReply", "Aborted send right before delivery — owner active: $latePause")
+                return
+            }
+        }
+
         registerSentReply(record.packageName, record.senderName, finalReplyText)
         lastAutoReplyAtMs[convKey] = System.currentTimeMillis()
 
@@ -539,12 +735,13 @@ class IncomingMessageListener : NotificationListenerService() {
         )
 
         if (!delivered) {
+            PilotStateHub.markMessageStatus(record.id, null, null)
             PilotStateHub.log(LogLevel.ERROR, "AutoReply", "Could not deliver reply to ${record.senderName}.")
             return
         }
 
         appendConversationHistory(convKey, "Me: $finalReplyText")
-        PilotStateHub.markMessageAutoReplied(record.id, finalReplyText)
+        PilotStateHub.markMessageAutoReplied(record.id, finalReplyText, aiDecisionNote)
         PilotStateHub.log(
             LogLevel.INFO,
             "AutoReply",
@@ -623,7 +820,9 @@ class IncomingMessageListener : NotificationListenerService() {
         replyAction: Notification.Action?,
         replyText: String
     ): Boolean {
+        val convKey = conversationKey(record.packageName, record.senderName)
         if (settingsDelivery == AutoReplyDelivery.SILENT_DIRECT_REPLY && replyAction != null) {
+            lastAiDirectReplyAtMs[convKey] = System.currentTimeMillis()
             return sendDirectReply(
                 context = applicationContext,
                 action = replyAction,
@@ -638,6 +837,7 @@ class IncomingMessageListener : NotificationListenerService() {
         if (accessibility == null) {
             // If silent direct reply action still exists as fallback, use it!
             if (replyAction != null) {
+                lastAiDirectReplyAtMs[convKey] = System.currentTimeMillis()
                 return sendDirectReply(
                     context = applicationContext,
                     action = replyAction,
@@ -650,16 +850,21 @@ class IncomingMessageListener : NotificationListenerService() {
             return false
         }
 
-        accessibility.openNotificationChat(record.senderName)
-        delay(900)
-        val res = accessibility.typeText(
-            index = -1,
-            x = 0,
-            y = 0,
-            text = replyText,
-            pressSend = true
-        )
-        return res.optString("status") == "ok"
+        PilotAccessibilityService.aiVisualReplyInProgress = true
+        return try {
+            accessibility.openNotificationChat(record.senderName)
+            delay(900)
+            val res = accessibility.typeText(
+                index = -1,
+                x = 0,
+                y = 0,
+                text = replyText,
+                pressSend = true
+            )
+            res.optString("status") == "ok"
+        } finally {
+            PilotAccessibilityService.aiVisualReplyInProgress = false
+        }
     }
 
     private fun findDirectReplyAction(notification: Notification): Notification.Action? {
@@ -671,21 +876,86 @@ class IncomingMessageListener : NotificationListenerService() {
     }
 
     companion object {
-        private const val DEBOUNCE_WINDOW_MS = 2_400L
         private const val PER_SENDER_COOLDOWN_MS = 10_000L
         private const val FINGERPRINT_DEDUP_MS = 5 * 60_000L
         private const val SELF_ECHO_MEMORY_MS = 5 * 60_000L
+        private const val OWNER_TAKEOVER_PAUSE_MS = 3 * 60_000L
+        private const val OWNER_APP_ACTIVITY_PAUSE_MS = 75_000L
+        private const val AI_DIRECT_REPLY_SUPPRESS_REMOVE_MS = 5_000L
 
         private data class SentEchoRecord(
             val normalizedText: String,
             val sentAtMs: Long
         )
 
+        private val pendingDebounceJobs = ConcurrentHashMap<String, Job>()
+        private val pendingBatchMessages = ConcurrentHashMap<String, MutableList<Pair<IncomingMessageRecord, Notification.Action?>>>()
+        private val ownerTakeoverUntilMs = ConcurrentHashMap<String, Long>()
+        private val lastAiDirectReplyAtMs = ConcurrentHashMap<String, Long>()
         private val recentSentReplies = ConcurrentHashMap<String, CopyOnWriteArrayList<SentEchoRecord>>()
         private val conversationHistoryMap = ConcurrentHashMap<String, CopyOnWriteArrayList<String>>()
 
         internal fun conversationKey(packageName: String, senderName: String): String =
             "${packageName.trim().lowercase()}|${senderName.trim().lowercase()}"
+
+        fun cancelPendingAutoReply(
+            packageName: String,
+            senderName: String,
+            reasonNote: String = "আপনি নিজে রিপ্লাই দেওয়ার জন্য AI বাতিল করেছেন"
+        ): Boolean {
+            val convKey = conversationKey(packageName, senderName)
+            val job = pendingDebounceJobs.remove(convKey)
+            val hadBatch = pendingBatchMessages.remove(convKey) != null
+            job?.cancel()
+            if (job != null || hadBatch) {
+                PilotStateHub.markWaitingMessagesForConversationStatus(
+                    packageName = packageName,
+                    senderName = senderName,
+                    status = "SKIPPED_OWNER_ACTIVE",
+                    note = reasonNote
+                )
+                return true
+            }
+            return false
+        }
+
+        fun markOwnerTookOverConversation(
+            packageName: String,
+            senderName: String,
+            reasonNote: String = "আপনি নিজেই চ্যাটে আছেন — AI বিরতিতে",
+            nowMs: Long = System.currentTimeMillis()
+        ) {
+            val convKey = conversationKey(packageName, senderName)
+            ownerTakeoverUntilMs[convKey] = nowMs + OWNER_TAKEOVER_PAUSE_MS
+            val cancelled = cancelPendingAutoReply(packageName, senderName, reasonNote)
+            if (cancelled) {
+                PilotStateHub.log(LogLevel.INFO, "AutoReply", "Cancelled pending AI reply for $senderName ($reasonNote)")
+            }
+        }
+
+        fun getOwnerActivePauseReason(
+            packageName: String,
+            convKey: String,
+            appDisplayName: String,
+            nowMs: Long = System.currentTimeMillis()
+        ): String? {
+            if (PilotAccessibilityService.isOwnerCurrentlyInPackage(packageName)) {
+                return "আপনি এখন নিজেই $appDisplayName-এ আছেন — AI থেমে আছে"
+            }
+            if (PilotAccessibilityService.hasRecentOwnerActivityInPackage(
+                    packageName = packageName,
+                    withinMs = OWNER_APP_ACTIVITY_PAUSE_MS,
+                    nowMs = nowMs
+                )
+            ) {
+                return "আপনি এইমাত্র $appDisplayName-এ সক্রিয় ছিলেন — AI বিরতিতে"
+            }
+            val takeoverUntil = ownerTakeoverUntilMs[convKey] ?: 0L
+            if (takeoverUntil > nowMs) {
+                return "আপনি নিজেই এই চ্যাটে কথা বলছেন — AI বিরতিতে"
+            }
+            return null
+        }
 
         internal fun normalizeForMatch(text: String): String =
             text.trim().lowercase().replace(Regex("\\s+"), " ")
@@ -744,6 +1014,11 @@ class IncomingMessageListener : NotificationListenerService() {
         internal fun clearEchoCacheForTest() {
             recentSentReplies.clear()
             conversationHistoryMap.clear()
+            ownerTakeoverUntilMs.clear()
+            lastAiDirectReplyAtMs.clear()
+            pendingDebounceJobs.values.forEach { it.cancel() }
+            pendingDebounceJobs.clear()
+            pendingBatchMessages.clear()
         }
 
         fun appendConversationHistory(packageName: String, senderName: String, line: String) {
@@ -755,8 +1030,8 @@ class IncomingMessageListener : NotificationListenerService() {
 
         private fun appendConversationHistory(convKey: String, line: String) {
             val list = conversationHistoryMap.computeIfAbsent(convKey) { CopyOnWriteArrayList() }
-            list.add(line.take(220))
-            while (list.size > 10) {
+            list.add(line.take(240))
+            while (list.size > 16) {
                 list.removeAt(0)
             }
         }

@@ -37,7 +37,9 @@ data class SmartAutoReplyResult(
     val sensitivityReason: String? = null,
     val replyText: String,
     val questionForOwner: String = "",
-    val messageType: String = "NORMAL" // NORMAL | ABUSIVE | SPAM_NONSENSE | SENSITIVE_OWNER_ONLY
+    val messageType: String = "NORMAL", // NORMAL | NO_REPLY | ABUSIVE | SPAM_NONSENSE | SENSITIVE_OWNER_ONLY
+    val shouldReply: Boolean = true,
+    val decisionReason: String = ""
 )
 
 data class OwnerVoiceConsultationResult(
@@ -576,13 +578,13 @@ object GeminiRestClient {
                 }
                 if (conversationHistory.isNotEmpty()) {
                     append("Recent Conversation History (oldest to newest):\n")
-                    conversationHistory.takeLast(6).forEach { append("- ").append(it).append('\n') }
+                    conversationHistory.takeLast(12).forEach { append("- ").append(it).append('\n') }
                 }
                 append("LATEST Incoming Message from ").append(senderName).append(": \"").append(incomingText).append("\"\n")
                 if (!screenContext.isNullOrBlank()) {
                     append("Visible Chat Screen Context: ").append(screenContext.take(700)).append('\n')
                 }
-                append("Output strict JSON only.")
+                append("Read the full context carefully, decide the exact right action, and output strict JSON only.")
             }
 
             val systemPrompt = buildString {
@@ -598,18 +600,25 @@ object GeminiRestClient {
                 }
                 append(
                     """
-                    STRICT AUTO-REPLY & MODERATION RULES:
-                    1. First classify the sender's LATEST message into ONE exact "message_type":
-                       - "ABUSIVE": Profanity, slurs, insults, verbal abuse, rudeness, or hostile scolding ("বকাবাজি / গালাগালি").
-                       - "SPAM_NONSENSE": Meaningless gibberish, random letters/emojis, trolling, "আবুল তাবুল" nonsense, or intentional spam.
-                       - "SENSITIVE_OWNER_ONLY": ONLY when genuinely IMPOSSIBLE for an AI to answer or fulfill on its own — specifically: private passwords/PINs/OTPs/NID, sending real money/loans/bKash/bank transfers, private live location/address NOT in Saved Personal Data, urgent real-world emergencies, or binding real-life personal commitments/decisions that ONLY the human account owner can make.
-                       - "NORMAL": EVERYTHING ELSE! Casual chat, greetings, questions, advice, jokes, writing a poem ("কবিতা"), writing a story/song/essay/caption/code, translations, math, general knowledge, answering facts from OWNER'S SAVED PERSONAL DATA, or creative requests (like describing/designing an image or giving a creative response when asked to create a picture).
+                    STRICT CONTEXT-UNDERSTANDING & AUTO-REPLY RULES:
+                    Read the ENTIRE Recent Conversation History and the LATEST message carefully so you truly understand what is happening and what you should do.
 
-                    2. CRITICAL — DO NOT OVER-ESCALATE!
-                       - NEVER mark normal chat, poems ("কবিতা"), image creation requests ("ছবি তৈরি"), jokes, study help, general questions, or anything answered by OWNER'S SAVED PERSONAL DATA as "SENSITIVE_OWNER_ONLY"!
-                       - If the sender asks for a poem, story, advice, explanation, or creative content, FULFILL IT YOURSELF beautifully and completely in "reply" (you may write multiple lines for a poem or creative request) with "message_type": "NORMAL"!
-                       - If the sender asks to generate/draw an image in text chat, handle it yourself politely in "reply" (e.g. share creative text/emoji artwork or ask what details they want) with "message_type": "NORMAL" — NEVER disturb the owner for it!
-                       - For ordinary short chat messages, keep "reply" concise (1-2 natural human-like sentences matching Bengali, Banglish, or English) and NEVER repeat greetings already in Recent Conversation History.
+                    1. First classify the sender's LATEST message into ONE exact "message_type":
+                       - "NO_REPLY": Choose this whenever NO reply is needed or the conversation has naturally ended! Specifically:
+                         * Closing acknowledgements: "আচ্ছা", "ঠিক আছে", "ওকে", "বুঝেছি", "পেয়েছি", "হুম", "জ্বী", "ok", "okay", "hmm", "got it", "noted", "done".
+                         * Thank-you / welcome / farewell wrap-ups: "ধন্যবাদ", "অনেক ধন্যবাদ", "স্বাগতম", "ওয়েলকাম", "ভালো থাকবেন", "আল্লাহ হাফেজ", "শুভ রাত্রি", "পরে কথা হবে", "thanks", "thank you", "welcome", "no problem", "bye", "take care", "good night".
+                         * Pure reaction emojis ("👍", "🙏", "❤️", "👌") or passive statements/forwards that do NOT ask any question or request any action.
+                         * CRITICAL ANTI-LOOP RULE: If our previous message ("Me:") ALREADY answered their question, thanked them, welcomed them, or said goodbye, and they reply with another polite closing/thank-you/goodbye — you MUST return "message_type": "NO_REPLY", "should_reply": false, "reply": "" so the conversation ends cleanly instead of looping forever!
+                       - "ABUSIVE": Profanity, slurs, insults, verbal abuse, rudeness, or hostile scolding ("বকাবাজি / গালাগালি").
+                       - "SPAM_NONSENSE": Meaningless gibberish, random keyboard mash, trolling, "আবুল তাবুল" nonsense, or intentional spam.
+                       - "SENSITIVE_OWNER_ONLY": ONLY when genuinely IMPOSSIBLE for an AI to answer or fulfill on its own — specifically: private passwords/PINs/OTPs/NID, sending real money/loans/bKash/bank transfers, private live location/address NOT in Saved Personal Data, urgent real-world emergencies, or binding real-life personal commitments/decisions that ONLY the human account owner can make.
+                       - "NORMAL": Genuine messages that EXPECT a reply right now! Fresh greetings starting a new chat, direct questions, requests, active discussions, advice, jokes, writing a poem ("কবিতা"), writing a story/song/essay/caption/code, translations, math, general knowledge, or answering facts from OWNER'S SAVED PERSONAL DATA.
+
+                    2. SMART HUMAN-LIKE REPLY RULES (when "message_type" == "NORMAL"):
+                       - Set "should_reply": true and write a natural, concise, helpful reply matching the sender's language (Bengali, Banglish, or English).
+                       - DO NOT artificially prolong finished topics! Never add filler hooks like "আর কিছু লাগলে বলবেন", "ধন্যবাদ!", or extra unnecessary farewells at the end of a completed answer — answer clearly and stop cleanly so the other person isn't pulled into a thank-you loop!
+                       - NEVER repeat greetings already present in Recent Conversation History.
+                       - NEVER over-escalate poems ("কবিতা"), stories, jokes, study help, general questions, or facts already in OWNER'S SAVED PERSONAL DATA as "SENSITIVE_OWNER_ONLY".
                     """.trimIndent()
                 )
                 if (sensitiveGuardEnabled) {
@@ -617,7 +626,7 @@ object GeminiRestClient {
                         """
 
                         3. WHEN "message_type" == "SENSITIVE_OWNER_ONLY":
-                           - Set "is_sensitive": true
+                           - Set "should_reply": true and "is_sensitive": true
                            - DO NOT guess or fabricate the owner's private answer!
                            - Set "reply" to EXACTLY: "$defaultDeferral"
                            - Set "sensitivity_reason" to a short 2-4 word Bengali label (e.g. "আর্থিক অনুরোধ", "ব্যক্তিগত তথ্য", "জরুরি সিদ্ধান্ত").
@@ -630,10 +639,12 @@ object GeminiRestClient {
 
                     Return ONLY valid JSON:
                     {
-                      "message_type": "NORMAL",
+                      "message_type": "NORMAL" | "NO_REPLY" | "ABUSIVE" | "SPAM_NONSENSE" | "SENSITIVE_OWNER_ONLY",
+                      "should_reply": true,
+                      "decision_reason": "short 3-8 word Bengali explanation of what you understood",
                       "is_sensitive": false,
                       "sensitivity_reason": "",
-                      "reply": "exact message text to send back",
+                      "reply": "exact message text to send back, or empty string when should_reply is false",
                       "question_for_owner": ""
                     }
                     """.trimIndent()
@@ -659,7 +670,7 @@ object GeminiRestClient {
                 .put(
                     "generationConfig",
                     JSONObject()
-                        .put("temperature", 0.35)
+                        .put("temperature", 0.3)
                         .put("responseMimeType", "application/json")
                 )
             val bodyJson = payload.toString()
@@ -704,46 +715,13 @@ object GeminiRestClient {
                                 }
                             }.trim()
 
-                            val parsedJson = runCatching { extractCleanJsonObject(rawText) }.getOrNull()
-                            if (parsedJson != null) {
-                                val rawType = parsedJson.optString("message_type", "NORMAL").trim().uppercase()
-                                val normalizedType = when (rawType) {
-                                    "ABUSIVE", "SPAM_NONSENSE", "SENSITIVE_OWNER_ONLY", "NORMAL" -> rawType
-                                    else -> if (parsedJson.optBoolean("is_sensitive", false)) "SENSITIVE_OWNER_ONLY" else "NORMAL"
-                                }
-                                val isCreative = com.example.messaging.SensitiveMessageGuard.isCreativeOrAiSolvableRequest(incomingText)
-                                val isSensitive = sensitiveGuardEnabled &&
-                                    !isCreative &&
-                                    (normalizedType == "SENSITIVE_OWNER_ONLY" || parsedJson.optBoolean("is_sensitive", false)) &&
-                                    normalizedType != "ABUSIVE" &&
-                                    normalizedType != "SPAM_NONSENSE"
-                                val reason = parsedJson.optString("sensitivity_reason", "").trim().ifBlank { null }
-                                val reply = when {
-                                    normalizedType == "ABUSIVE" || normalizedType == "SPAM_NONSENSE" -> ""
-                                    isSensitive -> defaultDeferral
-                                    else -> parsedJson.optString("reply", "").trim().removeSurrounding("\"")
-                                }
-                                if (normalizedType == "NORMAL" && !isSensitive) {
-                                    require(reply.isNotBlank()) { "Empty auto-reply returned." }
-                                }
-                                val ownerQ = parsedJson.optString("question_for_owner", "").trim()
-                                    .ifBlank { "$senderName জিজ্ঞেস করেছে: \"${incomingText.take(120)}\" — কী উত্তর পাঠাবো?" }
-                                SmartAutoReplyResult(
-                                    isSensitive = isSensitive,
-                                    sensitivityReason = reason,
-                                    replyText = reply,
-                                    questionForOwner = if (isSensitive) ownerQ else "",
-                                    messageType = if (isSensitive) "SENSITIVE_OWNER_ONLY" else normalizedType
-                                )
-                            } else {
-                                val plain = rawText.removeSurrounding("\"").trim()
-                                require(plain.isNotBlank()) { "Empty auto-reply returned." }
-                                SmartAutoReplyResult(
-                                    isSensitive = false,
-                                    replyText = plain,
-                                    messageType = "NORMAL"
-                                )
-                            }
+                            parseSmartAutoReplyJson(
+                                rawText = rawText,
+                                senderName = senderName,
+                                incomingText = incomingText,
+                                defaultDeferral = defaultDeferral,
+                                sensitiveGuardEnabled = sensitiveGuardEnabled
+                            )
                         }
                     }
                 } catch (e: Throwable) {
@@ -761,6 +739,91 @@ object GeminiRestClient {
                 }
             }
             throw lastAutoError ?: IllegalStateException("Auto-reply generation failed.")
+        }
+    }
+
+    internal fun parseSmartAutoReplyJson(
+        rawText: String,
+        senderName: String,
+        incomingText: String,
+        defaultDeferral: String,
+        sensitiveGuardEnabled: Boolean = true
+    ): SmartAutoReplyResult {
+        val parsedJson = runCatching { extractCleanJsonObject(rawText) }.getOrNull()
+        if (parsedJson != null) {
+            val rawType = parsedJson.optString("message_type", "NORMAL").trim().uppercase()
+            val explicitShouldReply = if (parsedJson.has("should_reply")) {
+                parsedJson.optBoolean("should_reply", true)
+            } else {
+                rawType != "NO_REPLY" && rawType != "ABUSIVE" && rawType != "SPAM_NONSENSE"
+            }
+            val normalizedType = when (rawType) {
+                "NO_REPLY", "ABUSIVE", "SPAM_NONSENSE", "SENSITIVE_OWNER_ONLY", "NORMAL" -> rawType
+                else -> when {
+                    !explicitShouldReply -> "NO_REPLY"
+                    parsedJson.optBoolean("is_sensitive", false) -> "SENSITIVE_OWNER_ONLY"
+                    else -> "NORMAL"
+                }
+            }
+            val decisionReason = parsedJson.optString("decision_reason", "").trim()
+            if (normalizedType == "NO_REPLY" || (!explicitShouldReply && normalizedType == "NORMAL")) {
+                return SmartAutoReplyResult(
+                    isSensitive = false,
+                    replyText = "",
+                    messageType = "NO_REPLY",
+                    shouldReply = false,
+                    decisionReason = decisionReason.ifBlank { "কথা শেষ — তাই AI আর বাড়তি রিপ্লাই দেয়নি" }
+                )
+            }
+            val isCreative = com.example.messaging.SensitiveMessageGuard.isCreativeOrAiSolvableRequest(incomingText)
+            val isSensitive = sensitiveGuardEnabled &&
+                !isCreative &&
+                (normalizedType == "SENSITIVE_OWNER_ONLY" || parsedJson.optBoolean("is_sensitive", false)) &&
+                normalizedType != "ABUSIVE" &&
+                normalizedType != "SPAM_NONSENSE"
+            val reason = parsedJson.optString("sensitivity_reason", "").trim().ifBlank { null }
+            val reply = when {
+                normalizedType == "ABUSIVE" || normalizedType == "SPAM_NONSENSE" -> ""
+                isSensitive -> defaultDeferral
+                else -> parsedJson.optString("reply", "").trim().removeSurrounding("\"")
+            }
+            if (normalizedType == "NORMAL" && !isSensitive && reply.isBlank()) {
+                return SmartAutoReplyResult(
+                    isSensitive = false,
+                    replyText = "",
+                    messageType = "NO_REPLY",
+                    shouldReply = false,
+                    decisionReason = decisionReason.ifBlank { "কোনো রিপ্লাই প্রয়োজন নেই" }
+                )
+            }
+            val ownerQ = parsedJson.optString("question_for_owner", "").trim()
+                .ifBlank { "$senderName জিজ্ঞেস করেছে: \"${incomingText.take(120)}\" — কী উত্তর পাঠাবো?" }
+            return SmartAutoReplyResult(
+                isSensitive = isSensitive,
+                sensitivityReason = reason,
+                replyText = reply,
+                questionForOwner = if (isSensitive) ownerQ else "",
+                messageType = if (isSensitive) "SENSITIVE_OWNER_ONLY" else normalizedType,
+                shouldReply = normalizedType != "ABUSIVE" && normalizedType != "SPAM_NONSENSE",
+                decisionReason = decisionReason
+            )
+        } else {
+            val plain = rawText.removeSurrounding("\"").trim()
+            if (plain.isBlank() || plain.equals("NO_REPLY", ignoreCase = true)) {
+                return SmartAutoReplyResult(
+                    isSensitive = false,
+                    replyText = "",
+                    messageType = "NO_REPLY",
+                    shouldReply = false,
+                    decisionReason = "কথা শেষ — বাড়তি রিপ্লাই প্রয়োজন নেই"
+                )
+            }
+            return SmartAutoReplyResult(
+                isSensitive = false,
+                replyText = plain,
+                messageType = "NORMAL",
+                shouldReply = true
+            )
         }
     }
 

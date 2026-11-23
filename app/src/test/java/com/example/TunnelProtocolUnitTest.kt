@@ -150,4 +150,80 @@ class TunnelProtocolUnitTest {
 
         assertEquals("nl1.wssht.to" to 443, SshProxyBridge.parseHostPort("nl1.wssht.to:443", 443))
     }
+
+    @Test
+    fun `TunnelAutoDoctor accurately diagnoses GP failures and builds self-healing Auto-Fix plan`() {
+        val gpAuto = HttpCustomTunnelProfile.DEFAULT_PROFILES.first { it.id == HttpCustomTunnelProfile.GP_SUPER_AUTO_ID }
+
+        // 1. All routes blocked on GP SIM
+        val allBlocked = com.example.tunnel.TunnelAutoDoctor.diagnose(
+            profile = gpAuto,
+            carrierName = "Grameenphone (GP)",
+            isGrameenphone = true,
+            dnsReachable = true,
+            workingDnsServer = "192.0.0.1",
+            workingDnsTransport = "UDP:53",
+            dnsRttMs = 140L,
+            wsAttempted = true,
+            wsSucceeded = false,
+            wsFailures = listOf("TLS:443 -> Connection timed out"),
+            slowDnsAttempted = true,
+            slowDnsSucceeded = false,
+            slowDnsDiagnostics = listOf("Carrier(192.0.0.1,EDNS512) -> Timeout(3200ms)"),
+            sshError = null
+        )
+        assertEquals(com.example.tunnel.FailureCategory.ALL_ROUTES_BLOCKED, allBlocked.category)
+        assertTrue(allBlocked.canAutoFix)
+        assertEquals(3, allBlocked.checks.size)
+        assertTrue(allBlocked.checks.first().passed)
+
+        // 2. SSH Auth failed
+        val authDiag = com.example.tunnel.TunnelAutoDoctor.diagnose(
+            profile = gpAuto,
+            carrierName = "Grameenphone (GP)",
+            isGrameenphone = true,
+            dnsReachable = true,
+            workingDnsServer = "192.0.0.1",
+            workingDnsTransport = "UDP:53",
+            dnsRttMs = 95L,
+            wsAttempted = true,
+            wsSucceeded = true,
+            wsFailures = emptyList(),
+            slowDnsAttempted = false,
+            slowDnsSucceeded = false,
+            slowDnsDiagnostics = emptyList(),
+            sshError = "Auth fail"
+        )
+        assertEquals(com.example.tunnel.FailureCategory.SSH_AUTH_FAILED, authDiag.category)
+        assertTrue(authDiag.requiresNewConfig)
+
+        // 3. Auto-Fix plan picks live HTTP 101 Cloudflare Edge IP automatically
+        val winnerEdge = com.example.tunnel.GpBugHostScanEntry(
+            label = "CF Edge 104.16 (HTTP:80)",
+            connectTarget = "104.16.132.229",
+            port = 80,
+            useTls = false,
+            sniHost = "",
+            wsHostHeader = "nl1.wssht.to",
+            reachable = true,
+            wsUpgrade101 = true,
+            httpStatusCode = 101,
+            rttMs = 68L,
+            serverHeader = "cloudflare",
+            detail = "HTTP 101 • WS READY [cloudflare]"
+        )
+        val plan = com.example.tunnel.TunnelAutoDoctor.buildAutoFixPlan(
+            currentProfile = gpAuto,
+            allProfiles = HttpCustomTunnelProfile.DEFAULT_PROFILES,
+            currentDiagnosis = allBlocked,
+            bugHostResults = listOf(winnerEdge),
+            dnsResults = emptyList()
+        )
+        assertTrue(plan.shouldReconnect)
+        assertNotNull(plan.updatedProfile)
+        assertEquals("104.16.132.229", plan.updatedProfile!!.bugHost)
+        assertEquals(80, plan.updatedProfile!!.port)
+        assertTrue(plan.updatedProfile!!.enableSplitPayload)
+    }
 }
+

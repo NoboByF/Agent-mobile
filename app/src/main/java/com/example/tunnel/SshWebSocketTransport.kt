@@ -191,7 +191,14 @@ object SshWebSocketTransport {
             if (underlyingNetwork != null) {
                 runCatching { underlyingNetwork.bindSocket(rawSocket) }
             }
-            rawSocket.connect(InetSocketAddress(config.connectHost, config.port), connectTimeoutMs)
+            val targetEndpoint = if (!isIpLiteral(config.connectHost) && underlyingNetwork != null) {
+                val resolved = runCatching { underlyingNetwork.getByName(config.connectHost) }.getOrNull()
+                if (resolved != null) InetSocketAddress(resolved, config.port)
+                else InetSocketAddress(config.connectHost, config.port)
+            } else {
+                InetSocketAddress(config.connectHost, config.port)
+            }
+            rawSocket.connect(targetEndpoint, connectTimeoutMs)
             rawSocket.soTimeout = connectTimeoutMs
             rawSocket.tcpNoDelay = true
 
@@ -468,8 +475,8 @@ object SshWebSocketTransport {
             )
         }
 
-        // 6. Plain & Split HTTP WebSocket ports (80, 8080, 8880)
-        for (httpPort in listOf(80, 8080, 8880)) {
+        // 6. Plain & Split HTTP WebSocket ports (80, 8080, 2052, 8880)
+        for (httpPort in listOf(80, 8080, 2052, 8880)) {
             addUnique(
                 SshWebSocketConfig(
                     connectHost = directAddr,
@@ -479,8 +486,25 @@ object SshWebSocketTransport {
                     wsPath = cleanPath,
                     useTls = false,
                     customPayload = customPayload,
-                    splitPayload = httpPort == 80,
+                    splitPayload = httpPort == 80 || httpPort == 2052,
                     label = "HTTP:$httpPort ($cleanHost)"
+                )
+            )
+        }
+
+        // 7. GP Zero-Rated Split-Inject Payload over Cloudflare Edge IP (bypasses GP HTTP Host DPI)
+        if (customPayload.isBlank()) {
+            addUnique(
+                SshWebSocketConfig(
+                    connectHost = "162.159.135.42",
+                    port = 80,
+                    wsHostHeader = cleanHost,
+                    sniHost = "www.grameenphone.com",
+                    wsPath = cleanPath,
+                    useTls = false,
+                    customPayload = PRESET_GP_SPLIT_DPI,
+                    splitPayload = true,
+                    label = "CF-Edge(162.159):80 GP-Split"
                 )
             )
         }

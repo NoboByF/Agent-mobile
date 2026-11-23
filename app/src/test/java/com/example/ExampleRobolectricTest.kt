@@ -1212,4 +1212,130 @@ class ExampleRobolectricTest {
         assertEquals("nl1.wssht.to", reparsed.host)
         assertEquals("sshocean-fahimsshh", reparsed.username)
     }
+
+    @Test
+    fun `smart conversation closing stops thank-you, ok, welcome, farewell loops while answering real follow-up questions`() {
+        ChatModerationEngine.clearAllForTest()
+        val convKey = "com.whatsapp|rahim"
+        val history = listOf(
+            "Rahim: ভাই মিটিং কয়টায়?",
+            "Me: বিকেল ৪টায় মিটিং আছে।"
+        )
+
+        // Pure closings, thanks, welcome, ok, farewells, and approval reactions -> SILENT_CONVERSATION_ENDED
+        val closingMessages = listOf(
+            "ধন্যবাদ",
+            "অনেক ধন্যবাদ ভাই",
+            "ওয়েলকাম",
+            "আচ্ছা ঠিক আছে",
+            "ঠিক আছে ভাই, ভালো থাকবেন",
+            "আল্লাহ হাফেজ",
+            "ok",
+            "okay thanks",
+            "thank you so much",
+            "you're welcome",
+            "hmm",
+            "👍",
+            "🙏",
+            "bye"
+        )
+        for (msg in closingMessages) {
+            val decision = ChatModerationEngine.evaluateIncomingLocally(
+                convKey = convKey,
+                incomingText = msg,
+                conversationHistory = history,
+                smartClosingEnabled = true
+            )
+            assertEquals("Expected NO_REPLY closing for \"$msg\"", ModerationAction.SILENT_CONVERSATION_ENDED, decision.action)
+            assertEquals("", decision.replyText)
+        }
+
+        // Messages that include thanks/ok PLUS a real question or request MUST still proceed to AI!
+        val realFollowUps = listOf(
+            "অনেক ধন্যবাদ ভাই, কালকে কয়টায় আসবেন?",
+            "আচ্ছা, ফাইলটা একটু পাঠিয়ে দাও তো",
+            "ok can you send me the schedule?",
+            "ধন্যবাদ! আরেকটা কবিতা লিখে দাও"
+        )
+        for (msg in realFollowUps) {
+            val decision = ChatModerationEngine.evaluateIncomingLocally(
+                convKey = convKey,
+                incomingText = msg,
+                conversationHistory = history,
+                smartClosingEnabled = true
+            )
+            assertEquals("Expected PROCEED_TO_AI for \"$msg\"", ModerationAction.PROCEED_TO_AI, decision.action)
+        }
+    }
+
+    @Test
+    fun `owner active detection and manual takeover pause AI auto-reply immediately`() {
+        IncomingMessageListener.clearEchoCacheForTest()
+        com.example.automation.PilotAccessibilityService.clearOwnerActivityForTest()
+
+        val pkg = "com.whatsapp"
+        val sender = "Karim"
+        val convKey = IncomingMessageListener.conversationKey(pkg, sender)
+        val t0 = 10_000_000L
+
+        // Initially owner is NOT active -> AI is allowed to reply
+        assertNull(IncomingMessageListener.getOwnerActivePauseReason(pkg, convKey, "WhatsApp", nowMs = t0))
+
+        // Case 1: Owner opens or types inside WhatsApp -> AI pauses immediately and for 75s after leaving
+        com.example.automation.PilotAccessibilityService.recordOwnerInteractionForTest(pkg, t0)
+        assertNotNull(IncomingMessageListener.getOwnerActivePauseReason(pkg, convKey, "WhatsApp", nowMs = t0 + 5_000L))
+
+        // Switch away to another app: still paused within 75s recent activity window, then resumes after 80s
+        com.example.automation.PilotAccessibilityService.lastForegroundPackage = "com.android.chrome"
+        assertNotNull(IncomingMessageListener.getOwnerActivePauseReason(pkg, convKey, "WhatsApp", nowMs = t0 + 30_000L))
+        assertNull(IncomingMessageListener.getOwnerActivePauseReason(pkg, convKey, "WhatsApp", nowMs = t0 + 80_000L))
+
+        // Case 2: Owner manually takes over / replies / opens chat notification -> pauses for 3 minutes
+        IncomingMessageListener.markOwnerTookOverConversation(pkg, sender, nowMs = t0 + 100_000L)
+        assertNotNull(IncomingMessageListener.getOwnerActivePauseReason(pkg, convKey, "WhatsApp", nowMs = t0 + 200_000L))
+        assertNull(IncomingMessageListener.getOwnerActivePauseReason(pkg, convKey, "WhatsApp", nowMs = t0 + 300_000L))
+
+        com.example.automation.PilotAccessibilityService.clearOwnerActivityForTest()
+        IncomingMessageListener.clearEchoCacheForTest()
+    }
+
+    @Test
+    fun `smart auto-reply JSON parser handles NO_REPLY, NORMAL, and persists smart human-first settings`() {
+        val noReply = GeminiRestClient.parseSmartAutoReplyJson(
+            rawText = """{"message_type":"NO_REPLY","should_reply":false,"decision_reason":"ধন্যবাদ জানিয়ে কথা শেষ করেছে","is_sensitive":false,"reply":""}""",
+            senderName = "Rahim",
+            incomingText = "অনেক ধন্যবাদ ভাই",
+            defaultDeferral = "অপেক্ষা করুন"
+        )
+        assertEquals("NO_REPLY", noReply.messageType)
+        assertFalse(noReply.shouldReply)
+        assertEquals("", noReply.replyText)
+        assertTrue(noReply.decisionReason.contains("ধন্যবাদ"))
+
+        val normalReply = GeminiRestClient.parseSmartAutoReplyJson(
+            rawText = """{"message_type":"NORMAL","should_reply":true,"decision_reason":"সময় জানতে চেয়েছে","is_sensitive":false,"reply":"বিকেল ৪টায় দেখা হবে।"}""",
+            senderName = "Rahim",
+            incomingText = "কয়টায় দেখা হবে?",
+            defaultDeferral = "অপেক্ষা করুন"
+        )
+        assertEquals("NORMAL", normalReply.messageType)
+        assertTrue(normalReply.shouldReply)
+        assertEquals("বিকেল ৪টায় দেখা হবে।", normalReply.replyText)
+
+        // Verify persistence of new human-first settings
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val prefs = PilotPreferences(context)
+        prefs.saveSettings(
+            PilotSettings(
+                autoReplyDelaySec = 30,
+                pauseAutoReplyWhenOwnerActive = true,
+                smartConversationClosingEnabled = true
+            )
+        )
+        val loaded = prefs.loadSettings()
+        assertEquals(30, loaded.autoReplyDelaySec)
+        assertTrue(loaded.pauseAutoReplyWhenOwnerActive)
+        assertTrue(loaded.smartConversationClosingEnabled)
+    }
 }
+

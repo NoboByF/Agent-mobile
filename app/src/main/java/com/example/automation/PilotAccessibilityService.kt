@@ -29,8 +29,10 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import com.example.data.AgentActivity
 import com.example.data.LogLevel
+import com.example.data.MessagingApp
 import com.example.data.PilotStateHub
 import com.example.data.SafetyGuardrails
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -70,7 +72,30 @@ class PilotAccessibilityService : AccessibilityService() {
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Live window tree is inspected on-demand by tool calls for zero idle CPU drain.
+        // Lightweight O(1) package/typing signal ONLY (no UI tree traversal) so AI knows when the
+        // human owner is actively inside a messaging app or typing a message and steps aside.
+        if (event == null || aiVisualReplyInProgress) return
+        val pkg = event.packageName?.toString()?.trim().orEmpty()
+        if (pkg.isBlank()) return
+
+        when (event.eventType) {
+            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
+                if (pkg != "com.android.systemui") {
+                    lastForegroundPackage = pkg
+                }
+                if (MessagingApp.fromPackage(pkg) != null) {
+                    lastOwnerInteractionByPkg[pkg] = System.currentTimeMillis()
+                }
+            }
+            AccessibilityEvent.TYPE_VIEW_TEXT_CHANGED,
+            AccessibilityEvent.TYPE_VIEW_CLICKED,
+            AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
+                if (MessagingApp.fromPackage(pkg) != null) {
+                    lastForegroundPackage = pkg
+                    lastOwnerInteractionByPkg[pkg] = System.currentTimeMillis()
+                }
+            }
+        }
     }
 
     override fun onInterrupt() {
@@ -1367,6 +1392,47 @@ class PilotAccessibilityService : AccessibilityService() {
     companion object {
         @Volatile
         var instance: PilotAccessibilityService? = null
+
+        @Volatile
+        var aiVisualReplyInProgress: Boolean = false
+
+        @Volatile
+        var lastForegroundPackage: String? = null
+
+        private val lastOwnerInteractionByPkg = ConcurrentHashMap<String, Long>()
+
+        fun isOwnerCurrentlyInPackage(packageName: String): Boolean {
+            if (packageName.isBlank()) return false
+            val liveRootPkg = runCatching { instance?.rootInActiveWindow?.packageName?.toString() }.getOrNull()
+            if (!liveRootPkg.isNullOrBlank()) {
+                if (liveRootPkg == packageName) return true
+                // If we got a definitive non-systemui active window and it's NOT this package, owner is elsewhere
+                if (liveRootPkg != "com.android.systemui") return false
+            }
+            return lastForegroundPackage == packageName
+        }
+
+        fun hasRecentOwnerActivityInPackage(
+            packageName: String,
+            withinMs: Long = 75_000L,
+            nowMs: Long = System.currentTimeMillis()
+        ): Boolean {
+            if (packageName.isBlank()) return false
+            if (isOwnerCurrentlyInPackage(packageName)) return true
+            val last = lastOwnerInteractionByPkg[packageName] ?: return false
+            return (nowMs - last) in 0L..withinMs
+        }
+
+        internal fun recordOwnerInteractionForTest(packageName: String, timestampMs: Long) {
+            lastForegroundPackage = packageName
+            lastOwnerInteractionByPkg[packageName] = timestampMs
+        }
+
+        internal fun clearOwnerActivityForTest() {
+            lastForegroundPackage = null
+            lastOwnerInteractionByPkg.clear()
+            aiVisualReplyInProgress = false
+        }
 
         fun setAlarmOrTimerWithContext(
             context: Context,

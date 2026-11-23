@@ -238,10 +238,56 @@ object PilotStateHub {
         }
     }
 
-    fun markMessageAutoReplied(recordId: String, replyText: String) {
+    fun markMessageAutoReplied(recordId: String, replyText: String, statusNote: String? = null) {
         _incomingMessages.update { current ->
             current.map { msg ->
-                if (msg.id == recordId) msg.copy(autoRepliedText = replyText) else msg
+                if (msg.id == recordId) {
+                    msg.copy(
+                        autoRepliedText = replyText,
+                        aiStatus = "REPLIED",
+                        aiStatusNote = statusNote ?: msg.aiStatusNote
+                    )
+                } else {
+                    msg
+                }
+            }
+        }
+    }
+
+    fun markMessageStatus(recordId: String, status: String?, note: String?) {
+        _incomingMessages.update { current ->
+            current.map { msg ->
+                if (msg.id == recordId) {
+                    msg.copy(
+                        aiStatus = status,
+                        aiStatusNote = note
+                    )
+                } else {
+                    msg
+                }
+            }
+        }
+    }
+
+    fun markWaitingMessagesForConversationStatus(
+        packageName: String,
+        senderName: String,
+        status: String,
+        note: String
+    ) {
+        val normPkg = packageName.trim().lowercase()
+        val normSender = senderName.trim().lowercase()
+        _incomingMessages.update { current ->
+            current.map { msg ->
+                val matchesPkg = msg.packageName.trim().lowercase() == normPkg
+                val matchesSender = normSender.isBlank() ||
+                    msg.senderName.trim().lowercase() == normSender ||
+                    msg.senderName.trim().lowercase().contains(normSender)
+                if (matchesPkg && matchesSender && msg.aiStatus == "WAITING") {
+                    msg.copy(aiStatus = status, aiStatusNote = note)
+                } else {
+                    msg
+                }
             }
         }
     }
@@ -252,7 +298,9 @@ object PilotStateHub {
                 if (msg.id == recordId) {
                     msg.copy(
                         generatedImagePath = imagePath,
-                        autoRepliedText = replyText ?: msg.autoRepliedText
+                        autoRepliedText = replyText ?: msg.autoRepliedText,
+                        aiStatus = "REPLIED",
+                        aiStatusNote = "AI ছবি তৈরি করেছে"
                     )
                 } else {
                     msg
@@ -304,7 +352,9 @@ object PilotStateHub {
                         isSensitive = true,
                         sensitivityReason = reason,
                         needsOwnerAnswer = true,
-                        ownerQuestion = ownerQuestion
+                        ownerQuestion = ownerQuestion,
+                        aiStatus = "SENSITIVE",
+                        aiStatusNote = reason ?: "আপনার সিদ্ধান্ত প্রয়োজন"
                     )
                 } else {
                     msg
@@ -320,7 +370,9 @@ object PilotStateHub {
                     msg.copy(
                         needsOwnerAnswer = false,
                         ownerResolvedReply = ownerReply,
-                        autoRepliedText = ownerReply
+                        autoRepliedText = ownerReply,
+                        aiStatus = "REPLIED",
+                        aiStatusNote = "আপনি নিজে উত্তর পাঠিয়েছেন"
                     )
                 } else {
                     msg

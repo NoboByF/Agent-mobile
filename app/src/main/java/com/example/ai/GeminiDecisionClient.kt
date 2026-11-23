@@ -61,13 +61,14 @@ data class DecisionBatchResult(
 )
 
 data class IncomingMessageDecision(
-    val category: String, // NORMAL | ABUSIVE | SPAM_NONSENSE | SENSITIVE_OWNER_ONLY | IMAGE_REQUEST
+    val category: String, // NORMAL | NO_REPLY | ABUSIVE | SPAM_NONSENSE | SENSITIVE_OWNER_ONLY | IMAGE_REQUEST
     val categoryConfidence: Double,
     val needsOwnerProb: Double,
     val answerableByPersonalDataProb: Double,
     val urgencyScore: Double,
     val latencyMs: Long,
-    val keyLabelUsed: String? = null
+    val keyLabelUsed: String? = null,
+    val needsReplyProb: Double = 1.0
 )
 
 data class OwnerVoiceIntentDecision(
@@ -294,8 +295,8 @@ object GeminiDecisionClient {
             append("Messaging App: ").append(appName).append('\n')
             append("Sender: ").append(senderName).append('\n')
             if (conversationHistory.isNotEmpty()) {
-                append("Recent Conversation History:\n")
-                conversationHistory.takeLast(6).forEach { append("- ").append(it).append('\n') }
+                append("Recent Conversation History (oldest to newest):\n")
+                conversationHistory.takeLast(12).forEach { append("- ").append(it).append('\n') }
             }
             if (shareableFacts.isNotEmpty()) {
                 append("Owner's Saved Personal Data (allowed to share automatically):\n")
@@ -310,14 +311,18 @@ object GeminiDecisionClient {
 
         val questions = linkedMapOf<String, DecisionQuestion>(
             "category" to DecisionQuestion.Choice(
-                instructions = "Classify the LATEST incoming message into the single most accurate category.",
+                instructions = "Read the Recent Conversation History and classify the LATEST incoming message into the single most accurate action category.",
                 criteria = linkedMapOf(
+                    "NO_REPLY" to "The conversation has naturally ended or NO reply is needed/expected — e.g., thank-you/welcome exchanges ('ধন্যবাদ', 'thanks', 'welcome'), acknowledgements ('আচ্ছা', 'ঠিক আছে', 'ok', 'hmm', 'বুঝেছি', 'got it'), farewells ('আল্লাহ হাফেজ', 'ভালো থাকবেন', 'bye', 'good night', 'পরে কথা হবে'), pure reactions/emojis, or passive statements/forwards where replying would create an endless back-and-forth loop.",
                     "ABUSIVE" to "Profanity, slurs, insults, verbal abuse, rudeness, or hostile scolding (e.g., Bengali/Banglish/English গালাগালি or বকাবাজি).",
-                    "SPAM_NONSENSE" to "Meaningless gibberish, random letters/emojis, trolling, or nonsensical spam (আবুল তাবুল).",
+                    "SPAM_NONSENSE" to "Meaningless gibberish, random keyboard mash, trolling, or nonsensical spam (আবুল তাবুল).",
                     "SENSITIVE_OWNER_ONLY" to "Strictly private, financial, or real-world personal commitment ONLY the human owner can answer (e.g., passwords, OTP, PIN, NID, sending money/loan/bKash/bank transfer, private live address/location NOT present in Owner's Saved Personal Data, urgent real-life emergency, or binding personal promises).",
                     "IMAGE_REQUEST" to "The sender is explicitly asking the assistant to generate, draw, or create a brand-new picture/image/artwork (e.g., 'একটা পাখির ছবি তৈরি করে দাও', 'draw a sunset image').",
-                    "NORMAL" to "Everything else: greetings, normal chat, questions, advice, poems (কবিতা), stories, jokes, study help, general knowledge, or personal questions already answered by Owner's Saved Personal Data."
+                    "NORMAL" to "A genuine message that EXPECTS a reply right now: fresh greetings starting a new conversation, questions, requests, active discussion, advice, poems (কবিতা), stories, jokes, study help, general knowledge, or personal questions answered by Owner's Saved Personal Data."
                 )
+            ),
+            "needs_reply" to DecisionQuestion.Noul(
+                instructions = "Based on the Recent Conversation History and LATEST Incoming Message, does this message genuinely need or expect a reply right now? Answer NO if the conversation is finished, if it is just thanks/welcome/ok/bye/acknowledgement/reaction, or if replying would keep an already-ended chat looping."
             ),
             "needs_owner" to DecisionQuestion.Noul(
                 instructions = "Does this message strictly require interrupting the human phone owner personally because an AI assistant cannot safely or accurately handle it using general knowledge or Owner's Saved Personal Data?"
@@ -328,7 +333,7 @@ object GeminiDecisionClient {
             "urgency" to DecisionQuestion.Score(
                 instructions = "Rate how urgent the sender's LATEST message is.",
                 criteria = listOf(
-                    "0: Casual chat, low urgency, greetings, jokes, or creative prompts.",
+                    "0: Casual chat, low urgency, greetings, closings, jokes, or creative prompts.",
                     "1: Normal question or moderate everyday request.",
                     "2: Urgent real-world situation, time-sensitive emergency, or critical financial/personal request."
                 )
@@ -344,7 +349,7 @@ object GeminiDecisionClient {
         ).map { batch ->
             val catAns = batch.choiceAnswers["category"]
             val normalizedCat = when (catAns?.choice?.uppercase(Locale.US)) {
-                "ABUSIVE", "SPAM_NONSENSE", "SENSITIVE_OWNER_ONLY", "IMAGE_REQUEST", "NORMAL" ->
+                "NO_REPLY", "ABUSIVE", "SPAM_NONSENSE", "SENSITIVE_OWNER_ONLY", "IMAGE_REQUEST", "NORMAL" ->
                     catAns.choice.uppercase(Locale.US)
                 else -> "NORMAL"
             }
@@ -355,7 +360,8 @@ object GeminiDecisionClient {
                 answerableByPersonalDataProb = batch.noulAnswers["answerable_by_personal_data"]?.probability ?: 0.0,
                 urgencyScore = batch.scoreAnswers["urgency"]?.score ?: 0.0,
                 latencyMs = batch.latencyMs,
-                keyLabelUsed = batch.keyLabelUsed
+                keyLabelUsed = batch.keyLabelUsed,
+                needsReplyProb = batch.noulAnswers["needs_reply"]?.probability ?: 1.0
             )
         }
     }

@@ -10,7 +10,8 @@ enum class ModerationAction {
     WARN_ABUSE,
     SILENT_IGNORE_ABUSE,
     AVOID_SPAM_ONCE,
-    SILENT_IGNORE_SPAM
+    SILENT_IGNORE_SPAM,
+    SILENT_CONVERSATION_ENDED
 }
 
 data class ModerationDecision(
@@ -78,7 +79,61 @@ object ChatModerationEngine {
     )
     private val REPEATED_SINGLE_CHAR_REGEX = Regex("(.)\\1{5,}")
     private val ABUL_TABUL_PHRASES = Regex(
-        "(?iu)^(হাহা+|হিহি+|হুহু+|আবুল\\s*তাবুল|ব্লা\\s*ব্লা+|blah+|lmao+|lol+|hmm+|hm+|ok+|k+|yo+|test+|testing+|\\.\\.\\.+|\\?+|!+)$"
+        "(?iu)^(হাহা+|হিহি+|হুহু+|আবুল\\s*তাবুল|ব্লা\\s*ব্লা+|blah+|lmao+|lol+|yo+|test+|testing+|\\.\\.\\.+|\\?+|!+)$"
+    )
+
+    // Question or explicit action/request words -> never swallow as a closing acknowledgement!
+    private val QUESTION_OR_REQUEST_REGEX = Regex(
+        "(?iu)([?؟]|\\b(how|what|when|where|why|who|which|can\\s+you|could\\s+you|would\\s+you|please\\s+(send|tell|give|help|write|make|draw|check)|tell\\s+me|send\\s+me|help\\s+me|need)\\b|কখন|কোথায়|কোথায়|কত|কেন|কিভাবে|কীভাবে|কেমন|পারবে|পারবেন|দাও|দেন|বলো|বলেন|করো|করেন|পাঠাও|পাঠান|লাগবে|দরকার|কবিতা|গল্প|ছবি|ইমেজ|টাকা|বিকাশ|নগদ|ঠিকানা|কী\\s*কর|কি\\s*কর)"
+    )
+
+    // Pure polite acknowledgement / closing reaction emojis (1..3 glyphs, distinct from spam floods like 😂😂😂😂)
+    private val PURE_ACK_REACTION_REGEX = Regex(
+        "^(?:\\s|👍[🏻-🏿]?|👌[🏻-🏿]?|🙏[🏻-🏿]?|❤️|❤|♥|♥️|🤝|✅|✔|✔️|😊|🙂|🫡|💐|🌹|🤲[🏻-🏿]?|✨|💯|👏[🏻-🏿]?)+$"
+    )
+
+    // Exact closing / thank-you / welcome / farewell / acknowledgement tokens (Bengali, Banglish, English)
+    private val CLOSING_PHRASES: Set<String> = setOf(
+        // Thank-you & welcome
+        "ধন্যবাদ", "ধন্নবাদ", "অনেক ধন্যবাদ", "অসংখ্য ধন্যবাদ", "আপনাকেও ধন্যবাদ", "তোমাকেও ধন্যবাদ",
+        "শুকরিয়া", "শুকরিয়া", "জাযাকাল্লাহ", "জাযাকাল্লাহু খাইরান", "জাজাকাল্লাহ",
+        "স্বাগতম", "ওয়েলকাম", "ওয়েলকাম", "কোনো ব্যাপার না", "কোন ব্যাপার না",
+        "কোনো সমস্যা নেই", "কোন সমস্যা নেই", "সমস্যা নেই",
+        "thanks", "thank", "thank you", "thank u", "thanks a lot", "thank you so much",
+        "thx", "ty", "tysm", "tnx", "tnq", "shukriya", "jazakallah", "jazakallah khair",
+        "welcome", "youre welcome", "you're welcome", "your welcome", "most welcome", "my pleasure",
+        "no problem", "np", "no worries", "mention not", "dont mention it", "don't mention it",
+        "its ok", "its okay", "it's ok", "it's okay", "dhonnobad", "dhonnyobad",
+        "kono somossa nei", "somossa nei", "kono bepar na",
+        // Acknowledgements
+        "আচ্ছা", "আচ্ছা ঠিক আছে", "ঠিক আছে", "ঠিকআছে", "ওকে", "ওকে ঠিক আছে",
+        "বুঝেছি", "বুঝলাম", "পেয়েছি", "পেয়েছি", "হুম", "হুঁ", "হু", "জ্বী", "জ্বি", "জি",
+        "হ্যাঁ ঠিক আছে", "হ্যা ঠিক আছে", "হইছে", "হয়েছে", "হয়েছে", "বেশ", "হবে", "চলে", "ভালো",
+        "ok", "okay", "okey", "okk", "okh", "k", "kk", "hmm", "hmmm", "hm",
+        "accha", "acha", "achha", "thik ache", "thik ase", "thk ache", "thikase",
+        "bujhechi", "bujhlam", "bujlam", "peyechi", "peyeci", "ji", "jee",
+        "done", "noted", "got it", "alright", "all right", "fine", "cool", "nice",
+        "great", "perfect", "sure", "right", "hoise", "hoyeche", "hobe", "besh", "good",
+        // Farewells & wrap-ups
+        "আল্লাহ হাফেজ", "খোদা হাফেজ", "ভালো থাকবেন", "ভালো থেকো", "ভালো থাকো",
+        "আপনিও ভালো থাকবেন", "তুমিও ভালো থেকো", "সুস্থ থাকবেন", "শুভ রাত্রি",
+        "টাটা", "বাই", "রাখলাম", "আসি", "পরে কথা হবে", "পরে কথা বলবো", "পরে নক দেবো", "পরে জানাবো",
+        "allah hafez", "allah hafiz", "khoda hafez",
+        "valo thakben", "valo theko", "valo thako", "bhalo thakben", "bhalo theko", "bhalo thako",
+        "take care", "tc", "bye", "byee", "byeee", "goodbye", "good bye", "tata",
+        "good night", "goodnight", "gn", "see you", "see ya", "cya",
+        "talk later", "ttyl", "pore kotha hobe", "pore kotha bolbo", "rakhlam"
+    )
+
+    private val POLITE_ADDRESS_FILLERS: Set<String> = setOf(
+        "ভাই", "ভাইয়া", "ভাইয়া", "আপু", "বন্ধু", "দোস্ত", "বস", "স্যার", "ম্যাডাম",
+        "আপনাকে", "আপনাকেও", "তোমাকে", "তোমাকেও", "আপনিও", "তুমিও", "অনেক", "অসংখ্য", "খুব", "এখন",
+        "bro", "bhai", "vai", "vaia", "bhaiyya", "apu", "sir", "boss", "dear", "friend",
+        "very", "so", "much", "a", "lot", "most", "you", "u", "too", "to", "now", "then"
+    )
+
+    private val CLOSING_REPLY_HINT_REGEX = Regex(
+        "(?iu)(ধন্যবাদ|স্বাগতম|ওয়েলকাম|ওয়েলকাম|আল্লাহ\\s*হাফেজ|খোদা\\s*হাফেজ|ভালো\\s*থাকবেন|ভালো\\s*থেকো|শুভ\\s*রাত্রি|পরে\\s*কথা\\s*হবে|আর\\s*কিছু\\s*লাগলে|thank\\s*you|thanks|welcome|allah\\s*hafez|take\\s*care|good\\s*night|goodbye|\\bbye\\b)"
     )
 
     fun isAbusiveText(text: String): Boolean {
@@ -134,16 +189,134 @@ object ChatModerationEngine {
     }
 
     /**
+     * Detects pure conversation closings, thank-you/welcome wrap-ups, polite acknowledgements,
+     * farewells, or single-tap reaction emojis so the AI stops cleanly instead of creating an
+     * endless "ধন্যবাদ -> ওয়েলকাম -> আচ্ছা -> ভালো থাকবেন" ping-pong loop!
+     */
+    fun evaluateConversationClosingLocally(
+        incomingText: String,
+        conversationHistory: List<String> = emptyList()
+    ): Pair<Boolean, String> {
+        val clean = incomingText.trim()
+        if (clean.isBlank()) return false to ""
+
+        // Never treat messages with a question or explicit request as a conversation closing!
+        if (QUESTION_OR_REQUEST_REGEX.containsMatchIn(clean)) {
+            return false to ""
+        }
+
+        // 1. Pure acknowledgement reaction emoji (e.g., 👍, 🙏, ❤️, 👌) up to 3 code points
+        val noSpaces = clean.replace(Regex("\\s+"), "")
+        val codePoints = noSpaces.codePointCount(0, noSpaces.length)
+        if (codePoints in 1..4 && PURE_ACK_REACTION_REGEX.matches(clean)) {
+            return true to "রিঅ্যাকশন ইমোজি — বাড়তি রিপ্লাই প্রয়োজন নেই"
+        }
+
+        // Only apply local closing shortcut to concise messages (long nuanced messages go to Gemini AI)
+        if (clean.length > 68) return false to ""
+
+        // Strip apostrophes cleanly (so "you're welcome" -> "youre welcome") and replace other punctuation/emojis with spaces
+        val stripped = clean
+            .lowercase()
+            .replace(Regex("['’`]+"), "")
+            .replace(Regex("(?:[.,!।;:\\-–—~\"()\\[\\]{}]|👍[🏻-🏿]?|👌[🏻-🏿]?|🙏[🏻-🏿]?|❤️|❤|♥|♥️|🤝|✅|✔|✔️|😊|🙂|🫡|💐|🌹|🤲[🏻-🏿]?|✨|💯|👏[🏻-🏿]?)+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (stripped.isBlank()) return false to ""
+
+        // 2. Exact match against known closing / thanks / welcome / farewell / acknowledgement phrases
+        if (stripped in CLOSING_PHRASES) {
+            return true to buildClosingReason(stripped)
+        }
+
+        // 3. Multi-phrase closing combinations (e.g. "আচ্ছা ধন্যবাদ ভাই", "ok thanks bye", "ঠিক আছে ভালো থাকবেন")
+        if (isCombinationOfClosingPhrases(stripped)) {
+            return true to buildClosingReason(stripped)
+        }
+
+        // 4. Anti-ping-pong check: if our previous AI reply was ALREADY a closing/thanks/goodbye,
+        // and the sender replies with a short non-question wrap-up (<= 40 chars) containing any closing keyword
+        val lastAiReply = conversationHistory.lastOrNull { it.startsWith("Me:") }?.removePrefix("Me:")?.trim().orEmpty()
+        if (lastAiReply.isNotBlank() &&
+            CLOSING_REPLY_HINT_REGEX.containsMatchIn(lastAiReply) &&
+            stripped.length <= 42 &&
+            CLOSING_REPLY_HINT_REGEX.containsMatchIn(stripped)
+        ) {
+            return true to "কথা আগেই শেষ হয়েছে — লুপ এড়াতে AI চুপ ছিল"
+        }
+
+        return false to ""
+    }
+
+    private fun isCombinationOfClosingPhrases(normalized: String): Boolean {
+        val tokens = normalized.split(' ').filter { it.isNotBlank() }
+        if (tokens.isEmpty() || tokens.size > 8) return false
+
+        var idx = 0
+        var matchedClosingCount = 0
+        while (idx < tokens.size) {
+            var matchedLen = 0
+            // Try longest 3-word, 2-word, 1-word phrase match from CLOSING_PHRASES
+            for (len in minOf(3, tokens.size - idx) downTo 1) {
+                val slice = tokens.subList(idx, idx + len).joinToString(" ")
+                if (slice in CLOSING_PHRASES) {
+                    matchedLen = len
+                    matchedClosingCount++
+                    break
+                }
+            }
+            if (matchedLen > 0) {
+                idx += matchedLen
+            } else if (tokens[idx] in POLITE_ADDRESS_FILLERS) {
+                idx += 1
+            } else {
+                return false
+            }
+        }
+        return matchedClosingCount >= 1
+    }
+
+    private fun buildClosingReason(stripped: String): String = when {
+        stripped.contains("ধন্যবাদ") || stripped.contains("thank") || stripped.contains("thx") ||
+            stripped.contains("shukriya") || stripped.contains("jazak") || stripped.contains("ধন্নবাদ") ||
+            stripped.contains("dhonnobad") ->
+            "ধন্যবাদ জানিয়ে কথা শেষ করেছে — বাড়তি রিপ্লাই প্রয়োজন নেই"
+        stripped.contains("welcome") || stripped.contains("স্বাগতম") || stripped.contains("ওয়েলকাম") ||
+            stripped.contains("ওয়েলকাম") || stripped.contains("সমস্যা নেই") || stripped.contains("no problem") ->
+            "সমাপনী শুভেচ্ছা — লুপ এড়াতে AI চুপ ছিল"
+        stripped.contains("হাফেজ") || stripped.contains("hafez") || stripped.contains("hafiz") ||
+            stripped.contains("bye") || stripped.contains("ভালো থাক") || stripped.contains("ভালো থেক") ||
+            stripped.contains("good night") || stripped.contains("শুভ রাত্রি") || stripped.contains("পরে কথা") ->
+            "বিদায়/সমাপ্তি মেসেজ — কথা শেষ হয়েছে"
+        else ->
+            "সম্মতি/কথা শেষ (\"${stripped.take(24)}\") — রিপ্লাই দরকার নেই"
+    }
+
+    /**
      * Fast pre-AI moderation check (Layer 1).
      * Note: Polite/meaningful messages ALWAYS return PROCEED_TO_AI even if the sender previously abused or spammed!
+     * Polite closings ("ধন্যবাদ", "আচ্ছা", "ঠিক আছে", "ok", "welcome", "আল্লাহ হাফেজ", "👍") return
+     * SILENT_CONVERSATION_ENDED instead of ever being misclassified as spam!
      */
     fun evaluateIncomingLocally(
         convKey: String,
         incomingText: String,
-        nowMs: Long = System.currentTimeMillis()
+        nowMs: Long = System.currentTimeMillis(),
+        conversationHistory: List<String> = emptyList(),
+        smartClosingEnabled: Boolean = true
     ): ModerationDecision {
         if (isAbusiveText(incomingText)) {
             return recordAbuseAndDecide(convKey, incomingText)
+        }
+        if (smartClosingEnabled) {
+            val (isClosing, reason) = evaluateConversationClosingLocally(incomingText, conversationHistory)
+            if (isClosing) {
+                return ModerationDecision(
+                    action = ModerationAction.SILENT_CONVERSATION_ENDED,
+                    replyText = "",
+                    reason = reason
+                )
+            }
         }
         if (isSpamOrNonsenseText(convKey, incomingText, nowMs)) {
             return recordSpamAndDecide(convKey, incomingText, nowMs)

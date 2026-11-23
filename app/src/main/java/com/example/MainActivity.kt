@@ -517,6 +517,9 @@ private fun LivePilotAppRoot(
                             onUpdatePersona = { viewModel.updateAutoReplyPersona(it) },
                             onToggleSensitiveGuard = { viewModel.updateSensitiveQuestionGuard(it) },
                             onToggleHandsFreeVoiceEscalation = { viewModel.updateHandsFreeVoiceEscalation(it) },
+                            onUpdateAutoReplyDelaySec = { viewModel.updateAutoReplyDelaySec(it) },
+                            onTogglePauseWhenOwnerActive = { viewModel.updatePauseWhenOwnerActive(it) },
+                            onToggleSmartConversationClosing = { viewModel.updateSmartConversationClosing(it) },
                             onToggleApp = { viewModel.toggleMessagingApp(it) },
                             onOpenNotificationSettings = {
                                 runCatching {
@@ -525,6 +528,7 @@ private fun LivePilotAppRoot(
                             },
                             onOpenChat = { viewModel.openChatFromFeed(it) },
                             onQuickAiReply = { viewModel.sendQuickAiReplyFromFeed(it) },
+                            onCancelPendingAiReply = { viewModel.cancelPendingAutoReplyFromFeed(it) },
                             onTemplateReply = { msg, replyText ->
                                 viewModel.sendTemplateDirectReply(msg, replyText)
                             },

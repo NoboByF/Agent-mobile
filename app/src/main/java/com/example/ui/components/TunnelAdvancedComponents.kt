@@ -68,8 +68,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.filled.AddCircleOutline
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.WarningAmber
@@ -81,6 +84,7 @@ import com.example.tunnel.InternetCheckResult
 import com.example.tunnel.InternetCheckStatus
 import com.example.tunnel.PipelineStageState
 import com.example.tunnel.SshWebSocketTransport
+import com.example.tunnel.TunnelDiagnosis
 import com.example.tunnel.TunnelPipelineStages
 import com.example.tunnel.TunnelTransportMode
 import com.example.tunnel.TunnelTuningConfig
@@ -1253,3 +1257,213 @@ fun TunnelPipelineAndInternetBanner(
         }
     }
 }
+
+@Composable
+fun SmartDiagnosisAutoFixCard(
+    diagnosis: TunnelDiagnosis,
+    isAutoFixing: Boolean,
+    autoFixStatusText: String?,
+    onAutoFixClick: () -> Unit,
+    onImportConfigClick: () -> Unit,
+    onEditProfileClick: () -> Unit
+) {
+    val palette = StudioTheme.colors
+
+    StudioCardContainer(
+        borderColor = SignalRed.copy(alpha = 0.45f),
+        contentPadding = 16.dp
+    ) {
+        // Header: Why it failed
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(SignalRed.copy(alpha = 0.14f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.WarningAmber,
+                    contentDescription = "কেন কানেক্ট হয়নি",
+                    tint = SignalRed,
+                    modifier = Modifier.size(22.dp)
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "কেন কানেক্ট হয়নি?",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = SignalRed
+                )
+                Text(
+                    text = diagnosis.titleBn,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = palette.inkPrimary
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+        Text(
+            text = diagnosis.explanationBn,
+            style = MaterialTheme.typography.bodySmall,
+            color = palette.inkSecondary
+        )
+
+        // Compact Check Report
+        if (diagnosis.checks.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = palette.surfaceSubtle,
+                border = BorderStroke(1.dp, palette.outline)
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    diagnosis.checks.forEach { row ->
+                        val rowColor = if (row.passed) EmeraldGreen else SignalRed
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (row.passed) Icons.Filled.CheckCircle else Icons.Filled.Cancel,
+                                contentDescription = if (row.passed) "সফল" else "ব্যর্থ",
+                                tint = rowColor,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = row.label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = palette.inkPrimary
+                                )
+                                Text(
+                                    text = row.detail,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    color = if (row.passed) EmeraldGreen else palette.inkSecondary,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Primary 1-Tap Auto-Fix & Reconnect Button
+        Button(
+            onClick = onAutoFixClick,
+            enabled = !isAutoFixing,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(52.dp)
+                .testTag("hc_auto_fix_button"),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = CobaltBlue)
+        ) {
+            if (isAutoFixing) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.2.dp,
+                    color = Color.White
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = autoFixStatusText ?: "অটো সমাধান খোঁজা হচ্ছে...",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Filled.AutoFixHigh,
+                    contentDescription = "অটো সমাধান",
+                    tint = Color.White,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = diagnosis.autoFixActionLabelBn,
+                    color = Color.White,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+
+        // Secondary Quick Actions when new config or credential update helps
+        if (diagnosis.requiresNewConfig) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onImportConfigClick,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("hc_diag_import_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, palette.outline)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.AddCircleOutline,
+                        contentDescription = "নতুন কনফিগ",
+                        tint = palette.cobaltAccent,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "নতুন কনফিগ",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.inkPrimary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                OutlinedButton(
+                    onClick = onEditProfileClick,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("hc_diag_edit_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, palette.outline)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Edit,
+                        contentDescription = "অ্যাকাউন্ট এডিট",
+                        tint = palette.cobaltAccent,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "অ্যাকাউন্ট এডিট",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.inkPrimary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        }
+    }
+}
+

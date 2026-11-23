@@ -155,6 +155,9 @@ class PilotPreferences(context: Context) {
             ).orEmpty().ifBlank { PilotSettings.DEFAULT_AUTO_REPLY_PERSONA },
             sensitiveQuestionGuardEnabled = prefs.getBoolean(KEY_SENSITIVE_GUARD_ENABLED, true),
             handsFreeVoiceEscalationEnabled = prefs.getBoolean(KEY_HANDS_FREE_VOICE_ESCALATION, true),
+            autoReplyDelaySec = prefs.getInt(KEY_AUTO_REPLY_DELAY_SEC, 15).coerceIn(3, 60),
+            pauseAutoReplyWhenOwnerActive = prefs.getBoolean(KEY_PAUSE_WHEN_OWNER_ACTIVE, true),
+            smartConversationClosingEnabled = prefs.getBoolean(KEY_SMART_CONVERSATION_CLOSING, true),
             enabledMessagingApps = enabledApps
         )
     }
@@ -209,6 +212,9 @@ class PilotPreferences(context: Context) {
             .putString(KEY_AUTO_REPLY_PERSONA, settings.autoReplyPersona.trim())
             .putBoolean(KEY_SENSITIVE_GUARD_ENABLED, settings.sensitiveQuestionGuardEnabled)
             .putBoolean(KEY_HANDS_FREE_VOICE_ESCALATION, settings.handsFreeVoiceEscalationEnabled)
+            .putInt(KEY_AUTO_REPLY_DELAY_SEC, settings.autoReplyDelaySec.coerceIn(3, 60))
+            .putBoolean(KEY_PAUSE_WHEN_OWNER_ACTIVE, settings.pauseAutoReplyWhenOwnerActive)
+            .putBoolean(KEY_SMART_CONVERSATION_CLOSING, settings.smartConversationClosingEnabled)
             .putStringSet(KEY_ENABLED_APPS, settings.enabledMessagingApps.map { it.name }.toSet())
             .apply()
     }
@@ -431,6 +437,9 @@ class PilotPreferences(context: Context) {
             .put("autoReplyPersona", settings.autoReplyPersona)
             .put("sensitiveQuestionGuardEnabled", settings.sensitiveQuestionGuardEnabled)
             .put("handsFreeVoiceEscalationEnabled", settings.handsFreeVoiceEscalationEnabled)
+            .put("autoReplyDelaySec", settings.autoReplyDelaySec.coerceIn(3, 60))
+            .put("pauseAutoReplyWhenOwnerActive", settings.pauseAutoReplyWhenOwnerActive)
+            .put("smartConversationClosingEnabled", settings.smartConversationClosingEnabled)
             .put("enabledMessagingApps", JSONArray(settings.enabledMessagingApps.map { it.name }))
 
         root.put("settings", settingsObj)
@@ -511,6 +520,9 @@ class PilotPreferences(context: Context) {
                     .ifBlank { PilotSettings.DEFAULT_AUTO_REPLY_PERSONA },
                 sensitiveQuestionGuardEnabled = sObj.optBoolean("sensitiveQuestionGuardEnabled", true),
                 handsFreeVoiceEscalationEnabled = sObj.optBoolean("handsFreeVoiceEscalationEnabled", true),
+                autoReplyDelaySec = sObj.optInt("autoReplyDelaySec", 15).coerceIn(3, 60),
+                pauseAutoReplyWhenOwnerActive = sObj.optBoolean("pauseAutoReplyWhenOwnerActive", true),
+                smartConversationClosingEnabled = sObj.optBoolean("smartConversationClosingEnabled", true),
                 enabledMessagingApps = enabledApps
             )
             saveSettings(restoredSettings)
@@ -562,6 +574,9 @@ class PilotPreferences(context: Context) {
         private const val KEY_AUTO_REPLY_PERSONA = "auto_reply_persona"
         private const val KEY_SENSITIVE_GUARD_ENABLED = "sensitive_question_guard_enabled"
         private const val KEY_HANDS_FREE_VOICE_ESCALATION = "hands_free_voice_escalation_enabled"
+        private const val KEY_AUTO_REPLY_DELAY_SEC = "auto_reply_delay_sec"
+        private const val KEY_PAUSE_WHEN_OWNER_ACTIVE = "pause_when_owner_active_enabled"
+        private const val KEY_SMART_CONVERSATION_CLOSING = "smart_conversation_closing_enabled"
         private const val KEY_DELETED_MODELS = "deleted_models_set"
         private const val KEY_PERSONAL_DATA_JSON = "personal_data_json"
         private const val KEY_ENABLED_APPS = "enabled_messaging_apps"
