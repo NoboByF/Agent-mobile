@@ -15,7 +15,7 @@ data class HttpCustomTunnelProfile(
     val pubKey: String,
     val bannerNote: String,
     val rawJson: String,
-    val dnsServer: String = "8.8.8.8"
+    val dnsServer: String = "auto"
 ) {
     companion object {
         val DEFAULT_PROFILES = listOf(
@@ -31,7 +31,7 @@ data class HttpCustomTunnelProfile(
                 nameserver = "nsts3.me-link.uk",
                 pubKey = "75148e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220",
                 bannerNote = "য়ে যাবে",
-                dnsServer = "8.8.8.8",
+                dnsServer = "auto",
                 rawJson = """
                     {
                       "config": {
@@ -77,18 +77,18 @@ data class HttpCustomTunnelProfile(
                 """.trimIndent()
             ),
             HttpCustomTunnelProfile(
-                id = "hc_grameenphone_gp_2",
-                name = "Fahim - gp-bd.me-link.uk (GP Zero-Rated Pro)",
-                operatorName = "Grameenphone (GP)",
-                host = "gp-bd.me-link.uk",
+                id = "hc_cloudflare_slowdns_2",
+                name = "Fahim - nsts3.me-link.uk (Cloudflare DNS)",
+                operatorName = "GP, Robi & Airtel (1.1.1.1)",
+                host = "nsts3.me-link.uk",
                 port = 22,
-                username = "gp_user77",
-                password = "GPpass9921X",
+                username = "jssh_9qknqpo",
+                password = "RgNax1QLRtx68x",
                 protocol = "SlowDns + SSH",
-                nameserver = "ns1.grameenphone.com",
-                pubKey = "48b29e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220",
-                bannerNote = "গ্রামীণফোন ফ্রি ডাটা বাইপাস",
-                dnsServer = "8.8.8.8",
+                nameserver = "nsts3.me-link.uk",
+                pubKey = "75148e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220",
+                bannerNote = "Cloudflare 1.1.1.1 + Carrier Fallback",
+                dnsServer = "1.1.1.1",
                 rawJson = """
                     {
                       "config": {
@@ -96,7 +96,7 @@ data class HttpCustomTunnelProfile(
                         "g": {
                           "a": "unlocked",
                           "w": true,
-                          "x": { "h": "গ্রামীণফোন ফ্রি ডাটা বাইপাস", "s": "custom", "v": 1 }
+                          "x": { "h": "Cloudflare 1.1.1.1 + Carrier Fallback", "s": "custom", "v": 1 }
                         },
                         "l": "Fahim",
                         "m": "kill_switch",
@@ -106,26 +106,26 @@ data class HttpCustomTunnelProfile(
                       "decoded": {
                         "config": {
                           "protection": {
-                            "tunnelBanner": { "h": "GP ", "s": "custom", "v": 1 }
+                            "tunnelBanner": { "h": "ফ্রি ", "s": "custom", "v": 1 }
                           }
                         },
                         "profiles": {
                           "s0": {
                             "configJson": {
-                              "dns": "8.8.8.8",
+                              "dns": "1.1.1.1",
                               "methods": ["SlowDns"],
-                              "ns": "ns1.grameenphone.com",
-                              "pubKey": "48b29e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220",
-                              "serverAddress": "gp-bd.me-link.uk:22",
+                              "ns": "nsts3.me-link.uk",
+                              "pubKey": "75148e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220",
+                              "serverAddress": "nsts3.me-link.uk:22",
                               "slowDnsMode": "auto",
                               "timeout": 30
                             },
-                            "host": "gp-bd.me-link.uk",
-                            "name": "Fahim - gp-bd.me-link.uk (GP Zero-Rated Pro)",
-                            "password": "GPpass9921X",
+                            "host": "nsts3.me-link.uk",
+                            "name": "Fahim - nsts3.me-link.uk (Cloudflare DNS)",
+                            "password": "RgNax1QLRtx68x",
                             "port": 22,
                             "protocolType": "SSH",
-                            "username": "gp_user77"
+                            "username": "jssh_9qknqpo"
                           }
                         }
                       },
@@ -160,7 +160,7 @@ data class HttpCustomTunnelProfile(
                 ?: s0?.optString("f")?.takeIf { it.isNotBlank() }
                 ?: "secret"
             val ns = configJson?.optString("ns")?.takeIf { it.isNotBlank() } ?: host
-            val dns = configJson?.optString("dns")?.takeIf { it.isNotBlank() } ?: "8.8.8.8"
+            val dns = configJson?.optString("dns")?.takeIf { it.isNotBlank() } ?: "auto"
             val pubKey = configJson?.optString("pubKey", "") ?: ""
             val banner = decoded?.optJSONObject("config")?.optJSONObject("protection")
                 ?.optJSONObject("tunnelBanner")?.optString("h")?.takeIf { it.isNotBlank() }

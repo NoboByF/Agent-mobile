@@ -20,7 +20,7 @@ data class TunUdpPacket(
 )
 
 /**
- * Pure Kotlin RFC-1035 DNS wire-format codec and IPv4/UDP TUN packet processor.
+ * Pure Kotlin RFC-1035 / RFC-6891 (EDNS0) DNS wire-format codec and IPv4/UDP TUN packet processor.
  */
 object DnsPacketCodec {
 
@@ -31,10 +31,13 @@ object DnsPacketCodec {
     fun buildDnsQueryPacket(
         domain: String,
         queryType: Int = TYPE_A,
-        transactionId: Int = 0x1A2B
+        transactionId: Int = 0x1A2B,
+        includeEdns0: Boolean = true,
+        ednsUdpPayloadSize: Int = 1232
     ): ByteArray {
         val out = ByteArrayOutputStream()
-        // Header: ID (2), Flags (2: standard recursive query 0x0100), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        val arCount = if (includeEdns0) 1 else 0
+        // Header: ID (2), Flags (2: standard recursive query 0x0100), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT
         out.write((transactionId ushr 8) and 0xFF)
         out.write(transactionId and 0xFF)
         out.write(0x01)
@@ -45,8 +48,8 @@ object DnsPacketCodec {
         out.write(0x00)
         out.write(0x00)
         out.write(0x00)
-        out.write(0x00)
-        out.write(0x00)
+        out.write((arCount ushr 8) and 0xFF)
+        out.write(arCount and 0xFF)
 
         // QNAME labels
         val labels = domain.trim().trimEnd('.').split('.').filter { it.isNotEmpty() }
@@ -63,6 +66,22 @@ object DnsPacketCodec {
         out.write(queryType and 0xFF)
         out.write(0x00)
         out.write(0x01)
+
+        // RFC-6891 EDNS0 OPT pseudo-record (required by SlowDNS / dnstt authoritative servers)
+        if (includeEdns0) {
+            val clampedSize = ednsUdpPayloadSize.coerceIn(512, 4096)
+            out.write(0x00) // NAME: root
+            out.write(0x00)
+            out.write(0x29) // TYPE: OPT (41)
+            out.write((clampedSize ushr 8) and 0xFF) // CLASS: requestor's UDP payload size
+            out.write(clampedSize and 0xFF)
+            out.write(0x00) // Extended RCODE
+            out.write(0x00) // EDNS version 0
+            out.write(0x00) // Z flags high
+            out.write(0x00) // Z flags low
+            out.write(0x00) // RDLENGTH high
+            out.write(0x00) // RDLENGTH low
+        }
         return out.toByteArray()
     }
 
@@ -179,7 +198,6 @@ object DnsPacketCodec {
         packet[7] = 0x00.toByte()
         packet[8] = 64.toByte()   // TTL
         packet[9] = 17.toByte()   // UDP
-        // Checksum [10..11] filled below
         System.arraycopy(srcIp, 0, packet, 12, 4)
         System.arraycopy(dstIp, 0, packet, 16, 4)
 
@@ -195,7 +213,6 @@ object DnsPacketCodec {
         packet[u + 3] = (dstPort and 0xFF).toByte()
         packet[u + 4] = ((udpLen ushr 8) and 0xFF).toByte()
         packet[u + 5] = (udpLen and 0xFF).toByte()
-        // Payload
         System.arraycopy(payload, 0, packet, u + 8, payload.size)
 
         val udpChecksum = computeUdpChecksum(srcIp, dstIp, packet, u, udpLen)

@@ -114,7 +114,7 @@ enum class PilotTab(
         testTag = "nav_tab_explorer"
     ),
     HTTP_CUSTOM(
-        label = "HTTP Custom",
+        label = "Tunnel",
         selectedIcon = Icons.Filled.VpnKey,
         unselectedIcon = Icons.Outlined.VpnKey,
         testTag = "nav_tab_http_custom"

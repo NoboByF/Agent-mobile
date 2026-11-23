@@ -968,7 +968,7 @@ class ExampleRobolectricTest {
         assertEquals("jssh_9qknqpo", sample.username)
         assertEquals("RgNax1QLRtx68x", sample.password)
         assertEquals("nsts3.me-link.uk", sample.nameserver)
-        assertEquals("8.8.8.8", sample.dnsServer)
+        assertEquals("auto", sample.dnsServer)
         assertEquals("75148e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220", sample.pubKey)
         assertEquals("য়ে যাবে", sample.bannerNote)
 
@@ -978,20 +978,42 @@ class ExampleRobolectricTest {
         assertEquals("nsts3.me-link.uk", p.host)
         assertEquals("jssh_9qknqpo", p.username)
         assertEquals("8.8.8.8", p.dnsServer)
+
+        // Verify Auto DNS prioritizes carrier DNS servers ahead of public resolvers
+        val autoOrder = com.example.tunnel.HttpCustomTunnelStateHolder.buildCandidateDnsList(
+            configuredDns = "auto",
+            carrierDnsList = listOf("182.160.120.11", "182.160.120.12")
+        )
+        assertEquals("182.160.120.11", autoOrder.first().first)
+        assertTrue(autoOrder.first().second)
+        assertTrue(autoOrder.any { it.first == "1.1.1.1" })
+        assertTrue(autoOrder.any { it.first == "8.8.8.8" })
+
+        // Explicit DNS puts configured IP first while keeping carrier DNS as immediate fallback
+        val explicitOrder = com.example.tunnel.HttpCustomTunnelStateHolder.buildCandidateDnsList(
+            configuredDns = "1.1.1.1",
+            carrierDnsList = listOf("182.160.120.11")
+        )
+        assertEquals("1.1.1.1", explicitOrder[0].first)
+        assertEquals("182.160.120.11", explicitOrder[1].first)
+        assertTrue(explicitOrder[1].second)
     }
 
     @Test
-    fun `dns packet codec builds RFC1035 query, parses response, and wraps IPv4 UDP TUN packets accurately`() {
+    fun `dns packet codec builds RFC1035 plus EDNS0 query and wraps IPv4 UDP TUN packets accurately`() {
         val query = com.example.tunnel.DnsPacketCodec.buildDnsQueryPacket(
             domain = "nsts3.me-link.uk",
-            queryType = com.example.tunnel.DnsPacketCodec.TYPE_A,
-            transactionId = 0x4242
+            queryType = com.example.tunnel.DnsPacketCodec.TYPE_TXT,
+            transactionId = 0x4242,
+            includeEdns0 = true
         )
-        assertTrue(query.size > 16)
+        assertTrue(query.size > 27)
         assertEquals(0x42, query[0].toInt() and 0xFF)
         assertEquals(0x42, query[1].toInt() and 0xFF)
+        // ARCOUNT should be 1 for EDNS0 OPT record
+        assertEquals(1, ((query[10].toInt() and 0xFF) shl 8) or (query[11].toInt() and 0xFF))
 
-        val srcIp = byteArrayOf(8, 8, 8, 8)
+        val srcIp = byteArrayOf(10, 88, 0, 1)
         val dstIp = byteArrayOf(10, 88, 0, 2)
         val tunPacket = com.example.tunnel.DnsPacketCodec.buildTunUdpResponsePacket(
             srcIp = srcIp,

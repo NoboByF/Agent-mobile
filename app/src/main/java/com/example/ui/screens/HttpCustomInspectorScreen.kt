@@ -26,8 +26,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AddCircleOutline
@@ -35,6 +37,7 @@ import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Dns
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.NetworkCheck
 import androidx.compose.material.icons.filled.Person
@@ -49,6 +52,8 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -101,6 +106,13 @@ import com.example.ui.theme.StudioTheme
 import com.example.ui.theme.WarmAmber
 import kotlinx.coroutines.launch
 
+private val DNS_PRESET_OPTIONS = listOf(
+    "auto" to "Auto (Carrier)",
+    "1.1.1.1" to "1.1.1.1",
+    "8.8.8.8" to "8.8.8.8",
+    "9.9.9.9" to "9.9.9.9"
+)
+
 @Composable
 fun HttpCustomInspectorScreen(
     onShowNotice: (String) -> Unit,
@@ -125,6 +137,7 @@ fun HttpCustomInspectorScreen(
 
     var showImportDialog by rememberSaveable { mutableStateOf(false) }
     var importJsonText by rememberSaveable { mutableStateOf("") }
+    var showEditDialog by rememberSaveable { mutableStateOf(false) }
     var isProbingOnly by remember { mutableStateOf(false) }
     var pendingProfileForVpn by remember { mutableStateOf<HttpCustomTunnelProfile?>(null) }
 
@@ -220,6 +233,18 @@ fun HttpCustomInspectorScreen(
                 TextButton(onClick = { showImportDialog = false }) {
                     Text("বাতিল")
                 }
+            }
+        )
+    }
+
+    if (showEditDialog) {
+        EditTunnelProfileDialog(
+            profile = activeProfile,
+            onDismiss = { showEditDialog = false },
+            onSave = { updated ->
+                HttpCustomTunnelStateHolder.updateProfile(updated)
+                showEditDialog = false
+                onShowNotice("✓ প্রফাইল আপডেট হয়েছে: ${updated.host}:${updated.port}")
             }
         )
     }
@@ -370,7 +395,9 @@ fun HttpCustomInspectorScreen(
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = "${activeProfile.host}:${activeProfile.port} • ${activeProfile.protocol}",
+                                text = tunnelState.activeDnsServer?.let { dns ->
+                                    "DNS: $dns • ${tunnelState.activeDnsTransport ?: "UDP:53"}"
+                                } ?: "${activeProfile.host}:${activeProfile.port} • DNS: ${activeProfile.dnsServer}",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = palette.inkSecondary,
                                 maxLines = 1,
@@ -419,7 +446,38 @@ fun HttpCustomInspectorScreen(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Quick DNS Mode Selector Chips (Auto Carrier DNS solves 8.8.8.8 timeout on GP/Robi/Airtel)
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(DNS_PRESET_OPTIONS, key = { it.first }) { (value, label) ->
+                        val selected = activeProfile.dnsServer.equals(value, ignoreCase = true)
+                        FilterChip(
+                            selected = selected,
+                            onClick = {
+                                HttpCustomTunnelStateHolder.updateProfileDns(activeProfile.id, value)
+                                onShowNotice("DNS মোড নির্বাচিত: $label")
+                            },
+                            label = {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = palette.cobaltSoft,
+                                selectedLabelColor = palette.cobaltAccent
+                            ),
+                            modifier = Modifier.testTag("hc_dns_chip_$value")
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
 
                 // Primary Connect / Disconnect Button
                 Button(
@@ -514,9 +572,9 @@ fun HttpCustomInspectorScreen(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = when {
-                                profile.id == "hc_gp_robi_airtel_1" -> "GP, Robi & Airtel"
-                                profile.id == "hc_grameenphone_gp_2" -> "GP Pro"
+                            text = when (profile.id) {
+                                "hc_gp_robi_airtel_1" -> "GP/Robi/Airtel (Auto)"
+                                "hc_cloudflare_slowdns_2" -> "Cloudflare 1.1.1.1"
                                 else -> profile.name.take(18)
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -539,16 +597,30 @@ fun HttpCustomInspectorScreen(
                         text = activeProfile.name,
                         style = MaterialTheme.typography.titleMedium,
                         color = palette.inkPrimary,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.weight(1f),
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
                     )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    StatusPillBadge(
-                        label = activeProfile.operatorName,
-                        accentColor = WarmAmber,
-                        containerColor = WarmAmber.copy(alpha = 0.15f),
-                        leadingDot = false
-                    )
+                    IconButton(
+                        onClick = { showEditDialog = true },
+                        modifier = Modifier
+                            .size(48.dp)
+                            .testTag("hc_edit_profile_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Edit,
+                            contentDescription = "Edit Profile",
+                            tint = palette.cobaltAccent,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
+                StatusPillBadge(
+                    label = activeProfile.operatorName,
+                    accentColor = WarmAmber,
+                    containerColor = WarmAmber.copy(alpha = 0.15f),
+                    leadingDot = false
+                )
                 Spacer(modifier = Modifier.height(10.dp))
 
                 TunnelDetailRow(
@@ -578,7 +650,11 @@ fun HttpCustomInspectorScreen(
                 TunnelDetailRow(
                     icon = Icons.Filled.Dns,
                     label = "DNS Resolver",
-                    value = "${activeProfile.dnsServer}:53",
+                    value = if (activeProfile.dnsServer.equals("auto", ignoreCase = true)) {
+                        "Auto (Carrier + Public)"
+                    } else {
+                        "${activeProfile.dnsServer}:53"
+                    },
                     palette = palette
                 )
                 TunnelDetailRow(
@@ -627,13 +703,22 @@ fun HttpCustomInspectorScreen(
                         onClick = {
                             if (isProbingOnly) return@OutlinedButton
                             isProbingOnly = true
-                            HttpCustomTunnelStateHolder.appendLog("Running ping probe for ${activeProfile.host}...")
+                            HttpCustomTunnelStateHolder.appendLog(
+                                "Probing Carrier & Public DNS for ${activeProfile.nameserver}..."
+                            )
                             coroutineScope.launch {
-                                val result = HttpCustomTunnelStateHolder.probeNetworkReachability(activeProfile)
+                                val result = HttpCustomTunnelStateHolder.probeNetworkReachability(
+                                    profile = activeProfile,
+                                    context = context
+                                )
                                 isProbingOnly = false
                                 val summary = buildString {
-                                    if (result.dnsReachable) append("DNS OK (${result.dnsRttMs}ms)")
-                                    else append("DNS Fail")
+                                    if (result.dnsReachable) {
+                                        val tag = if (result.workingDnsIsCarrier) "Carrier" else "DNS"
+                                        append("$tag ${result.workingDnsServer} OK (${result.dnsRttMs}ms)")
+                                    } else {
+                                        append("DNS Blocked/Offline")
+                                    }
                                     append(" • ")
                                     if (result.sshReachable) append("SSH OK (${result.sshRttMs}ms)")
                                     else append("SSH Filtered")
@@ -641,6 +726,8 @@ fun HttpCustomInspectorScreen(
                                 HttpCustomTunnelStateHolder.updateState {
                                     it.copy(
                                         dnsRttMs = result.dnsRttMs ?: result.sshRttMs,
+                                        activeDnsServer = result.workingDnsServer ?: it.activeDnsServer,
+                                        activeDnsTransport = result.workingDnsTransport ?: it.activeDnsTransport,
                                         sshBanner = result.sshBanner ?: it.sshBanner
                                     )
                                 }
@@ -721,19 +808,19 @@ fun HttpCustomInspectorScreen(
 
                     if (tunnelState.logs.isEmpty()) {
                         Text(
-                            text = "কানেক্ট বাটনে ট্যাপ করলে এখানে রিয়েল-টাইম DNS/SSH লগ দেখাবে।",
+                            text = "কানেক্ট বাটনে ট্যাপ করলে এখানে ক্যারিয়ার DNS অটো-ডিটেকশন ও রিয়েল-টাইম লগ দেখাবে।",
                             style = MaterialTheme.typography.bodySmall,
                             color = ConsoleTextMuted,
                             fontFamily = JetBrainsMonoFontFamily
                         )
                     } else {
                         Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            tunnelState.logs.takeLast(12).forEach { line ->
+                            tunnelState.logs.takeLast(14).forEach { line ->
                                 Text(
                                     text = line,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = if (line.contains("OK") || line.contains("active")) EmeraldGreen
-                                    else if (line.contains("failed") || line.contains("denied")) SignalRed
+                                    else if (line.contains("failed") || line.contains("denied") || line.contains("Timeout")) SignalRed
                                     else ConsoleTextPrimary,
                                     fontFamily = JetBrainsMonoFontFamily
                                 )
@@ -744,6 +831,109 @@ fun HttpCustomInspectorScreen(
             }
         }
     }
+}
+
+@Composable
+private fun EditTunnelProfileDialog(
+    profile: HttpCustomTunnelProfile,
+    onDismiss: () -> Unit,
+    onSave: (HttpCustomTunnelProfile) -> Unit
+) {
+    var host by remember(profile.id) { mutableStateOf(profile.host) }
+    var port by remember(profile.id) { mutableStateOf(profile.port.toString()) }
+    var nameserver by remember(profile.id) { mutableStateOf(profile.nameserver) }
+    var dnsServer by remember(profile.id) { mutableStateOf(profile.dnsServer) }
+    var username by remember(profile.id) { mutableStateOf(profile.username) }
+    var password by remember(profile.id) { mutableStateOf(profile.password) }
+    var pubKey by remember(profile.id) { mutableStateOf(profile.pubKey) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("প্রফাইল এডিট করুন") },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = host,
+                    onValueChange = { host = it },
+                    label = { Text("Server Host") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = port,
+                    onValueChange = { port = it.filter { ch -> ch.isDigit() } },
+                    label = { Text("Port (22)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = nameserver,
+                    onValueChange = { nameserver = it },
+                    label = { Text("SlowDNS Nameserver (NS)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = dnsServer,
+                    onValueChange = { dnsServer = it },
+                    label = { Text("DNS Resolver (auto / IP)") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it },
+                    label = { Text("SSH Username") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = { Text("SSH Password") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = pubKey,
+                    onValueChange = { pubKey = it },
+                    label = { Text("SlowDNS Public Key") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    val cleanHost = host.trim().ifBlank { profile.host }
+                    val cleanPort = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: profile.port
+                    onSave(
+                        profile.copy(
+                            host = cleanHost,
+                            port = cleanPort,
+                            nameserver = nameserver.trim().ifBlank { cleanHost },
+                            dnsServer = dnsServer.trim().ifBlank { "auto" },
+                            username = username.trim(),
+                            password = password.trim(),
+                            pubKey = pubKey.trim()
+                        )
+                    )
+                },
+                modifier = Modifier.testTag("hc_save_profile_button")
+            ) {
+                Text("সেভ করুন")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("বাতিল")
+            }
+        }
+    )
 }
 
 @Composable

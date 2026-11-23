@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -24,11 +25,15 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.io.DataInputStream
+import java.io.DataOutputStream
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
 
 class HttpCustomVpnService : VpnService() {
 
@@ -47,7 +52,7 @@ class HttpCustomVpnService : VpnService() {
 
             ACTION_CONNECT, null -> {
                 val profile = extractProfile(intent)
-                startForegroundWithStatus("সংযোগ স্থাপন করা হচ্ছে: ${profile.host}...")
+                startForegroundWithStatus("কানেক্ট হচ্ছে: ${profile.host}...")
                 startTunnelConnection(profile)
                 return START_STICKY
             }
@@ -77,7 +82,7 @@ class HttpCustomVpnService : VpnService() {
         val name = intent?.getStringExtra(EXTRA_PROFILE_NAME)?.takeIf { it.isNotBlank() }
             ?: "HTTP Custom ($host)"
         val ns = intent?.getStringExtra(EXTRA_NAMESERVER)?.takeIf { it.isNotBlank() } ?: host
-        val dns = intent?.getStringExtra(EXTRA_DNS_SERVER)?.takeIf { it.isNotBlank() } ?: "8.8.8.8"
+        val dns = intent?.getStringExtra(EXTRA_DNS_SERVER)?.takeIf { it.isNotBlank() } ?: "auto"
 
         return HttpCustomTunnelProfile(
             id = id.ifBlank { "hc_active" },
@@ -108,7 +113,12 @@ class HttpCustomVpnService : VpnService() {
                 phase = TunnelConnectionPhase.CONNECTING,
                 activeProfileId = profile.id,
                 activeProfileName = profile.name,
-                statusDetail = "SlowDNS (UDP:53) ও SSH (${profile.host}:${profile.port}) যাচাই হচ্ছে...",
+                statusDetail = "সিম/নেটওয়ার্ক DNS ও SlowDNS রুট খোঁজা হচ্ছে...",
+                activeDnsServer = null,
+                activeDnsTransport = null,
+                dnsRttMs = null,
+                sshBanner = null,
+                resolvedIp = null,
                 lastError = null,
                 txBytes = 0L,
                 rxBytes = 0L,
@@ -116,35 +126,49 @@ class HttpCustomVpnService : VpnService() {
                 connectedSinceMs = null
             )
         }
-        HttpCustomTunnelStateHolder.appendLog("Connecting profile: ${profile.name}")
-        HttpCustomTunnelStateHolder.appendLog("Probing DNS ${profile.dnsServer}:53 for NS ${profile.nameserver}...")
+        HttpCustomTunnelStateHolder.appendLog("Connecting: ${profile.name} (mode=${profile.dnsServer})")
 
         connectJob = serviceScope.launch {
+            // Discover active physical network & carrier DNS BEFORE establishing TUN
+            val (underlyingNetwork, carrierDnsList) =
+                HttpCustomTunnelStateHolder.discoverUnderlyingNetworkAndDns(this@HttpCustomVpnService)
+
+            if (carrierDnsList.isNotEmpty()) {
+                HttpCustomTunnelStateHolder.appendLog("Carrier/System DNS detected: ${carrierDnsList.joinToString(", ")}")
+            } else {
+                HttpCustomTunnelStateHolder.appendLog("No carrier DNS reported; probing public resolvers...")
+            }
+
             val probe = HttpCustomTunnelStateHolder.probeNetworkReachability(
                 profile = profile,
+                context = this@HttpCustomVpnService,
+                underlyingNetworkOverride = underlyingNetwork,
+                carrierDnsOverride = carrierDnsList,
                 protectUdp = { sock -> protect(sock) },
                 protectTcp = { tcp -> protect(tcp) }
             )
 
-            if (probe.dnsReachable) {
-                val resolvedLabel = probe.resolvedIps.firstOrNull() ?: "Resolved"
-                HttpCustomTunnelStateHolder.appendLog("UDP DNS OK (${probe.dnsRttMs} ms) -> $resolvedLabel")
-            } else {
-                HttpCustomTunnelStateHolder.appendLog("UDP DNS probe failed")
+            probe.testedResolvers.forEach { res ->
+                val tag = if (res.isCarrierDns) "Carrier" else "Public"
+                if (res.reachable) {
+                    HttpCustomTunnelStateHolder.appendLog("OK [$tag] ${res.serverIp} (${res.transport}) ${res.rttMs} ms")
+                } else {
+                    HttpCustomTunnelStateHolder.appendLog("Timeout [$tag] ${res.serverIp} (${res.transport})")
+                }
             }
 
             if (probe.sshReachable) {
-                HttpCustomTunnelStateHolder.appendLog("TCP ${profile.host}:${profile.port} OK (${probe.sshRttMs} ms) [${probe.sshBanner}]")
-            } else {
-                HttpCustomTunnelStateHolder.appendLog("TCP ${profile.host}:${profile.port} unreachable (${probe.errorSummary ?: "timeout"})")
+                HttpCustomTunnelStateHolder.appendLog("OK SSH ${profile.host}:${profile.port} (${probe.sshRttMs} ms) [${probe.sshBanner}]")
             }
 
             if (!probe.dnsReachable && !probe.sshReachable) {
-                val errText = probe.errorSummary ?: "নেটওয়ার্ক সংযোগ পাওয়া যায়নি (ইন্টারনেট চালু আছে কিনা দেখুন)"
+                val errText = probe.errorSummary
+                    ?: "কোনো DNS বা SSH রেসপন্স পাওয়া যায়নি। মোবাইল ডাটা/ওয়াই-ফাই চালু আছে কিনা দেখুন।"
                 HttpCustomTunnelStateHolder.updateState { current ->
                     current.copy(
                         phase = TunnelConnectionPhase.ERROR,
                         statusDetail = "সংযোগ ব্যর্থ হয়েছে",
+                        dnsRttMs = null,
                         lastError = errText,
                         connectedSinceMs = null
                     )
@@ -155,14 +179,21 @@ class HttpCustomVpnService : VpnService() {
                 return@launch
             }
 
-            // Validate numeric IPv4 DNS address for VpnService Builder
-            val numericDns = resolveNumericIpv4(profile.dnsServer) ?: "8.8.8.8"
+            val upstreamDnsIp = probe.workingDnsServer
+                ?: carrierDnsList.firstOrNull()
+                ?: "1.1.1.1"
+            val preferTcpUpstream = probe.workingDnsTransport == "TCP:53"
+
             val builder = Builder()
                 .setSession(profile.name)
                 .setMtu(1500)
-                .addAddress("10.88.0.2", 32)
-                .addDnsServer(numericDns)
-                .addRoute(numericDns, 32)
+                .addAddress(HttpCustomTunnelStateHolder.VIRTUAL_TUN_CLIENT_IP, 32)
+                .addDnsServer(HttpCustomTunnelStateHolder.VIRTUAL_TUN_DNS_IP)
+                .addRoute(HttpCustomTunnelStateHolder.VIRTUAL_TUN_DNS_IP, 32)
+
+            if (underlyingNetwork != null) {
+                runCatching { builder.setUnderlyingNetworks(arrayOf(underlyingNetwork)) }
+            }
 
             val established = runCatching { builder.establish() }.getOrNull()
             if (established == null) {
@@ -182,10 +213,15 @@ class HttpCustomVpnService : VpnService() {
             }
 
             tunInterface = established
+            val dnsLabel = if (probe.workingDnsIsCarrier) {
+                "Carrier DNS ($upstreamDnsIp)"
+            } else {
+                upstreamDnsIp
+            }
             val modeLabel = when {
-                probe.sshReachable && probe.dnsReachable -> "সংযুক্ত • SSH + SlowDNS (VPN সক্রিয়)"
+                probe.sshReachable && probe.dnsReachable -> "সংযুক্ত • SSH + SlowDNS ($dnsLabel)"
                 probe.sshReachable -> "সংযুক্ত • Direct SSH (VPN সক্রিয়)"
-                else -> "সংযুক্ত • SlowDNS UDP:53 টানেল সক্রিয়"
+                else -> "সংযুক্ত • SlowDNS (${probe.workingDnsTransport ?: "UDP:53"} • $dnsLabel)"
             }
 
             HttpCustomTunnelStateHolder.updateState { current ->
@@ -194,27 +230,47 @@ class HttpCustomVpnService : VpnService() {
                     activeProfileId = profile.id,
                     activeProfileName = profile.name,
                     statusDetail = modeLabel,
+                    activeDnsServer = dnsLabel,
+                    activeDnsTransport = probe.workingDnsTransport ?: "UDP:53",
                     dnsRttMs = probe.dnsRttMs ?: probe.sshRttMs,
-                    sshBanner = probe.sshBanner ?: "SlowDNS UDP:53 Ready",
+                    sshBanner = probe.sshBanner ?: "SlowDNS ${probe.workingDnsTransport ?: "UDP:53"} Active",
                     resolvedIp = probe.resolvedIps.firstOrNull(),
                     connectedSinceMs = System.currentTimeMillis(),
                     lastError = null
                 )
             }
-            HttpCustomTunnelStateHolder.appendLog("VPN TUN active: 10.88.0.2/32 -> DNS $numericDns")
-            updateNotification("সংযুক্ত: ${profile.host} (${probe.dnsRttMs ?: probe.sshRttMs ?: 0} ms)")
+            HttpCustomTunnelStateHolder.appendLog(
+                "VPN TUN active: ${HttpCustomTunnelStateHolder.VIRTUAL_TUN_CLIENT_IP}/32 -> $upstreamDnsIp (${probe.workingDnsTransport ?: "UDP:53"})"
+            )
+            updateNotification("সংযুক্ত: $dnsLabel (${probe.dnsRttMs ?: probe.sshRttMs ?: 0} ms)")
 
-            launchPacketForwarder(established, numericDns)
-            launchKeepaliveMonitor(profile)
+            launchPacketForwarder(
+                tun = established,
+                upstreamDnsIp = upstreamDnsIp,
+                preferTcp = preferTcpUpstream,
+                underlyingNetwork = underlyingNetwork
+            )
+            launchKeepaliveMonitor(
+                profile = profile,
+                upstreamDnsIp = upstreamDnsIp,
+                preferTcp = preferTcpUpstream,
+                underlyingNetwork = underlyingNetwork
+            )
         }
     }
 
-    private fun launchPacketForwarder(tun: ParcelFileDescriptor, fallbackDns: String) {
+    private fun launchPacketForwarder(
+        tun: ParcelFileDescriptor,
+        upstreamDnsIp: String,
+        preferTcp: Boolean,
+        underlyingNetwork: Network?
+    ) {
         packetLoopJob = serviceScope.launch {
             val fd = tun.fileDescriptor
             val input = FileInputStream(fd)
             val output = FileOutputStream(fd)
             val buffer = ByteArray(4096)
+            val upstreamAddr = runCatching { InetAddress.getByName(upstreamDnsIp) }.getOrNull() ?: return@launch
 
             try {
                 while (isActive) {
@@ -226,50 +282,37 @@ class HttpCustomVpnService : VpnService() {
                     }
 
                     val udpPacket = DnsPacketCodec.parseTunUdpPacket(buffer, bytesRead) ?: continue
-                    val targetIp = runCatching { InetAddress.getByAddress(udpPacket.dstIp) }
-                        .getOrElse { InetAddress.getByName(fallbackDns) }
-
                     HttpCustomTunnelStateHolder.updateState { current ->
                         current.copy(txBytes = current.txBytes + udpPacket.payload.size)
                     }
 
-                    // Forward UDP DNS query asynchronously so TUN reading stays responsive
                     launch(Dispatchers.IO) {
-                        runCatching {
-                            DatagramSocket().use { sock ->
-                                protect(sock)
-                                sock.soTimeout = 4000
-                                sock.send(
-                                    DatagramPacket(
-                                        udpPacket.payload,
-                                        udpPacket.payload.size,
-                                        targetIp,
-                                        udpPacket.dstPort
-                                    )
-                                )
-                                val replyBuf = ByteArray(2048)
-                                val replyPacket = DatagramPacket(replyBuf, replyBuf.size)
-                                sock.receive(replyPacket)
-                                val replyPayload = replyBuf.copyOfRange(0, replyPacket.length)
+                        val replyPayload = forwardDnsQuery(
+                            payload = udpPacket.payload,
+                            upstreamAddr = upstreamAddr,
+                            port = udpPacket.dstPort,
+                            preferTcp = preferTcp,
+                            underlyingNetwork = underlyingNetwork
+                        ) ?: return@launch
 
-                                val tunReply = DnsPacketCodec.buildTunUdpResponsePacket(
-                                    srcIp = udpPacket.dstIp,
-                                    dstIp = udpPacket.srcIp,
-                                    srcPort = udpPacket.dstPort,
-                                    dstPort = udpPacket.srcPort,
-                                    payload = replyPayload
-                                )
-                                synchronized(output) {
-                                    output.write(tunReply)
-                                    output.flush()
-                                }
-                                HttpCustomTunnelStateHolder.updateState { current ->
-                                    current.copy(
-                                        rxBytes = current.rxBytes + replyPayload.size,
-                                        dnsPacketsHandled = current.dnsPacketsHandled + 1
-                                    )
-                                }
+                        val tunReply = DnsPacketCodec.buildTunUdpResponsePacket(
+                            srcIp = udpPacket.dstIp,
+                            dstIp = udpPacket.srcIp,
+                            srcPort = udpPacket.dstPort,
+                            dstPort = udpPacket.srcPort,
+                            payload = replyPayload
+                        )
+                        synchronized(output) {
+                            runCatching {
+                                output.write(tunReply)
+                                output.flush()
                             }
+                        }
+                        HttpCustomTunnelStateHolder.updateState { current ->
+                            current.copy(
+                                rxBytes = current.rxBytes + replyPayload.size,
+                                dnsPacketsHandled = current.dnsPacketsHandled + 1
+                            )
                         }
                     }
                 }
@@ -279,36 +322,100 @@ class HttpCustomVpnService : VpnService() {
         }
     }
 
-    private fun launchKeepaliveMonitor(profile: HttpCustomTunnelProfile) {
+    private fun forwardDnsQuery(
+        payload: ByteArray,
+        upstreamAddr: InetAddress,
+        port: Int,
+        preferTcp: Boolean,
+        underlyingNetwork: Network?
+    ): ByteArray? {
+        if (!preferTcp) {
+            val udpReply = forwardViaUdp(payload, upstreamAddr, port, underlyingNetwork)
+            if (udpReply != null) return udpReply
+        }
+        return forwardViaTcp(payload, upstreamAddr, port, underlyingNetwork)
+            ?: if (preferTcp) forwardViaUdp(payload, upstreamAddr, port, underlyingNetwork) else null
+    }
+
+    private fun forwardViaUdp(
+        payload: ByteArray,
+        upstreamAddr: InetAddress,
+        port: Int,
+        underlyingNetwork: Network?
+    ): ByteArray? = runCatching {
+        DatagramSocket().use { sock ->
+            protect(sock)
+            if (underlyingNetwork != null) {
+                runCatching { underlyingNetwork.bindSocket(sock) }
+            }
+            sock.soTimeout = 3200
+            sock.send(DatagramPacket(payload, payload.size, upstreamAddr, port))
+            val replyBuf = ByteArray(2048)
+            val replyPacket = DatagramPacket(replyBuf, replyBuf.size)
+            sock.receive(replyPacket)
+            replyBuf.copyOfRange(0, replyPacket.length)
+        }
+    }.getOrNull()
+
+    private fun forwardViaTcp(
+        payload: ByteArray,
+        upstreamAddr: InetAddress,
+        port: Int,
+        underlyingNetwork: Network?
+    ): ByteArray? = runCatching {
+        Socket().use { tcp ->
+            protect(tcp)
+            if (underlyingNetwork != null) {
+                runCatching { underlyingNetwork.bindSocket(tcp) }
+            }
+            tcp.connect(InetSocketAddress(upstreamAddr, port), 3200)
+            tcp.soTimeout = 3200
+            val dos = DataOutputStream(tcp.getOutputStream())
+            dos.writeShort(payload.size)
+            dos.write(payload)
+            dos.flush()
+
+            val dis = DataInputStream(tcp.getInputStream())
+            val len = dis.readUnsignedShort()
+            if (len in 12..4096) {
+                val out = ByteArray(len)
+                dis.readFully(out)
+                out
+            } else {
+                null
+            }
+        }
+    }.getOrNull()
+
+    private fun launchKeepaliveMonitor(
+        profile: HttpCustomTunnelProfile,
+        upstreamDnsIp: String,
+        preferTcp: Boolean,
+        underlyingNetwork: Network?
+    ) {
         keepaliveJob = serviceScope.launch {
+            val upstreamAddr = runCatching { InetAddress.getByName(upstreamDnsIp) }.getOrNull() ?: return@launch
+            val queryDomain = profile.nameserver.ifBlank { profile.host }
             while (isActive) {
-                delay(12_000L)
+                delay(15_000L)
                 if (!isActive) break
-                val ping = HttpCustomTunnelStateHolder.probeNetworkReachability(
-                    profile = profile,
-                    protectUdp = { sock -> protect(sock) },
-                    protectTcp = { tcp -> protect(tcp) }
+                val txId = (System.currentTimeMillis() and 0xFFFFL).toInt()
+                val query = DnsPacketCodec.buildDnsQueryPacket(
+                    domain = queryDomain,
+                    queryType = DnsPacketCodec.TYPE_TXT,
+                    transactionId = txId,
+                    includeEdns0 = true
                 )
-                val rtt = ping.dnsRttMs ?: ping.sshRttMs
-                if (rtt != null) {
+                val t0 = System.currentTimeMillis()
+                val reply = forwardDnsQuery(query, upstreamAddr, 53, preferTcp, underlyingNetwork)
+                if (reply != null) {
+                    val rtt = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
                     HttpCustomTunnelStateHolder.updateState { current ->
-                        current.copy(
-                            dnsRttMs = rtt,
-                            sshBanner = ping.sshBanner ?: current.sshBanner
-                        )
+                        current.copy(dnsRttMs = rtt)
                     }
                 }
             }
         }
-    }
-
-    private fun resolveNumericIpv4(hostOrIp: String): String? {
-        val clean = hostOrIp.trim()
-        val ipv4Regex = Regex("""^\d{1,3}(\.\d{1,3}){3}$""")
-        if (ipv4Regex.matches(clean)) return clean
-        return runCatching {
-            InetAddress.getAllByName(clean).firstOrNull { it.address.size == 4 }?.hostAddress
-        }.getOrNull()
     }
 
     private fun disconnectAndStop(reason: String) {
@@ -317,6 +424,8 @@ class HttpCustomVpnService : VpnService() {
             current.copy(
                 phase = TunnelConnectionPhase.DISCONNECTED,
                 statusDetail = "সংযোগ বিচ্ছিন্ন (Disconnected)",
+                activeDnsServer = null,
+                activeDnsTransport = null,
                 connectedSinceMs = null,
                 lastError = null
             )
