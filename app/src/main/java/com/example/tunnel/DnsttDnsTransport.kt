@@ -321,7 +321,7 @@ class DnsttPacketTransport(
      * Returns detailed wire RCODE/timeout diagnostics for every tested path.
      */
     fun verifyDnsttServerReachable(
-        timeoutMs: Int = 2500,
+        timeoutMs: Int = 3600,
         candidateResolverIps: List<String> = listOf(resolverIp),
         directServerIp: String? = null
     ): DnsttProbeResult {
@@ -336,21 +336,30 @@ class DnsttPacketTransport(
             val ednsBytes: Int
         )
 
+        // Prioritize IPv4 carrier DNS (e.g. GP 192.0.0.1) ahead of IPv6 (2400:c600:...) for SlowDNS TXT stability
+        val orderedIps = candidateResolverIps
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .sortedBy { if (it.contains(':')) 1 else 0 }
+
         val attempts = buildList {
-            for (ip in candidateResolverIps.distinct()) {
+            for (ip in orderedIps) {
                 if (transportType == "DoH:443") {
                     add(ProbeAttempt("DoH($ip)", ip, "DoH:443", true, 512))
                 } else {
                     add(ProbeAttempt("Carrier($ip,EDNS512)", ip, "UDP:53", true, 512))
+                    add(ProbeAttempt("Carrier($ip,EDNS1232)", ip, "UDP:53", true, 1232))
                     add(ProbeAttempt("Carrier($ip,NoEDNS)", ip, "UDP:53", false, 512))
                 }
             }
-            if (!directServerIp.isNullOrBlank() && directServerIp !in candidateResolverIps) {
+            if (!directServerIp.isNullOrBlank() && directServerIp !in orderedIps) {
                 add(ProbeAttempt("Direct($directServerIp:53)", directServerIp, "UDP:53", true, 512))
                 add(ProbeAttempt("Direct($directServerIp:53,NoEDNS)", directServerIp, "UDP:53", false, 512))
             }
             if (transportType != "DoH:443") {
-                add(ProbeAttempt("TCP:53(${candidateResolverIps.firstOrNull() ?: resolverIp})", candidateResolverIps.firstOrNull() ?: resolverIp, "TCP:53", true, 512))
+                val tcpIp = orderedIps.firstOrNull() ?: resolverIp
+                add(ProbeAttempt("TCP:53($tcpIp)", tcpIp, "TCP:53", true, 512))
             }
         }
 

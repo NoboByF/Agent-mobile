@@ -65,6 +65,7 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.filled.Cancel
@@ -195,6 +196,7 @@ fun GpCarrierStatusCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = palette.inkSecondary
                 )
+                Spacer(modifier = Modifier.width(10.dp))
                 Text(
                     text = dnsSummary,
                     style = MaterialTheme.typography.labelSmall,
@@ -202,7 +204,9 @@ fun GpCarrierStatusCard(
                     fontWeight = FontWeight.SemiBold,
                     color = palette.inkPrimary,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(1f)
                 )
             }
         }
@@ -672,8 +676,13 @@ fun EditTunnelProfileDialog(
     onDismiss: () -> Unit,
     onSave: (HttpCustomTunnelProfile) -> Unit
 ) {
+    var isWebSocketSsh by remember(profile.id) { mutableStateOf(profile.isWebSocketSsh) }
+    var useTls by remember(profile.id) { mutableStateOf(profile.useTls) }
     var host by remember(profile.id) { mutableStateOf(profile.host) }
     var port by remember(profile.id) { mutableStateOf(profile.port.toString()) }
+    var sniHost by remember(profile.id) { mutableStateOf(profile.sniHost) }
+    var bugHost by remember(profile.id) { mutableStateOf(profile.bugHost) }
+    var wsPath by remember(profile.id) { mutableStateOf(profile.wsPath) }
     var nameserver by remember(profile.id) { mutableStateOf(profile.nameserver) }
     var dnsServer by remember(profile.id) { mutableStateOf(profile.dnsServer) }
     var username by remember(profile.id) { mutableStateOf(profile.username) }
@@ -688,31 +697,33 @@ fun EditTunnelProfileDialog(
                 modifier = Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = !isWebSocketSsh,
+                        onClick = { isWebSocketSsh = false },
+                        label = { Text("SlowDNS + SSH") }
+                    )
+                    FilterChip(
+                        selected = isWebSocketSsh,
+                        onClick = { isWebSocketSsh = true },
+                        label = { Text("SSH WebSocket") }
+                    )
+                }
+
                 OutlinedTextField(
                     value = host,
                     onValueChange = { host = it },
-                    label = { Text("Server Host") },
+                    label = { Text("Server Host (e.g. nl1.wssht.to)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 OutlinedTextField(
                     value = port,
                     onValueChange = { port = it.filter { ch -> ch.isDigit() } },
-                    label = { Text("Port (22)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = nameserver,
-                    onValueChange = { nameserver = it },
-                    label = { Text("SlowDNS Nameserver (NS)") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                OutlinedTextField(
-                    value = dnsServer,
-                    onValueChange = { dnsServer = it },
-                    label = { Text("DNS Resolver (auto / IP)") },
+                    label = { Text(if (isWebSocketSsh) "Port (443 / 80 / 8080)" else "Port (22)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -730,29 +741,91 @@ fun EditTunnelProfileDialog(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                OutlinedTextField(
-                    value = pubKey,
-                    onValueChange = { pubKey = it },
-                    label = { Text("SlowDNS Public Key") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
+
+                if (isWebSocketSsh) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "SSL/TLS Encryption (Port 443)",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Switch(checked = useTls, onCheckedChange = { useTls = it })
+                    }
+                    OutlinedTextField(
+                        value = sniHost,
+                        onValueChange = { sniHost = it },
+                        label = { Text("SNI / Bug Host (e.g. www.grameenphone.com)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = bugHost,
+                        onValueChange = { bugHost = it },
+                        label = { Text("CDN / Bug IP (Optional)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = wsPath,
+                        onValueChange = { wsPath = it },
+                        label = { Text("WebSocket Path (/)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = nameserver,
+                        onValueChange = { nameserver = it },
+                        label = { Text("SlowDNS Nameserver (NS)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = dnsServer,
+                        onValueChange = { dnsServer = it },
+                        label = { Text("DNS Resolver (auto / IP)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = pubKey,
+                        onValueChange = { pubKey = it },
+                        label = { Text("SlowDNS Public Key") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
             }
         },
         confirmButton = {
             Button(
                 onClick = {
                     val cleanHost = host.trim().ifBlank { profile.host }
-                    val cleanPort = port.toIntOrNull()?.takeIf { it in 1..65535 } ?: profile.port
+                    val cleanPort = port.toIntOrNull()?.takeIf { it in 1..65535 }
+                        ?: if (isWebSocketSsh) (if (useTls) 443 else 80) else 22
                     onSave(
                         profile.copy(
                             host = cleanHost,
                             port = cleanPort,
+                            protocol = if (isWebSocketSsh) {
+                                if (useTls) "SSH WebSocket (SSL/TLS)" else "SSH WebSocket (HTTP)"
+                            } else {
+                                "SlowDns + SSH"
+                            },
                             nameserver = nameserver.trim().ifBlank { cleanHost },
                             dnsServer = dnsServer.trim().ifBlank { "auto" },
                             username = username.trim(),
                             password = password.trim(),
-                            pubKey = pubKey.trim()
+                            pubKey = pubKey.trim(),
+                            isWebSocketSsh = isWebSocketSsh,
+                            useTls = useTls,
+                            sniHost = sniHost.trim(),
+                            bugHost = bugHost.trim(),
+                            wsPath = wsPath.trim().ifBlank { "/" }
                         )
                     )
                 },
@@ -776,6 +849,8 @@ fun TunnelPipelineAndInternetBanner(
     internetCheck: InternetCheckResult,
     localProxyPort: Int?,
     isTunnelActive: Boolean,
+    isWebSocketMode: Boolean = false,
+    carrierLabel: String = "Carrier DNS",
     onCheckInternetNow: () -> Unit
 ) {
     val palette = StudioTheme.colors
@@ -797,13 +872,23 @@ fun TunnelPipelineAndInternetBanner(
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // 5-Stage Live Pipeline Strip (wrapped cleanly so all 5 stages stay visible)
-        val stageItems = listOf(
-            "GP DNS" to stages.carrierDns,
-            "SlowDNS" to stages.slowDnsServer,
-            "Noise+SMUX" to stages.noiseSmux,
-            "SSH Auth" to stages.sshAuth,
-            "Internet" to stages.internetCheck
-        )
+        val stageItems = if (isWebSocketMode) {
+            listOf(
+                carrierLabel to stages.carrierDns,
+                "WS / TLS" to stages.slowDnsServer,
+                "Upgrade 101" to stages.noiseSmux,
+                "SSH Auth" to stages.sshAuth,
+                "Internet" to stages.internetCheck
+            )
+        } else {
+            listOf(
+                carrierLabel to stages.carrierDns,
+                "SlowDNS" to stages.slowDnsServer,
+                "Noise+SMUX" to stages.noiseSmux,
+                "SSH Auth" to stages.sshAuth,
+                "Internet" to stages.internetCheck
+            )
+        }
         FlowRow(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp),

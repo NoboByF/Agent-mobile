@@ -871,7 +871,7 @@ object HttpCustomTunnelStateHolder {
         }
 
         val connectTarget = resolvedIps.firstOrNull()
-        if (!connectTarget.isNullOrBlank()) {
+        if (!profile.isWebSocketSsh && !connectTarget.isNullOrBlank()) {
             runCatching {
                 Socket().use { tcp ->
                     protectTcp?.invoke(tcp)

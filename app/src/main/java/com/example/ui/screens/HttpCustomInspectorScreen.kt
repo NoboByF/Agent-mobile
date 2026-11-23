@@ -336,7 +336,7 @@ fun HttpCustomInspectorScreen(
                         color = palette.inkPrimary
                     )
                     Text(
-                        text = "গ্রামীণফোন SlowDNS + DoH 443 + SSH অ্যাডভান্সড কানেক্টর",
+                        text = "GP, Robi ও Airtel • SlowDNS + SSH WebSocket (443/80)",
                         style = MaterialTheme.typography.bodySmall,
                         color = palette.inkSecondary
                     )
@@ -543,6 +543,8 @@ fun HttpCustomInspectorScreen(
                         internetCheck = tunnelState.internetCheck,
                         localProxyPort = tunnelState.localProxyPort,
                         isTunnelActive = isConnected,
+                        isWebSocketMode = activeProfile.isWebSocketSsh,
+                        carrierLabel = if (carrierSnapshot.isGrameenphone) "GP DNS" else "Carrier DNS",
                         onCheckInternetNow = {
                             coroutineScope.launch {
                                 val res = HttpCustomTunnelStateHolder.runManualInternetCheck(context)
@@ -655,8 +657,10 @@ fun HttpCustomInspectorScreen(
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
                             text = when (profile.id) {
-                                "hc_gp_robi_airtel_1" -> "GP Auto Pro"
-                                "hc_cloudflare_slowdns_2" -> "GP Cloudflare 1.1.1.1"
+                                "hc_gp_robi_airtel_1" -> "Robi/GP SlowDNS"
+                                "hc_sshocean_nl1_ws_tls" -> "sshOcean WS 443"
+                                "hc_sshocean_nl1_gp_sni" -> "GP SNI WS 443"
+                                "hc_cloudflare_slowdns_2" -> "SlowDNS 1.1.1.1"
                                 else -> profile.name.take(18)
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -708,21 +712,42 @@ fun HttpCustomInspectorScreen(
                 TunnelDetailRow(Icons.Filled.Router, "Server Host & Port", "${activeProfile.host}:${activeProfile.port}", palette)
                 TunnelDetailRow(Icons.Filled.Person, "SSH Username", activeProfile.username, palette)
                 TunnelDetailRow(Icons.Filled.Key, "SSH Password", activeProfile.password, palette)
-                TunnelDetailRow(Icons.Filled.NetworkCheck, "SlowDNS Nameserver", activeProfile.nameserver, palette)
-                TunnelDetailRow(
-                    Icons.Filled.Dns,
-                    "DNS Resolver",
-                    if (activeProfile.dnsServer.equals("auto", ignoreCase = true)) "GP Auto (Carrier + DoH)"
-                    else "${activeProfile.dnsServer}:53",
-                    palette
-                )
-                TunnelDetailRow(
-                    Icons.Filled.Security,
-                    "Public Key (PubKey)",
-                    activeProfile.pubKey.take(28).ifBlank { "None" } +
-                        if (activeProfile.pubKey.length > 28) "..." else "",
-                    palette
-                )
+                if (activeProfile.isWebSocketSsh) {
+                    TunnelDetailRow(
+                        Icons.Filled.Security,
+                        "Protocol",
+                        if (activeProfile.useTls) "SSH WebSocket (SSL/TLS 443 + HTTP 80)" else "SSH WebSocket (HTTP 80/8080)",
+                        palette
+                    )
+                    TunnelDetailRow(
+                        Icons.Filled.NetworkCheck,
+                        "SNI / Wildcard",
+                        activeProfile.sniHost.ifBlank { activeProfile.host },
+                        palette
+                    )
+                    TunnelDetailRow(
+                        Icons.Filled.Dns,
+                        "WebSocket Path",
+                        activeProfile.wsPath.ifBlank { "/" },
+                        palette
+                    )
+                } else {
+                    TunnelDetailRow(Icons.Filled.NetworkCheck, "SlowDNS Nameserver", activeProfile.nameserver, palette)
+                    TunnelDetailRow(
+                        Icons.Filled.Dns,
+                        "DNS Resolver",
+                        if (activeProfile.dnsServer.equals("auto", ignoreCase = true)) "GP Auto (Carrier + DoH)"
+                        else "${activeProfile.dnsServer}:53",
+                        palette
+                    )
+                    TunnelDetailRow(
+                        Icons.Filled.Security,
+                        "Public Key (PubKey)",
+                        activeProfile.pubKey.take(28).ifBlank { "None" } +
+                            if (activeProfile.pubKey.length > 28) "..." else "",
+                        palette
+                    )
+                }
                 TunnelDetailRow(Icons.Filled.Code, "Banner / Note", activeProfile.bannerNote, palette)
 
                 Spacer(modifier = Modifier.height(14.dp))

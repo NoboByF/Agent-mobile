@@ -1150,4 +1150,66 @@ class ExampleRobolectricTest {
         )
         assertEquals(Triple("connectivitycheck.gstatic.com", 80, "/generate_204"), parsedUrl)
     }
+
+    @Test
+    fun `sshOcean WebSocket profiles, HTTP 101 upgrade, and RFC 6455 binary frame codec work accurately`() {
+        val wsTlsProfile = HttpCustomTunnelProfile.DEFAULT_PROFILES.firstOrNull { it.id == "hc_sshocean_nl1_ws_tls" }
+        assertNotNull(wsTlsProfile)
+        assertEquals("nl1.wssht.to", wsTlsProfile!!.host)
+        assertEquals(443, wsTlsProfile.port)
+        assertEquals("sshocean-fahimsshh", wsTlsProfile.username)
+        assertEquals("fahimsshh", wsTlsProfile.password)
+        assertTrue(wsTlsProfile.isWebSocketSsh)
+        assertTrue(wsTlsProfile.useTls)
+
+        val gpSniProfile = HttpCustomTunnelProfile.DEFAULT_PROFILES.firstOrNull { it.id == "hc_sshocean_nl1_gp_sni" }
+        assertNotNull(gpSniProfile)
+        assertEquals("www.grameenphone.com", gpSniProfile!!.sniHost)
+
+        // HTTP Upgrade request formatting & 101 response parsing
+        val reqBytes = com.example.tunnel.SshWebSocketTransport.buildUpgradeRequest(
+            wsPath = "/",
+            hostHeader = "nl1.wssht.to",
+            wsKey = "dGhlIHNhbXBsZSBub25jZQ=="
+        )
+        val reqText = String(reqBytes, Charsets.US_ASCII)
+        assertTrue(reqText.startsWith("GET / HTTP/1.1\r\n"))
+        assertTrue(reqText.contains("Host: nl1.wssht.to\r\n"))
+        assertTrue(reqText.contains("Upgrade: websocket\r\n"))
+
+        val fakeResp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        val parsedResp = com.example.tunnel.SshWebSocketTransport.readHttpUpgradeResponse(
+            java.io.ByteArrayInputStream(fakeResp.toByteArray(Charsets.US_ASCII))
+        )
+        assertEquals(101, parsedResp.statusCode)
+        assertEquals("websocket", parsedResp.headers["upgrade"])
+
+        // RFC 6455 masked binary frame encode/decode round-trip (small + medium > 125B payloads)
+        val payload = "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.6\r\n".repeat(5).toByteArray(Charsets.US_ASCII)
+        val encodedFrame = com.example.tunnel.SshWebSocketTransport.encodeClientBinaryFrame(payload)
+        val decoded = com.example.tunnel.SshWebSocketTransport.readWebSocketFrame(java.io.ByteArrayInputStream(encodedFrame))
+        assertNotNull(decoded)
+        assertEquals(0x02, decoded!!.first)
+        assertTrue(payload.contentEquals(decoded.second))
+
+        // Candidate strategy ordering includes primary TLS, wildcard SNI, alternate TLS ports, and HTTP 80 fallback
+        val candidates = com.example.tunnel.SshWebSocketTransport.buildCandidateConfigs(
+            host = "nl1.wssht.to",
+            port = 443,
+            sniHost = "www.grameenphone.com",
+            bugHost = "",
+            wsPath = "/",
+            useTls = true,
+            resolvedHostIp = null
+        )
+        assertTrue(candidates.any { it.port == 443 && it.useTls && it.sniHost == "www.grameenphone.com" })
+        assertTrue(candidates.any { it.wsHostHeader == "www.grameenphone.com.nl1.wssht.to" })
+        assertTrue(candidates.any { it.port == 80 && !it.useTls })
+
+        // Parse ssh-websocket JSON format cleanly
+        val reparsed = HttpCustomProfileParser.parseFromJson(wsTlsProfile.rawJson).getOrThrow()
+        assertTrue(reparsed.isWebSocketSsh)
+        assertEquals("nl1.wssht.to", reparsed.host)
+        assertEquals("sshocean-fahimsshh", reparsed.username)
+    }
 }

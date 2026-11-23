@@ -15,14 +15,19 @@ data class HttpCustomTunnelProfile(
     val pubKey: String,
     val bannerNote: String,
     val rawJson: String,
-    val dnsServer: String = "auto"
+    val dnsServer: String = "auto",
+    val isWebSocketSsh: Boolean = false,
+    val useTls: Boolean = false,
+    val sniHost: String = "",
+    val bugHost: String = "",
+    val wsPath: String = "/"
 ) {
     companion object {
         val DEFAULT_PROFILES = listOf(
             HttpCustomTunnelProfile(
                 id = "hc_gp_robi_airtel_1",
                 name = "Fahim - nsts3.me-link.uk (Pro)",
-                operatorName = "Grameenphone, Robi & Airtel",
+                operatorName = "Robi, Airtel & GP (SlowDNS)",
                 host = "nsts3.me-link.uk",
                 port = 22,
                 username = "jssh_9qknqpo",
@@ -73,6 +78,75 @@ data class HttpCustomTunnelProfile(
                         }
                       },
                       "format": "http-custom"
+                    }
+                """.trimIndent()
+            ),
+            HttpCustomTunnelProfile(
+                id = "hc_sshocean_nl1_ws_tls",
+                name = "sshOcean NL1 • SSL/TLS WS (443)",
+                operatorName = "GP & All SIM (SSH WebSocket TLS)",
+                host = "nl1.wssht.to",
+                port = 443,
+                username = "sshocean-fahimsshh",
+                password = "fahimsshh",
+                protocol = "SSH WebSocket (SSL/TLS)",
+                nameserver = "nl1.wssht.to",
+                pubKey = "",
+                bannerNote = "sshOcean NL1 • Valid 23-30 Nov 2026 • UDPGW 7200/7300",
+                dnsServer = "auto",
+                isWebSocketSsh = true,
+                useTls = true,
+                sniHost = "nl1.wssht.to",
+                bugHost = "",
+                wsPath = "/",
+                rawJson = """
+                    {
+                      "format": "ssh-websocket",
+                      "provider": "sshOcean",
+                      "host": "nl1.wssht.to",
+                      "port": 443,
+                      "httpPorts": [80, 8080, 8880, 2052, 2082, 2086, 2095],
+                      "tlsPorts": [443, 2053, 2083, 2087, 2096, 8443],
+                      "username": "sshocean-fahimsshh",
+                      "password": "fahimsshh",
+                      "sni": "nl1.wssht.to",
+                      "wsPath": "/",
+                      "useTls": true,
+                      "udpgw": [7200, 7300],
+                      "wildcard": "*.nl1.wssht.to"
+                    }
+                """.trimIndent()
+            ),
+            HttpCustomTunnelProfile(
+                id = "hc_sshocean_nl1_gp_sni",
+                name = "sshOcean NL1 • GP Bug-SNI WS (443/80)",
+                operatorName = "Grameenphone (GP) SNI WebSocket",
+                host = "nl1.wssht.to",
+                port = 443,
+                username = "sshocean-fahimsshh",
+                password = "fahimsshh",
+                protocol = "SSH WebSocket (GP SNI)",
+                nameserver = "nl1.wssht.to",
+                pubKey = "",
+                bannerNote = "GP Zero-Rated SNI + Wildcard *.nl1.wssht.to + HTTP 80 Fallback",
+                dnsServer = "auto",
+                isWebSocketSsh = true,
+                useTls = true,
+                sniHost = "www.grameenphone.com",
+                bugHost = "",
+                wsPath = "/",
+                rawJson = """
+                    {
+                      "format": "ssh-websocket",
+                      "provider": "sshOcean",
+                      "host": "nl1.wssht.to",
+                      "port": 443,
+                      "username": "sshocean-fahimsshh",
+                      "password": "fahimsshh",
+                      "sni": "www.grameenphone.com",
+                      "wildcardHost": "www.grameenphone.com.nl1.wssht.to",
+                      "wsPath": "/",
+                      "useTls": true
                     }
                 """.trimIndent()
             ),
@@ -137,6 +211,39 @@ data class HttpCustomTunnelProfile(
 
         fun parseFromJson(rawJson: String): Result<HttpCustomTunnelProfile> = runCatching {
             val root = JSONObject(rawJson)
+            if (root.optString("format").equals("ssh-websocket", ignoreCase = true) ||
+                root.has("wsPath") || root.has("sni")
+            ) {
+                val host = root.optString("host").takeIf { it.isNotBlank() } ?: "nl1.wssht.to"
+                val port = root.optInt("port", 443).takeIf { it in 1..65535 } ?: 443
+                val username = root.optString("username", "")
+                val password = root.optString("password", "")
+                val sni = root.optString("sni", host).ifBlank { host }
+                val wsPath = root.optString("wsPath", "/").ifBlank { "/" }
+                val useTls = root.optBoolean("useTls", port == 443 || port == 8443 || port == 2083)
+                val bugHost = root.optString("bugHost", "")
+                return@runCatching HttpCustomTunnelProfile(
+                    id = "hc_ws_${System.currentTimeMillis()}",
+                    name = root.optString("name").ifBlank { "SSH WebSocket ($host:$port)" },
+                    operatorName = "Custom SSH WebSocket",
+                    host = host,
+                    port = port,
+                    username = username,
+                    password = password,
+                    protocol = if (useTls) "SSH WebSocket (SSL/TLS)" else "SSH WebSocket (HTTP)",
+                    nameserver = host,
+                    pubKey = "",
+                    bannerNote = root.optString("provider", "SSH WebSocket"),
+                    rawJson = rawJson,
+                    dnsServer = "auto",
+                    isWebSocketSsh = true,
+                    useTls = useTls,
+                    sniHost = sni,
+                    bugHost = bugHost,
+                    wsPath = wsPath
+                )
+            }
+
             val decoded = root.optJSONObject("decoded")
             val profilesObj = decoded?.optJSONObject("profiles") ?: root.optJSONObject("profiles")
             val s0 = profilesObj?.optJSONObject("s0")
