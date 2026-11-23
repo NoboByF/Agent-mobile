@@ -20,9 +20,15 @@ data class HttpCustomTunnelProfile(
     val useTls: Boolean = false,
     val sniHost: String = "",
     val bugHost: String = "",
-    val wsPath: String = "/"
+    val wsPath: String = "/",
+    val customPayload: String = "",
+    val enableSplitPayload: Boolean = false,
+    val enableTlsFragment: Boolean = false,
+    val autoFallbackAllModes: Boolean = false
 ) {
     companion object {
+        const val GP_SUPER_AUTO_ID = "hc_gp_super_auto"
+
         val DEFAULT_PROFILES = listOf(
             HttpCustomTunnelProfile(
                 id = "hc_gp_robi_airtel_1",
@@ -82,6 +88,45 @@ data class HttpCustomTunnelProfile(
                 """.trimIndent()
             ),
             HttpCustomTunnelProfile(
+                id = GP_SUPER_AUTO_ID,
+                name = "GP Super Auto • WS + CF Edge + DoH/DoT",
+                operatorName = "Grameenphone (GP) All-In-One Pro",
+                host = "nl1.wssht.to",
+                port = 443,
+                username = "sshocean-fahimsshh",
+                password = "fahimsshh",
+                protocol = "GP Super Auto (WS+CF+SlowDNS)",
+                nameserver = "nsts3.me-link.uk",
+                pubKey = "75148e30f06c1a58700756c3746640d7e27d73632aed5b4844bdded4ffe86220",
+                bannerNote = "Auto Waterfall: TLS+DPI Frag -> CF Edge 104.16/104.18 -> HTTP Split -> DoH/DoT SlowDNS",
+                dnsServer = "auto",
+                isWebSocketSsh = true,
+                useTls = true,
+                sniHost = "nl1.wssht.to",
+                bugHost = "",
+                wsPath = "/",
+                customPayload = "",
+                enableSplitPayload = true,
+                enableTlsFragment = true,
+                autoFallbackAllModes = true,
+                rawJson = """
+                    {
+                      "format": "ssh-websocket",
+                      "provider": "GP Super Auto (sshOcean + dnstt)",
+                      "host": "nl1.wssht.to",
+                      "port": 443,
+                      "username": "sshocean-fahimsshh",
+                      "password": "fahimsshh",
+                      "sni": "nl1.wssht.to",
+                      "wsPath": "/",
+                      "useTls": true,
+                      "splitPayload": true,
+                      "tlsFragment": true,
+                      "autoFallbackAllModes": true
+                    }
+                """.trimIndent()
+            ),
+            HttpCustomTunnelProfile(
                 id = "hc_sshocean_nl1_ws_tls",
                 name = "sshOcean NL1 • SSL/TLS WS (443)",
                 operatorName = "GP & All SIM (SSH WebSocket TLS)",
@@ -133,8 +178,11 @@ data class HttpCustomTunnelProfile(
                 isWebSocketSsh = true,
                 useTls = true,
                 sniHost = "www.grameenphone.com",
-                bugHost = "",
+                bugHost = "104.16.132.229",
                 wsPath = "/",
+                customPayload = "",
+                enableSplitPayload = true,
+                enableTlsFragment = true,
                 rawJson = """
                     {
                       "format": "ssh-websocket",

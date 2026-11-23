@@ -127,6 +127,10 @@ class HttpCustomVpnService : VpnService() {
         val sniHost = intent?.getStringExtra(EXTRA_SNI_HOST).orEmpty()
         val bugHost = intent?.getStringExtra(EXTRA_BUG_HOST).orEmpty()
         val wsPath = intent?.getStringExtra(EXTRA_WS_PATH)?.takeIf { it.isNotBlank() } ?: "/"
+        val customPayload = intent?.getStringExtra(EXTRA_CUSTOM_PAYLOAD).orEmpty()
+        val splitPayload = intent?.getBooleanExtra(EXTRA_SPLIT_PAYLOAD, false) == true
+        val tlsFragment = intent?.getBooleanExtra(EXTRA_TLS_FRAGMENT, false) == true
+        val autoFallback = intent?.getBooleanExtra(EXTRA_AUTO_FALLBACK, false) == true
 
         return HttpCustomTunnelProfile(
             id = id.ifBlank { "hc_active" },
@@ -146,7 +150,11 @@ class HttpCustomVpnService : VpnService() {
             useTls = useTls,
             sniHost = sniHost,
             bugHost = bugHost,
-            wsPath = wsPath
+            wsPath = wsPath,
+            customPayload = customPayload,
+            enableSplitPayload = splitPayload,
+            enableTlsFragment = tlsFragment,
+            autoFallbackAllModes = autoFallback
         )
     }
 
@@ -287,6 +295,32 @@ class HttpCustomVpnService : VpnService() {
                     activeEngineLabel = "$engineDesc (127.0.0.1:$port)"
                     resolvedSshBanner = sshBridge?.serverVersionBanner ?: engineDesc
                 }?.first
+
+                // GP Super Auto Waterfall: if all SSH-WS + CF Edge strategies failed, automatically try SlowDNS (DoH:443 / DoT:853 / UDP:53)!
+                if (activeProxyPort == null && profile.autoFallbackAllModes) {
+                    val slowDnsFallback = HttpCustomTunnelProfile.DEFAULT_PROFILES.firstOrNull {
+                        !it.isWebSocketSsh && it.pubKey.trim().length == 64
+                    }
+                    if (slowDnsFallback != null) {
+                        HttpCustomTunnelStateHolder.appendLog(
+                            "GP Super Auto: SSH-WS blocked -> falling back to SlowDNS (DoH:443 / DoT:853 / UDP:53)..."
+                        )
+                        activeProxyPort = attemptFullDnsttSshPipeline(
+                            profile = slowDnsFallback,
+                            tuning = tuning,
+                            upstreamDnsIp = upstreamDnsIp,
+                            carrierDnsList = carrierDnsList,
+                            resolvedHostIp = null,
+                            transport = transport,
+                            activeDohUrl = activeDohUrl,
+                            dohClient = dohClient,
+                            underlyingNetwork = underlyingNetwork
+                        )?.also { port ->
+                            activeEngineLabel = "GP Auto SlowDNS+SSH (127.0.0.1:$port)"
+                            resolvedSshBanner = sshBridge?.serverVersionBanner ?: "SlowDNS+SSH Active"
+                        }
+                    }
+                }
             } else {
                 if (probe.sshReachable && profile.username.isNotBlank()) {
                     HttpCustomTunnelStateHolder.updateState {
@@ -683,10 +717,13 @@ class HttpCustomVpnService : VpnService() {
             bugHost = profile.bugHost,
             wsPath = profile.wsPath,
             useTls = profile.useTls,
-            resolvedHostIp = resolvedHostIp
+            resolvedHostIp = resolvedHostIp,
+            customPayload = profile.customPayload,
+            enableSplitPayload = profile.enableSplitPayload,
+            enableTlsFragment = profile.enableTlsFragment
         )
         HttpCustomTunnelStateHolder.appendLog(
-            "Starting SSH WebSocket (${profile.host}) with ${candidates.size} TLS/HTTP strategies..."
+            "Starting SSH WebSocket (${profile.host}) with ${candidates.size} TLS/CF-Edge/DPI strategies..."
         )
         updatePipeline {
             it.copy(
@@ -699,12 +736,12 @@ class HttpCustomVpnService : VpnService() {
         val failures = mutableListOf<String>()
         for ((index, cfg) in candidates.withIndex()) {
             HttpCustomTunnelStateHolder.updateState {
-                it.copy(statusDetail = "ধাপ ২/৫: WS/TLS কানেক্ট (${cfg.label}) [${index + 1}/${candidates.size}]...")
+                it.copy(statusDetail = "ধাপ ২/৫: WS/CF কানেক্ট (${cfg.label}) [${index + 1}/${candidates.size}]...")
             }
             val wsResult = runCatching {
                 SshWebSocketTransport.connect(
                     config = cfg,
-                    connectTimeoutMs = 6500,
+                    connectTimeoutMs = 4500,
                     underlyingNetwork = underlyingNetwork,
                     protectTcp = { s -> protect(s) }
                 )
@@ -1224,6 +1261,10 @@ class HttpCustomVpnService : VpnService() {
         const val EXTRA_SNI_HOST = "extra_sni_host"
         const val EXTRA_BUG_HOST = "extra_bug_host"
         const val EXTRA_WS_PATH = "extra_ws_path"
+        const val EXTRA_CUSTOM_PAYLOAD = "extra_custom_payload"
+        const val EXTRA_SPLIT_PAYLOAD = "extra_split_payload"
+        const val EXTRA_TLS_FRAGMENT = "extra_tls_fragment"
+        const val EXTRA_AUTO_FALLBACK = "extra_auto_fallback"
 
         private const val CHANNEL_ID = "http_custom_vpn_channel"
         private const val NOTIFICATION_ID = 4401
@@ -1245,6 +1286,10 @@ class HttpCustomVpnService : VpnService() {
                 putExtra(EXTRA_SNI_HOST, profile.sniHost)
                 putExtra(EXTRA_BUG_HOST, profile.bugHost)
                 putExtra(EXTRA_WS_PATH, profile.wsPath)
+                putExtra(EXTRA_CUSTOM_PAYLOAD, profile.customPayload)
+                putExtra(EXTRA_SPLIT_PAYLOAD, profile.enableSplitPayload)
+                putExtra(EXTRA_TLS_FRAGMENT, profile.enableTlsFragment)
+                putExtra(EXTRA_AUTO_FALLBACK, profile.autoFallbackAllModes)
             }
         }
 

@@ -75,10 +75,12 @@ import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.WarningAmber
 import com.example.data.HttpCustomTunnelProfile
 import com.example.tunnel.DnsBenchmarkEntry
+import com.example.tunnel.GpBugHostScanEntry
 import com.example.tunnel.GpCarrierSnapshot
 import com.example.tunnel.InternetCheckResult
 import com.example.tunnel.InternetCheckStatus
 import com.example.tunnel.PipelineStageState
+import com.example.tunnel.SshWebSocketTransport
 import com.example.tunnel.TunnelPipelineStages
 import com.example.tunnel.TunnelTransportMode
 import com.example.tunnel.TunnelTuningConfig
@@ -671,6 +673,143 @@ fun DnsBenchmarkCard(
 }
 
 @Composable
+fun GpBugHostScannerCard(
+    results: List<GpBugHostScanEntry>,
+    isRunning: Boolean,
+    onRunScan: () -> Unit,
+    onApplyEntry: (GpBugHostScanEntry) -> Unit
+) {
+    val palette = StudioTheme.colors
+
+    StudioCardContainer(borderColor = CyanTeal.copy(alpha = 0.35f)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "GP Bug Host & CF 101 Scanner",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = palette.inkPrimary
+                )
+                Text(
+                    text = "১৬টি GP পোর্টাল ও Cloudflare Edge IP স্ক্যান করে চালু HTTP 101 খুঁজুন",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = palette.inkSecondary
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(
+                onClick = onRunScan,
+                enabled = !isRunning,
+                modifier = Modifier
+                    .height(48.dp)
+                    .testTag("gp_run_bughost_scan_button"),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = CyanTeal)
+            ) {
+                if (isRunning) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = Color.White
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Scanning...", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                } else {
+                    Icon(
+                        imageVector = Icons.Filled.Bolt,
+                        contentDescription = "Scan GP Bug Hosts",
+                        tint = Color.White,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Scan GP", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+
+        if (results.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(10.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                results.take(8).forEach { entry ->
+                    val accent = when {
+                        entry.wsUpgrade101 -> EmeraldGreen
+                        entry.reachable -> WarmAmber
+                        else -> SignalRed
+                    }
+                    Surface(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(14.dp),
+                        color = palette.surfaceSubtle,
+                        border = BorderStroke(
+                            1.dp,
+                            if (entry.wsUpgrade101) EmeraldGreen.copy(alpha = 0.45f)
+                            else if (entry.reachable) WarmAmber.copy(alpha = 0.30f)
+                            else palette.outline
+                        )
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = entry.label,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = palette.inkPrimary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "${entry.connectTarget}:${entry.port} • ${entry.detail}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    color = if (entry.wsUpgrade101) EmeraldGreen else palette.inkSecondary,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(8.dp))
+                            if (entry.reachable) {
+                                OutlinedButton(
+                                    onClick = { onApplyEntry(entry) },
+                                    modifier = Modifier
+                                        .height(40.dp)
+                                        .testTag("gp_use_bughost_${entry.connectTarget}_${entry.port}"),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, accent.copy(alpha = 0.6f))
+                                ) {
+                                    Text(
+                                        text = if (entry.wsUpgrade101) "101 • Use" else "${entry.rttMs}ms • Use",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = accent,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            } else {
+                                StatusPillBadge(
+                                    label = "BLOCKED",
+                                    accentColor = SignalRed,
+                                    containerColor = SignalRed.copy(alpha = 0.12f),
+                                    leadingDot = false
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun EditTunnelProfileDialog(
     profile: HttpCustomTunnelProfile,
     onDismiss: () -> Unit,
@@ -678,11 +817,14 @@ fun EditTunnelProfileDialog(
 ) {
     var isWebSocketSsh by remember(profile.id) { mutableStateOf(profile.isWebSocketSsh) }
     var useTls by remember(profile.id) { mutableStateOf(profile.useTls) }
+    var enableSplitPayload by remember(profile.id) { mutableStateOf(profile.enableSplitPayload) }
+    var enableTlsFragment by remember(profile.id) { mutableStateOf(profile.enableTlsFragment) }
     var host by remember(profile.id) { mutableStateOf(profile.host) }
     var port by remember(profile.id) { mutableStateOf(profile.port.toString()) }
     var sniHost by remember(profile.id) { mutableStateOf(profile.sniHost) }
     var bugHost by remember(profile.id) { mutableStateOf(profile.bugHost) }
     var wsPath by remember(profile.id) { mutableStateOf(profile.wsPath) }
+    var customPayload by remember(profile.id) { mutableStateOf(profile.customPayload) }
     var nameserver by remember(profile.id) { mutableStateOf(profile.nameserver) }
     var dnsServer by remember(profile.id) { mutableStateOf(profile.dnsServer) }
     var username by remember(profile.id) { mutableStateOf(profile.username) }
@@ -755,6 +897,30 @@ fun EditTunnelProfileDialog(
                         )
                         Switch(checked = useTls, onCheckedChange = { useTls = it })
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "DPI Split Payload ([split])",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Switch(checked = enableSplitPayload, onCheckedChange = { enableSplitPayload = it })
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "TLS ClientHello DPI Fragment",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Switch(checked = enableTlsFragment, onCheckedChange = { enableTlsFragment = it })
+                    }
                     OutlinedTextField(
                         value = sniHost,
                         onValueChange = { sniHost = it },
@@ -765,7 +931,7 @@ fun EditTunnelProfileDialog(
                     OutlinedTextField(
                         value = bugHost,
                         onValueChange = { bugHost = it },
-                        label = { Text("CDN / Bug IP (Optional)") },
+                        label = { Text("CF Edge / Bug IP (e.g. 104.16.132.229)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
@@ -775,6 +941,38 @@ fun EditTunnelProfileDialog(
                         label = { Text("WebSocket Path (/)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
+                    )
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        item {
+                            FilterChip(
+                                selected = customPayload == SshWebSocketTransport.PRESET_SSHOCEAN_STANDARD,
+                                onClick = { customPayload = SshWebSocketTransport.PRESET_SSHOCEAN_STANDARD },
+                                label = { Text("sshOcean WS", style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                        item {
+                            FilterChip(
+                                selected = customPayload == SshWebSocketTransport.PRESET_GP_SPLIT_DPI,
+                                onClick = { customPayload = SshWebSocketTransport.PRESET_GP_SPLIT_DPI },
+                                label = { Text("GP Split DPI", style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                        item {
+                            FilterChip(
+                                selected = customPayload == SshWebSocketTransport.PRESET_BACK_INJECT,
+                                onClick = { customPayload = SshWebSocketTransport.PRESET_BACK_INJECT },
+                                label = { Text("Back-Inject", style = MaterialTheme.typography.labelSmall) }
+                            )
+                        }
+                    }
+                    OutlinedTextField(
+                        value = customPayload,
+                        onValueChange = { customPayload = it },
+                        label = { Text("Custom Payload ([crlf][split][host][sni])") },
+                        minLines = 2,
+                        maxLines = 4,
+                        modifier = Modifier.fillMaxWidth(),
+                        textStyle = MaterialTheme.typography.bodySmall.copy(fontFamily = JetBrainsMonoFontFamily)
                     )
                 } else {
                     OutlinedTextField(
@@ -825,7 +1023,10 @@ fun EditTunnelProfileDialog(
                             useTls = useTls,
                             sniHost = sniHost.trim(),
                             bugHost = bugHost.trim(),
-                            wsPath = wsPath.trim().ifBlank { "/" }
+                            wsPath = wsPath.trim().ifBlank { "/" },
+                            customPayload = customPayload.trim(),
+                            enableSplitPayload = enableSplitPayload,
+                            enableTlsFragment = enableTlsFragment
                         )
                     )
                 },

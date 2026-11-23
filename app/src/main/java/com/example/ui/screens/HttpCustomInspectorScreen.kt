@@ -94,6 +94,7 @@ import com.example.tunnel.TunnelTransportMode
 import com.example.ui.components.CallDurationBadge
 import com.example.ui.components.DnsBenchmarkCard
 import com.example.ui.components.EditTunnelProfileDialog
+import com.example.ui.components.GpBugHostScannerCard
 import com.example.ui.components.GpCarrierStatusCard
 import com.example.ui.components.GpProTuningCard
 import com.example.ui.components.StatusPillBadge
@@ -148,8 +149,15 @@ fun HttpCustomInspectorScreen(
     val carrierSnapshot by HttpCustomTunnelStateHolder.carrierSnapshot.collectAsStateWithLifecycle()
     val benchmarkResults by HttpCustomTunnelStateHolder.benchmarkResults.collectAsStateWithLifecycle()
     val isBenchmarkRunning by HttpCustomTunnelStateHolder.isBenchmarkRunning.collectAsStateWithLifecycle()
+    val bugHostResults by HttpCustomTunnelStateHolder.bugHostResults.collectAsStateWithLifecycle()
+    val isBugHostScanRunning by HttpCustomTunnelStateHolder.isBugHostScanRunning.collectAsStateWithLifecycle()
 
-    val activeProfile = profiles.firstOrNull { it.id == selectedProfileId } ?: profiles.first()
+    val orderedProfiles = remember(profiles) {
+        val superAuto = profiles.filter { it.id == HttpCustomTunnelProfile.GP_SUPER_AUTO_ID }
+        val others = profiles.filterNot { it.id == HttpCustomTunnelProfile.GP_SUPER_AUTO_ID }
+        superAuto + others
+    }
+    val activeProfile = profiles.firstOrNull { it.id == selectedProfileId } ?: orderedProfiles.first()
 
     var showImportDialog by rememberSaveable { mutableStateOf(false) }
     var importJsonText by rememberSaveable { mutableStateOf("") }
@@ -370,6 +378,54 @@ fun HttpCustomInspectorScreen(
                     onShowNotice("নেটওয়ার্ক রিফ্রেশ: ${snap.operatorName} (${snap.carrierDnsServers.firstOrNull() ?: "Auto"})")
                 }
             )
+        }
+
+        // Front-and-Center Profile / Engine Switcher (GP Super Auto first!)
+        item {
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(orderedProfiles, key = { it.id }) { profile ->
+                    val isSel = profile.id == activeProfile.id
+                    OutlinedButton(
+                        onClick = {
+                            HttpCustomTunnelStateHolder.selectProfile(profile.id)
+                            onShowNotice("প্রফাইল নির্বাচিত: ${profile.name}")
+                        },
+                        modifier = Modifier
+                            .height(48.dp)
+                            .testTag("hc_profile_tab_${profile.id}"),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (isSel) palette.cobaltSoft else palette.card,
+                            contentColor = if (isSel) palette.cobaltAccent else palette.inkPrimary
+                        ),
+                        border = BorderStroke(1.dp, if (isSel) palette.cobaltAccent else palette.outline)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.SimCard,
+                            contentDescription = "Profile",
+                            modifier = Modifier.size(16.dp),
+                            tint = if (isSel) palette.cobaltAccent else palette.inkSecondary
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = when (profile.id) {
+                                HttpCustomTunnelProfile.GP_SUPER_AUTO_ID -> "GP Super Auto"
+                                "hc_sshocean_nl1_ws_tls" -> "sshOcean WS 443"
+                                "hc_sshocean_nl1_gp_sni" -> "GP SNI + CF Edge"
+                                "hc_gp_robi_airtel_1" -> "Robi/GP SlowDNS"
+                                "hc_cloudflare_slowdns_2" -> "SlowDNS 1.1.1.1"
+                                else -> profile.name.take(18)
+                            },
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
         }
 
         // Hero Connect / Disconnect Card with Live Speed & Ping Sparkline
@@ -594,6 +650,30 @@ fun HttpCustomInspectorScreen(
             }
         }
 
+        // GP Bug Host & Cloudflare 101 Edge Scanner (1-Tap Live GP Finder)
+        item {
+            GpBugHostScannerCard(
+                results = bugHostResults,
+                isRunning = isBugHostScanRunning,
+                onRunScan = {
+                    coroutineScope.launch {
+                        val res = HttpCustomTunnelStateHolder.runGpBugHostScan(context, activeProfile)
+                        val count101 = res.count { it.wsUpgrade101 }
+                        val countOk = res.count { it.reachable }
+                        onShowNotice(
+                            if (count101 > 0) "✓ $count101 টি HTTP 101 চালু GP/CF হোস্ট পাওয়া গেছে!"
+                            else if (countOk > 0) "$countOk টি হোস্ট রেসপন্স দিয়েছে — Use চাপুন"
+                            else "কোনো Bug Host রেসপন্স দেয়নি (সিম ডাটা/সিগন্যাল চেক করুন)"
+                        )
+                    }
+                },
+                onApplyEntry = { entry ->
+                    HttpCustomTunnelStateHolder.applyBugHostScanResult(activeProfile.id, entry)
+                    onShowNotice("✓ সেট হয়েছে: ${entry.label} (${entry.connectTarget}:${entry.port})")
+                }
+            )
+        }
+
         // GP DNS Speed Benchmark Scanner
         item {
             DnsBenchmarkCard(
@@ -626,49 +706,6 @@ fun HttpCustomInspectorScreen(
                 tuning = tuning,
                 onUpdateTuning = { HttpCustomTunnelStateHolder.updateTuning(it) }
             )
-        }
-
-        // Profile Selector Tabs
-        item {
-            LazyRow(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                items(profiles, key = { it.id }) { profile ->
-                    val isSel = profile.id == activeProfile.id
-                    OutlinedButton(
-                        onClick = { HttpCustomTunnelStateHolder.selectProfile(profile.id) },
-                        modifier = Modifier
-                            .height(48.dp)
-                            .testTag("hc_profile_tab_${profile.id}"),
-                        shape = RoundedCornerShape(14.dp),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = if (isSel) palette.cobaltSoft else palette.card,
-                            contentColor = if (isSel) palette.cobaltAccent else palette.inkPrimary
-                        ),
-                        border = BorderStroke(1.dp, if (isSel) palette.cobaltAccent else palette.outline)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.SimCard,
-                            contentDescription = "Operator",
-                            modifier = Modifier.size(16.dp),
-                            tint = if (isSel) palette.cobaltAccent else palette.inkSecondary
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = when (profile.id) {
-                                "hc_gp_robi_airtel_1" -> "Robi/GP SlowDNS"
-                                "hc_sshocean_nl1_ws_tls" -> "sshOcean WS 443"
-                                "hc_sshocean_nl1_gp_sni" -> "GP SNI WS 443"
-                                "hc_cloudflare_slowdns_2" -> "SlowDNS 1.1.1.1"
-                                else -> profile.name.take(18)
-                            },
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1
-                        )
-                    }
-                }
-            }
         }
 
         // Active Profile Details Card
@@ -716,7 +753,7 @@ fun HttpCustomInspectorScreen(
                     TunnelDetailRow(
                         Icons.Filled.Security,
                         "Protocol",
-                        if (activeProfile.useTls) "SSH WebSocket (SSL/TLS 443 + HTTP 80)" else "SSH WebSocket (HTTP 80/8080)",
+                        activeProfile.protocol,
                         palette
                     )
                     TunnelDetailRow(
@@ -725,10 +762,22 @@ fun HttpCustomInspectorScreen(
                         activeProfile.sniHost.ifBlank { activeProfile.host },
                         palette
                     )
+                    if (activeProfile.bugHost.isNotBlank()) {
+                        TunnelDetailRow(
+                            Icons.Filled.Dns,
+                            "CF Edge / Bug IP",
+                            activeProfile.bugHost,
+                            palette
+                        )
+                    }
                     TunnelDetailRow(
                         Icons.Filled.Dns,
-                        "WebSocket Path",
-                        activeProfile.wsPath.ifBlank { "/" },
+                        "DPI Bypass",
+                        buildList {
+                            if (activeProfile.enableTlsFragment) add("TLS Frag")
+                            if (activeProfile.enableSplitPayload) add("HTTP Split")
+                            if (activeProfile.autoFallbackAllModes) add("DoH/DoT SlowDNS Fallback")
+                        }.joinToString(" + ").ifBlank { "Standard WS" },
                         palette
                     )
                 } else {

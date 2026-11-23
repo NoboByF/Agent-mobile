@@ -107,7 +107,7 @@ object HttpCustomTunnelStateHolder {
     private val _profiles = MutableStateFlow(HttpCustomTunnelProfile.DEFAULT_PROFILES)
     val profiles: StateFlow<List<HttpCustomTunnelProfile>> = _profiles.asStateFlow()
 
-    private val _selectedProfileId = MutableStateFlow(HttpCustomTunnelProfile.DEFAULT_PROFILES.first().id)
+    private val _selectedProfileId = MutableStateFlow(HttpCustomTunnelProfile.GP_SUPER_AUTO_ID)
     val selectedProfileId: StateFlow<String> = _selectedProfileId.asStateFlow()
 
     private val _tuning = MutableStateFlow(TunnelTuningConfig())
@@ -121,6 +121,12 @@ object HttpCustomTunnelStateHolder {
 
     private val _isBenchmarkRunning = MutableStateFlow(false)
     val isBenchmarkRunning: StateFlow<Boolean> = _isBenchmarkRunning.asStateFlow()
+
+    private val _bugHostResults = MutableStateFlow<List<GpBugHostScanEntry>>(emptyList())
+    val bugHostResults: StateFlow<List<GpBugHostScanEntry>> = _bugHostResults.asStateFlow()
+
+    private val _isBugHostScanRunning = MutableStateFlow(false)
+    val isBugHostScanRunning: StateFlow<Boolean> = _isBugHostScanRunning.asStateFlow()
 
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
@@ -149,6 +155,59 @@ object HttpCustomTunnelStateHolder {
             list.map { if (it.id == profileId) it.copy(dnsServer = dnsServer) else it }
         }
         appendLog("DNS resolver set to: $dnsServer")
+    }
+
+    suspend fun runGpBugHostScan(
+        context: Context,
+        profile: HttpCustomTunnelProfile
+    ): List<GpBugHostScanEntry> {
+        _isBugHostScanRunning.value = true
+        return try {
+            val (activeNet, _) = discoverUnderlyingNetworkAndDns(context)
+            val targetHost = if (profile.isWebSocketSsh) profile.host else "nl1.wssht.to"
+            appendLog("Scanning 16 GP Bug Hosts & Cloudflare Edge IPs for $targetHost...")
+            val results = GpBugHostScanner.runScan(
+                sshWsHost = targetHost,
+                underlyingNetwork = activeNet,
+                protectTcp = null
+            )
+            _bugHostResults.value = results
+            val best101 = results.firstOrNull { it.wsUpgrade101 }
+            val bestReachable = results.firstOrNull { it.reachable }
+            when {
+                best101 != null -> appendLog("OK GP Scanner: ${best101.label} -> ${best101.detail} (${best101.rttMs}ms)")
+                bestReachable != null -> appendLog("GP Scanner: ${bestReachable.label} -> ${bestReachable.detail} (${bestReachable.rttMs}ms)")
+                else -> appendLog("GP Scanner: All 16 Bug Hosts/Edge IPs timed out on current SIM")
+            }
+            results
+        } finally {
+            _isBugHostScanRunning.value = false
+        }
+    }
+
+    fun applyBugHostScanResult(profileId: String, entry: GpBugHostScanEntry) {
+        _profiles.update { list ->
+            list.map { p ->
+                if (p.id == profileId) {
+                    val wsHost = if (p.isWebSocketSsh) p.host else "nl1.wssht.to"
+                    val isDirect = entry.connectTarget.equals(wsHost, ignoreCase = true)
+                    p.copy(
+                        isWebSocketSsh = true,
+                        host = wsHost,
+                        port = entry.port,
+                        useTls = entry.useTls,
+                        bugHost = if (isDirect) "" else entry.connectTarget,
+                        sniHost = entry.sniHost.ifBlank { wsHost },
+                        protocol = if (entry.useTls) "SSH WebSocket (SSL/TLS)" else "SSH WebSocket (HTTP)",
+                        enableSplitPayload = !entry.useTls,
+                        enableTlsFragment = entry.useTls
+                    )
+                } else {
+                    p
+                }
+            }
+        }
+        appendLog("Applied GP Bug Host: ${entry.label} (${entry.connectTarget}:${entry.port}, TLS=${entry.useTls})")
     }
 
     fun updateTuning(transform: (TunnelTuningConfig) -> TunnelTuningConfig) {

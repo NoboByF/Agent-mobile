@@ -71,7 +71,7 @@ class TunnelProtocolUnitTest {
         assertEquals(0x02, decoded!!.first)
         assertTrue(payload.contentEquals(decoded.second))
 
-        // Candidate strategy ordering includes primary TLS, wildcard SNI, alternate TLS ports, and HTTP 80
+        // Candidate strategy ordering includes primary TLS, wildcard SNI, CF Edge IP fronting, DPI Frag, and HTTP 80
         val candidates = SshWebSocketTransport.buildCandidateConfigs(
             host = "nl1.wssht.to",
             port = 443,
@@ -79,11 +79,42 @@ class TunnelProtocolUnitTest {
             bugHost = "",
             wsPath = "/",
             useTls = true,
-            resolvedHostIp = null
+            resolvedHostIp = null,
+            enableSplitPayload = true,
+            enableTlsFragment = true
         )
         assertTrue(candidates.any { it.port == 443 && it.useTls && it.sniHost == "www.grameenphone.com" })
         assertTrue(candidates.any { it.wsHostHeader == "www.grameenphone.com.nl1.wssht.to" })
+        assertTrue(candidates.any { it.connectHost == "104.16.132.229" && it.port == 80 && it.splitPayload })
+        assertTrue(candidates.any { it.connectHost == "104.18.2.2" && it.port == 443 && it.fragmentTlsClientHello })
         assertTrue(candidates.any { it.port == 80 && !it.useTls })
+
+        // Verify HTTP Custom split payload rendering ([crlf], [split], [host], [sni])
+        val splitChunks = SshWebSocketTransport.renderPayloadChunks(
+            template = SshWebSocketTransport.PRESET_GP_SPLIT_DPI,
+            hostHeader = "nl1.wssht.to",
+            port = 80,
+            sniHost = "www.grameenphone.com",
+            wsPath = "/",
+            wsKey = "dGhlIHNhbXBsZSBub25jZQ=="
+        )
+        assertEquals(2, splitChunks.size)
+        val chunk1 = String(splitChunks[0], Charsets.US_ASCII)
+        val chunk2 = String(splitChunks[1], Charsets.US_ASCII)
+        assertTrue(chunk1.contains("www.grameenphone.com"))
+        assertTrue(chunk2.contains("Host: nl1.wssht.to"))
+        assertTrue(chunk2.contains("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="))
+
+        // Verify GP Super Auto profile & 16-target GP Bug-Host Scanner list
+        val gpAuto = HttpCustomTunnelProfile.DEFAULT_PROFILES.firstOrNull { it.id == HttpCustomTunnelProfile.GP_SUPER_AUTO_ID }
+        assertNotNull(gpAuto)
+        assertTrue(gpAuto!!.autoFallbackAllModes)
+        assertTrue(gpAuto.enableTlsFragment)
+        assertTrue(gpAuto.enableSplitPayload)
+        val scanTargets = com.example.tunnel.GpBugHostScanner.buildGpScanTargets("nl1.wssht.to")
+        assertEquals(16, scanTargets.size)
+        assertTrue(scanTargets.any { it.connectTarget == "104.16.132.229" && it.port == 80 })
+        assertTrue(scanTargets.any { it.connectTarget == "www.grameenphone.com" && it.port == 443 })
 
         val generatedKey = SshWebSocketTransport.generateWebSocketKey()
         assertEquals(24, generatedKey.length)

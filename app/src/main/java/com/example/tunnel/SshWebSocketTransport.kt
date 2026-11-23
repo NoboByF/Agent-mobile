@@ -3,6 +3,7 @@ package com.example.tunnel
 import android.net.Network
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
+import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
@@ -26,6 +27,10 @@ data class SshWebSocketConfig(
     val sniHost: String = "",
     val wsPath: String = "/",
     val useTls: Boolean = true,
+    val customPayload: String = "",
+    val splitPayload: Boolean = false,
+    val fragmentTlsClientHello: Boolean = false,
+    val includeWebSocketKey: Boolean = true,
     val label: String = ""
 )
 
@@ -39,15 +44,26 @@ data class SshWebSocketConnectResult(
 )
 
 /**
- * Pure-Kotlin SSH over WebSocket transport supporting:
- * 1) SSL/TLS WebSocket (Ports 443, 8443, 2083, 2053, 2087, 2096) with custom SNI / Bug Host
- * 2) HTTP WebSocket (Ports 80, 8080, 8880, 2052, 2082, 2086, 2095) with custom Host header
- * 3) Auto-detection of BOTH direct ws-openssh (raw SSH-2.0 stream after HTTP 101)
- *    AND Cloudflare/CDN RFC 6455 masked binary WebSocket framing!
+ * Pure-Kotlin Advanced SSH-over-WebSocket & HTTP Custom Payload Injector supporting:
+ * 1) SSL/TLS WebSocket (443, 8443, 2083, 2053, 2087, 2096) with custom SNI / Wildcard & TLS ClientHello DPI Fragmentation
+ * 2) HTTP WebSocket (80, 8080, 8880, 2052, 2082, 2086, 2095) with Split-Packet DPI Bypass ([split])
+ * 3) Cloudflare Anycast Edge IP Fronting (104.16.x.x, 104.18.x.x, 162.159.x.x, 172.64.x.x -> Host: nl1.wssht.to)
+ * 4) Full HTTP Custom Payload macro rendering ([crlf], [lf], [cr], [split], [delay_split], [host], [host_port], [sni], [ua], [protocol])
+ * 5) Auto-detection of BOTH direct ws-openssh (raw SSH-2.0 after 101) AND Cloudflare RFC 6455 Binary WebSocket frames!
  */
 object SshWebSocketTransport {
 
     private val secureRandom = SecureRandom()
+    const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36"
+
+    const val PRESET_SSHOCEAN_STANDARD =
+        "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf]"
+
+    const val PRESET_GP_SPLIT_DPI =
+        "GET http://[sni]/ HTTP/1.1[crlf]Host: [sni][crlf][crlf][split]GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf]"
+
+    const val PRESET_BACK_INJECT =
+        "CONNECT [host_port] HTTP/1.1[crlf][crlf][split]GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]User-Agent: [ua][crlf][crlf]"
 
     fun generateWebSocketKey(): String {
         val bytes = ByteArray(16)
@@ -55,10 +71,61 @@ object SshWebSocketTransport {
         return Base64.getEncoder().encodeToString(bytes)
     }
 
+    /**
+     * Renders an HTTP Custom payload template into 1 or more split chunks ready for sequential TCP write/flush.
+     * Supports [crlf], [lf], [cr], [split], [delay_split], [host], [host_port], [sni], [ua], [protocol].
+     */
+    fun renderPayloadChunks(
+        template: String,
+        hostHeader: String,
+        port: Int,
+        sniHost: String,
+        wsPath: String = "/",
+        wsKey: String? = null
+    ): List<ByteArray> {
+        val cleanHost = hostHeader.trim()
+        val cleanSni = sniHost.trim().ifBlank { cleanHost }
+        val cleanPath = wsPath.trim().ifBlank { "/" }.let { if (it.startsWith("/")) it else "/$it" }
+
+        var expanded = template
+            .replace("[host_port]", "$cleanHost:$port", ignoreCase = true)
+            .replace("[host]", cleanHost, ignoreCase = true)
+            .replace("[sni]", cleanSni, ignoreCase = true)
+            .replace("[bug_host]", cleanSni, ignoreCase = true)
+            .replace("[ua]", DEFAULT_USER_AGENT, ignoreCase = true)
+            .replace("[protocol]", "HTTP/1.1", ignoreCase = true)
+            .replace("[crlf]", "\r\n", ignoreCase = true)
+            .replace("[lf]", "\n", ignoreCase = true)
+            .replace("[cr]", "\r", ignoreCase = true)
+
+        if (cleanPath != "/" && expanded.startsWith("GET / ")) {
+            expanded = expanded.replaceFirst("GET / ", "GET $cleanPath ")
+        }
+
+        // Inject RFC 6455 WebSocket headers if requested and not already present in custom payload
+        if (!wsKey.isNullOrBlank() &&
+            !expanded.contains("Sec-WebSocket-Key", ignoreCase = true) &&
+            expanded.contains("Upgrade: websocket", ignoreCase = true)
+        ) {
+            val endMarkerIdx = expanded.lastIndexOf("\r\n\r\n")
+            if (endMarkerIdx >= 0) {
+                expanded = expanded.substring(0, endMarkerIdx) +
+                    "\r\nSec-WebSocket-Key: $wsKey\r\nSec-WebSocket-Version: 13\r\n\r\n" +
+                    expanded.substring(endMarkerIdx + 4)
+            }
+        }
+
+        val splitRegex = Regex("\\[(?:delay_)?split]", RegexOption.IGNORE_CASE)
+        return expanded.split(splitRegex)
+            .filter { it.isNotEmpty() }
+            .map { it.toByteArray(Charsets.US_ASCII) }
+    }
+
     fun buildUpgradeRequest(
         wsPath: String,
         hostHeader: String,
-        wsKey: String = generateWebSocketKey()
+        wsKey: String = generateWebSocketKey(),
+        includeWebSocketKey: Boolean = true
     ): ByteArray {
         val cleanPath = wsPath.trim().ifBlank { "/" }.let { if (it.startsWith("/")) it else "/$it" }
         val cleanHost = hostHeader.trim()
@@ -67,9 +134,11 @@ object SshWebSocketTransport {
             append("Host: ").append(cleanHost).append("\r\n")
             append("Upgrade: websocket\r\n")
             append("Connection: Upgrade\r\n")
-            append("Sec-WebSocket-Key: ").append(wsKey).append("\r\n")
-            append("Sec-WebSocket-Version: 13\r\n")
-            append("User-Agent: Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36\r\n")
+            if (includeWebSocketKey) {
+                append("Sec-WebSocket-Key: ").append(wsKey).append("\r\n")
+                append("Sec-WebSocket-Version: 13\r\n")
+            }
+            append("User-Agent: ").append(DEFAULT_USER_AGENT).append("\r\n")
             append("\r\n")
         }
         return req.toByteArray(Charsets.US_ASCII)
@@ -104,13 +173,13 @@ object SshWebSocketTransport {
     }
 
     /**
-     * Connects TCP (+ optional TLS with explicit SNI), sends HTTP/1.1 WebSocket Upgrade,
-     * validates HTTP 101 / 200, auto-detects raw-SSH vs RFC 6455 binary framing,
-     * and returns a Socket ready to hand straight to JSch (SshProxyBridge).
+     * Connects TCP (+ optional TLS with explicit SNI & optional ClientHello DPI fragmentation),
+     * sends HTTP/1.1 WebSocket Upgrade or Custom Split Payload, validates HTTP 101 / 200,
+     * auto-detects Raw-SSH vs RFC 6455 Binary WebSocket framing, and returns a Socket ready for JSch.
      */
     fun connect(
         config: SshWebSocketConfig,
-        connectTimeoutMs: Int = 7000,
+        connectTimeoutMs: Int = 5500,
         underlyingNetwork: Network? = null,
         protectTcp: ((Socket) -> Boolean)? = null
     ): SshWebSocketConnectResult {
@@ -128,9 +197,14 @@ object SshWebSocketTransport {
 
             if (config.useTls) {
                 val effectiveSni = config.sniHost.trim().ifBlank { config.wsHostHeader.trim() }
+                val baseForTls: Socket = if (config.fragmentTlsClientHello) {
+                    TlsFragmentingSocketWrapper(rawSocket)
+                } else {
+                    rawSocket
+                }
                 val sslFactory = createTunnelSslContext().socketFactory
                 val sslSock = sslFactory.createSocket(
-                    rawSocket,
+                    baseForTls,
                     effectiveSni,
                     config.port,
                     true
@@ -147,18 +221,67 @@ object SshWebSocketTransport {
                 activeSocket = sslSock
             }
 
-            val reqBytes = buildUpgradeRequest(
-                wsPath = config.wsPath,
-                hostHeader = config.wsHostHeader
-            )
+            val wsKey = if (config.includeWebSocketKey) generateWebSocketKey() else null
+            val chunks: List<ByteArray> = when {
+                config.customPayload.isNotBlank() -> renderPayloadChunks(
+                    template = config.customPayload,
+                    hostHeader = config.wsHostHeader,
+                    port = config.port,
+                    sniHost = config.sniHost.ifBlank { config.wsHostHeader },
+                    wsPath = config.wsPath,
+                    wsKey = wsKey
+                )
+
+                config.splitPayload -> {
+                    val full = buildUpgradeRequest(
+                        wsPath = config.wsPath,
+                        hostHeader = config.wsHostHeader,
+                        wsKey = wsKey ?: generateWebSocketKey(),
+                        includeWebSocketKey = config.includeWebSocketKey
+                    )
+                    // Split right after the request line to defeat single-packet DPI classifiers
+                    val splitAt = (full.size / 3).coerceIn(8, (full.size - 4).coerceAtLeast(8))
+                    listOf(full.copyOfRange(0, splitAt), full.copyOfRange(splitAt, full.size))
+                }
+
+                else -> listOf(
+                    buildUpgradeRequest(
+                        wsPath = config.wsPath,
+                        hostHeader = config.wsHostHeader,
+                        wsKey = wsKey ?: generateWebSocketKey(),
+                        includeWebSocketKey = config.includeWebSocketKey
+                    )
+                )
+            }
+
             val rawOut = activeSocket.getOutputStream()
-            rawOut.write(reqBytes)
-            rawOut.flush()
+            chunks.forEachIndexed { idx, chunk ->
+                rawOut.write(chunk)
+                rawOut.flush()
+                if (idx < chunks.lastIndex) {
+                    runCatching { Thread.sleep(25L) }
+                }
+            }
 
             val pushIn = PushbackInputStream(activeSocket.getInputStream(), 16)
-            val httpResp = readHttpUpgradeResponse(pushIn)
+            var httpResp = readHttpUpgradeResponse(pushIn)
+
+            // Some split-inject payloads emit an initial 200/400 response before the 101 Switching Protocols reply
+            if (chunks.size > 1 && httpResp.statusCode != 101 && httpResp.statusCode in 200..499) {
+                val prevTo = activeSocket.soTimeout
+                runCatching {
+                    activeSocket.soTimeout = 1000
+                    val next = readHttpUpgradeResponse(pushIn)
+                    if (next.statusCode == 101 || next.statusCode == 200) {
+                        httpResp = next
+                    }
+                }
+                runCatching { activeSocket.soTimeout = prevTo }
+            }
+
             if (httpResp.statusCode != 101 && httpResp.statusCode != 200) {
-                throw IOException("WS HTTP ${httpResp.statusCode}: ${httpResp.statusLine}")
+                val srv = httpResp.headers["server"]?.let { " [$it]" }.orEmpty()
+                throw IOException("WS HTTP ${httpResp.statusCode}$srv: ${httpResp.statusLine}")
             }
 
             // Auto-detect raw SSH-2.0 stream vs RFC 6455 WebSocket binary frames
@@ -208,11 +331,12 @@ object SshWebSocketTransport {
     }
 
     /**
-     * Builds an ordered list of smart SSH WebSocket connection strategies for sshOcean & GP SIMs:
-     * 1) User's exact configured port + TLS + SNI
-     * 2) Alternate SSL/TLS ports (443, 8443, 2083)
-     * 3) Wildcard SNI / GP Bug-Host CDN variants when direct host fails
-     * 4) Plain HTTP WebSocket ports (80, 8080, 8880)
+     * Builds an aggressive, GP-optimized SSH WebSocket strategy list:
+     * 1) User's exact configured port + TLS + SNI + custom payload/fragment flags
+     * 2) Cloudflare Anycast Edge IP fronting on HTTP:80 & TLS:443 (104.16.132.229, 104.18.2.2, 162.159.135.42)
+     * 3) Wildcard SNI / GP Bug-Host CDN variants (www.grameenphone.com.<host>, cloudflare.com.<host>)
+     * 4) TLS ClientHello DPI-fragmented Port 443 / 8443 / 2083
+     * 5) Plain & Split-Packet HTTP WebSocket ports (80, 8080, 8880)
      */
     fun buildCandidateConfigs(
         host: String,
@@ -221,7 +345,10 @@ object SshWebSocketTransport {
         bugHost: String,
         wsPath: String,
         useTls: Boolean,
-        resolvedHostIp: String? = null
+        resolvedHostIp: String? = null,
+        customPayload: String = "",
+        enableSplitPayload: Boolean = false,
+        enableTlsFragment: Boolean = false
     ): List<SshWebSocketConfig> {
         val cleanHost = host.trim()
         val cleanSni = sniHost.trim()
@@ -229,7 +356,10 @@ object SshWebSocketTransport {
         val connectAddr = cleanBug.ifBlank { resolvedHostIp?.takeIf { it.isNotBlank() } ?: cleanHost }
         val directAddr = resolvedHostIp?.takeIf { it.isNotBlank() } ?: cleanHost
         val cleanPath = wsPath.trim().ifBlank { "/" }
-        val wildcardSniHost = if (cleanSni.isNotBlank() && !cleanSni.equals(cleanHost, ignoreCase = true) && !cleanSni.endsWith(".$cleanHost", ignoreCase = true)) {
+        val wildcardSniHost = if (cleanSni.isNotBlank() &&
+            !cleanSni.equals(cleanHost, ignoreCase = true) &&
+            !cleanSni.endsWith(".$cleanHost", ignoreCase = true)
+        ) {
             "$cleanSni.$cleanHost"
         } else {
             cleanHost
@@ -239,7 +369,7 @@ object SshWebSocketTransport {
         val seen = HashSet<String>()
 
         fun addUnique(cfg: SshWebSocketConfig) {
-            val key = "${cfg.connectHost}|${cfg.port}|${cfg.useTls}|${cfg.sniHost}|${cfg.wsHostHeader}"
+            val key = "${cfg.connectHost}|${cfg.port}|${cfg.useTls}|${cfg.sniHost}|${cfg.wsHostHeader}|${cfg.splitPayload}|${cfg.fragmentTlsClientHello}"
             if (seen.add(key)) list.add(cfg)
         }
 
@@ -252,7 +382,10 @@ object SshWebSocketTransport {
                 sniHost = cleanSni.ifBlank { cleanHost },
                 wsPath = cleanPath,
                 useTls = useTls,
-                label = "${if (useTls) "TLS" else "HTTP"}:${port} (${cleanSni.ifBlank { cleanHost }})"
+                customPayload = customPayload,
+                splitPayload = enableSplitPayload,
+                fragmentTlsClientHello = enableTlsFragment,
+                label = "${if (useTls) "TLS" else "HTTP"}:$port (${cleanBug.ifBlank { cleanSni.ifBlank { cleanHost } }})"
             )
         )
 
@@ -266,27 +399,76 @@ object SshWebSocketTransport {
                     sniHost = wildcardSniHost,
                     wsPath = cleanPath,
                     useTls = true,
-                    label = "TLS:${if (useTls) port else 443} (Wildcard $wildcardSniHost)"
+                    customPayload = customPayload,
+                    fragmentTlsClientHello = true,
+                    label = "TLS+Frag:${if (useTls) port else 443} ($wildcardSniHost)"
                 )
             )
         }
 
-        // 3. Direct TLS 443, 8443, 2083 on origin host
-        for (tlsPort in listOf(443, 8443, 2083)) {
+        // 3. Direct TLS 443 with ClientHello DPI Fragmentation (bypasses GP stateless SNI DPI)
+        addUnique(
+            SshWebSocketConfig(
+                connectHost = directAddr,
+                port = 443,
+                wsHostHeader = cleanHost,
+                sniHost = cleanHost,
+                wsPath = cleanPath,
+                useTls = true,
+                customPayload = customPayload,
+                fragmentTlsClientHello = true,
+                label = "TLS+DPI-Frag:443 ($cleanHost)"
+            )
+        )
+
+        // 4. Cloudflare Anycast Edge IP Fronting on HTTP:80 (with Split DPI Bypass!) & TLS:443
+        for (edgeIp in listOf("104.16.132.229", "104.18.2.2", "162.159.135.42")) {
+            addUnique(
+                SshWebSocketConfig(
+                    connectHost = edgeIp,
+                    port = 80,
+                    wsHostHeader = cleanHost,
+                    sniHost = cleanSni.ifBlank { cleanHost },
+                    wsPath = cleanPath,
+                    useTls = false,
+                    customPayload = customPayload,
+                    splitPayload = true,
+                    label = "CF-Edge($edgeIp):80 Split"
+                )
+            )
+            addUnique(
+                SshWebSocketConfig(
+                    connectHost = edgeIp,
+                    port = 443,
+                    wsHostHeader = cleanHost,
+                    sniHost = cleanHost,
+                    wsPath = cleanPath,
+                    useTls = true,
+                    customPayload = customPayload,
+                    fragmentTlsClientHello = true,
+                    label = "CF-Edge($edgeIp):443 TLS"
+                )
+            )
+        }
+
+        // 5. Alternate Cloudflare SSL/TLS ports (8443, 2083)
+        for (tlsPort in listOf(8443, 2083)) {
             addUnique(
                 SshWebSocketConfig(
                     connectHost = directAddr,
                     port = tlsPort,
                     wsHostHeader = cleanHost,
-                    sniHost = cleanSni.ifBlank { cleanHost },
+                    sniHost = cleanHost,
                     wsPath = cleanPath,
                     useTls = true,
-                    label = "TLS:$tlsPort (${cleanSni.ifBlank { cleanHost }})"
+                    customPayload = customPayload,
+                    fragmentTlsClientHello = enableTlsFragment,
+                    label = "TLS:$tlsPort ($cleanHost)"
                 )
             )
         }
 
-        // 4. Plain HTTP WebSocket ports (80, 8080, 8880)
+        // 6. Plain & Split HTTP WebSocket ports (80, 8080, 8880)
         for (httpPort in listOf(80, 8080, 8880)) {
             addUnique(
                 SshWebSocketConfig(
@@ -296,6 +478,8 @@ object SshWebSocketTransport {
                     sniHost = "",
                     wsPath = cleanPath,
                     useTls = false,
+                    customPayload = customPayload,
+                    splitPayload = httpPort == 80,
                     label = "HTTP:$httpPort ($cleanHost)"
                 )
             )
@@ -308,11 +492,6 @@ object SshWebSocketTransport {
         return value.all { it.isDigit() || it == '.' } || value.contains(':')
     }
 
-    /**
-     * Scoped SSLContext used solely for custom-SNI / Bug-Host SSH WebSocket tunnels
-     * where the TLS SNI differs from the origin server certificate CN.
-     * SSH-2.0 inside the tunnel still provides end-to-end encryption & key exchange.
-     */
     private fun createTunnelSslContext(): SSLContext {
         val trustManager = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = Unit
@@ -356,7 +535,7 @@ object SshWebSocketTransport {
             else -> 10 + 4
         }
         val frame = ByteArray(headerSize + length)
-        frame[0] = 0x82.toByte() // FIN + Binary frame
+        frame[0] = 0x82.toByte()
         var pos = 2
         when {
             length < 126 -> {
@@ -387,9 +566,6 @@ object SshWebSocketTransport {
         return frame
     }
 
-    /**
-     * Reads a single RFC 6455 frame from [input]. Returns Pair(opcode, unmaskedPayload), or null on EOF.
-     */
     fun readWebSocketFrame(input: InputStream): Pair<Int, ByteArray>? {
         val b0 = input.read()
         if (b0 < 0) return null
@@ -444,8 +620,50 @@ object SshWebSocketTransport {
 }
 
 /**
- * Socket wrapper preserving already-peeked bytes in [PushbackInputStream] for direct Raw-SSH-after-101 servers.
+ * Splits the very first TLS ClientHello record across 2 TCP segments (first 5B record header +
+ * small handshake prefix, then remainder) to evade stateless carrier SNI DPI filters on port 443.
  */
+private class TlsFragmentingSocketWrapper(
+    private val delegate: Socket
+) : Socket() {
+    private val wrappedOut: OutputStream = object : FilterOutputStream(delegate.getOutputStream()) {
+        private var fragmentedFirstWrite = false
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            // TLS Handshake record starts with 0x16 0x03 ...
+            if (!fragmentedFirstWrite && len > 40 && (b[off].toInt() and 0xFF) == 0x16) {
+                fragmentedFirstWrite = true
+                val part1 = 24
+                out.write(b, off, part1)
+                out.flush()
+                runCatching { Thread.sleep(12L) }
+                out.write(b, off + part1, len - part1)
+                out.flush()
+            } else {
+                out.write(b, off, len)
+            }
+        }
+    }
+
+    override fun getInputStream(): InputStream = delegate.getInputStream()
+    override fun getOutputStream(): OutputStream = wrappedOut
+    override fun isConnected(): Boolean = delegate.isConnected
+    override fun isClosed(): Boolean = delegate.isClosed
+    override fun getInetAddress() = delegate.inetAddress
+    override fun getPort(): Int = delegate.port
+    override fun getLocalPort(): Int = delegate.localPort
+    override fun setSoTimeout(timeout: Int) {
+        runCatching { delegate.soTimeout = timeout }
+    }
+    override fun getSoTimeout(): Int = runCatching { delegate.soTimeout }.getOrDefault(0)
+    override fun setTcpNoDelay(on: Boolean) {
+        runCatching { delegate.tcpNoDelay = on }
+    }
+    override fun close() {
+        runCatching { delegate.close() }
+    }
+}
+
 private class PushbackSocketAdapter(
     private val delegate: Socket,
     private val pushIn: InputStream,
@@ -467,9 +685,6 @@ private class PushbackSocketAdapter(
     }
 }
 
-/**
- * Socket adapter tunneling an arbitrary byte stream (SSH-2.0) over RFC 6455 Binary WebSocket frames.
- */
 private class Rfc6455BinaryWebSocketAdapter(
     private val delegate: Socket,
     private val rawIn: InputStream,
@@ -511,12 +726,12 @@ private class Rfc6455BinaryWebSocketAdapter(
                         }
                     }
 
-                    0x08 -> { // Close frame
+                    0x08 -> {
                         eof = true
                         return -1
                     }
 
-                    0x09 -> { // Ping -> reply Pong (0x8A)
+                    0x09 -> {
                         synchronized(writeLock) {
                             runCatching {
                                 val pong = SshWebSocketTransport.encodeClientBinaryFrame(data)
@@ -527,7 +742,7 @@ private class Rfc6455BinaryWebSocketAdapter(
                         }
                     }
 
-                    0x0A -> Unit // Pong -> ignore
+                    0x0A -> Unit
                 }
             }
             val toCopy = minOf(len, currentChunk.size - chunkPos)

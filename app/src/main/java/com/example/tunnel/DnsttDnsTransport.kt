@@ -15,6 +15,9 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
 /**
  * Exact wire-level dnstt (SlowDNS) DNS transport encoder/decoder & adaptive poller.
@@ -257,7 +260,7 @@ class DnsttPacketTransport(
     private var transportType: String,
     private val tunnelDomain: String,
     private var ednsPayloadSize: Int,
-    private val dohUrl: String? = null,
+    private var dohUrl: String? = null,
     private val dohClient: OkHttpClient? = null,
     private val underlyingNetwork: Network? = null,
     private val protectUdp: ((DatagramSocket) -> Boolean)? = null,
@@ -333,7 +336,9 @@ class DnsttPacketTransport(
             val targetIp: String,
             val mode: String,
             val useEdns: Boolean,
-            val ednsBytes: Int
+            val ednsBytes: Int,
+            val attemptDohUrl: String? = null,
+            val dotSni: String? = null
         )
 
         // Prioritize IPv4 carrier DNS (e.g. GP 192.0.0.1) ahead of IPv6 (2400:c600:...) for SlowDNS TXT stability
@@ -344,15 +349,31 @@ class DnsttPacketTransport(
             .sortedBy { if (it.contains(':')) 1 else 0 }
 
         val attempts = buildList {
+            // 1. Carrier resolvers (IPv4 first, EDNS512 + EDNS1232 + NoEDNS)
             for (ip in orderedIps) {
                 if (transportType == "DoH:443") {
-                    add(ProbeAttempt("DoH($ip)", ip, "DoH:443", true, 512))
+                    add(ProbeAttempt("DoH($ip)", ip, "DoH:443", true, 512, dohUrl ?: GpNetworkInspector.CLOUDFLARE_DOH_URL))
                 } else {
                     add(ProbeAttempt("Carrier($ip,EDNS512)", ip, "UDP:53", true, 512))
                     add(ProbeAttempt("Carrier($ip,EDNS1232)", ip, "UDP:53", true, 1232))
                     add(ProbeAttempt("Carrier($ip,NoEDNS)", ip, "UDP:53", false, 512))
                 }
             }
+            // 2. Encrypted DoH:443 (bypasses GP 192.0.0.1 TXT filter completely when Port 443 is open!)
+            if (dohClient != null) {
+                add(ProbeAttempt("DoH:443(1.1.1.1)", "1.1.1.1", "DoH:443", true, 512, "https://1.1.1.1/dns-query"))
+                add(ProbeAttempt("DoH:443(8.8.8.8)", "8.8.8.8", "DoH:443", true, 512, GpNetworkInspector.GOOGLE_DOH_URL))
+            }
+            // 3. Encrypted DoT:853 (DNS-over-TLS — official dnstt -dot mode!)
+            add(ProbeAttempt("DoT:853(1.1.1.1)", "1.1.1.1", "DoT:853", true, 512, dotSni = "cloudflare-dns.com"))
+            add(ProbeAttempt("DoT:853(8.8.8.8)", "8.8.8.8", "DoT:853", true, 512, dotSni = "dns.google"))
+            // 4. Public UDP:53 resolvers (1.1.1.1, 8.8.8.8, 9.9.9.9)
+            for (pubIp in listOf("1.1.1.1", "8.8.8.8", "9.9.9.9")) {
+                if (pubIp !in orderedIps) {
+                    add(ProbeAttempt("Public($pubIp,EDNS512)", pubIp, "UDP:53", true, 512))
+                }
+            }
+            // 5. Direct SlowDNS server UDP:53 & Carrier TCP:53
             if (!directServerIp.isNullOrBlank() && directServerIp !in orderedIps) {
                 add(ProbeAttempt("Direct($directServerIp:53)", directServerIp, "UDP:53", true, 512))
                 add(ProbeAttempt("Direct($directServerIp:53,NoEDNS)", directServerIp, "UDP:53", false, 512))
@@ -379,12 +400,16 @@ class DnsttPacketTransport(
             )
             val t0 = System.currentTimeMillis()
             val prevTransport = transportType
+            val prevDohUrl = dohUrl
             transportType = att.mode
-            val reply = exchangeDnsWire(query, addr, timeoutMs)
+            if (att.attemptDohUrl != null) dohUrl = att.attemptDohUrl
+            val attemptTimeout = if (att.mode == "UDP:53" && att.targetIp in orderedIps) timeoutMs else minOf(timeoutMs, 2400)
+            val reply = exchangeDnsWire(query, addr, attemptTimeout, att.dotSni)
             transportType = prevTransport
+            dohUrl = prevDohUrl
 
             if (reply == null) {
-                diagNotes.add("${att.label} -> Timeout(${timeoutMs}ms)")
+                diagNotes.add("${att.label} -> Timeout(${attemptTimeout}ms)")
                 continue
             }
 
@@ -398,6 +423,7 @@ class DnsttPacketTransport(
                     resolverIp = att.targetIp
                     resolverAddr = addr
                     transportType = att.mode
+                    if (att.attemptDohUrl != null) dohUrl = att.attemptDohUrl
                     includeEdns0InLoop = att.useEdns
                     ednsPayloadSize = att.ednsBytes
                     lastValidResponseAtMs.set(System.currentTimeMillis())
@@ -491,7 +517,12 @@ class DnsttPacketTransport(
         }
     }
 
-    private fun exchangeDnsWire(query: ByteArray, addr: InetAddress, timeoutMs: Int): ByteArray? {
+    private fun exchangeDnsWire(
+        query: ByteArray,
+        addr: InetAddress,
+        timeoutMs: Int,
+        dotSni: String? = null
+    ): ByteArray? {
         return when (transportType) {
             "DoH:443" -> {
                 val client = dohClient ?: return null
@@ -499,10 +530,55 @@ class DnsttPacketTransport(
                 GpNetworkInspector.sendDohQuery(client, url, query)?.first
             }
 
+            "DoT:853" -> exchangeDotDns(query, addr, timeoutMs, dotSni)
+
             "TCP:53" -> exchangeTcpDns(query, addr, timeoutMs)
 
             else -> exchangeUdpDns(query, addr, timeoutMs)
         }
+    }
+
+    private fun exchangeDotDns(
+        query: ByteArray,
+        addr: InetAddress,
+        timeoutMs: Int,
+        dotSni: String?
+    ): ByteArray? {
+        return runCatching {
+            Socket().use { raw ->
+                protectTcp?.invoke(raw)
+                runCatching { underlyingNetwork?.bindSocket(raw) }
+                raw.connect(InetSocketAddress(addr, 853), timeoutMs)
+                raw.soTimeout = timeoutMs
+                val sni = dotSni ?: if (addr.hostAddress == "8.8.8.8") "dns.google" else "cloudflare-dns.com"
+                val sslSock = (SSLSocketFactory.getDefault() as SSLSocketFactory).createSocket(
+                    raw,
+                    sni,
+                    853,
+                    true
+                ) as SSLSocket
+                sslSock.use { tls ->
+                    tls.soTimeout = timeoutMs
+                    runCatching {
+                        val params = tls.sslParameters
+                        params.serverNames = listOf(SNIHostName(sni))
+                        tls.sslParameters = params
+                    }
+                    tls.startHandshake()
+                    val dos = DataOutputStream(tls.getOutputStream())
+                    dos.writeShort(query.size)
+                    dos.write(query)
+                    dos.flush()
+                    val dis = DataInputStream(tls.getInputStream())
+                    val len = dis.readUnsignedShort()
+                    if (len in 12..4096) {
+                        ByteArray(len).also { dis.readFully(it) }
+                    } else {
+                        null
+                    }
+                }
+            }
+        }.getOrNull()
     }
 
     private fun exchangeUdpDns(query: ByteArray, addr: InetAddress, timeoutMs: Int): ByteArray? {
